@@ -50,6 +50,15 @@ def test_review_rejection_keeps_candidate_out_of_live_source(controller):
     assert source_hash(controller.sources.live / "src") == original
 
 
+def test_validation_can_spend_time_reserved_from_investigation(controller):
+    from fixer.runtime import Deadline
+    import time
+    controller.deadline = controller.runner.deadline = Deadline(time.time() + 60)
+    controller.final_reserve = 90
+    repair_ownership(controller)
+    assert controller.validate(plan())["accepted"]
+
+
 def test_second_partial_repair_cannot_reintroduce_a_verified_obligation(controller):
     repair_ownership(controller)
     assert controller.validate(plan())["accepted"]

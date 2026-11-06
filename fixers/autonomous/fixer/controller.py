@@ -130,7 +130,8 @@ class Controller:
             faults_arg = str(path)
         return scenario_arg, faults_arg
 
-    def replay(self, source: str, scenario: str, seed: int, faults: str | None = None) -> ReplayResult:
+    def replay(self, source: str, scenario: str, seed: int, faults: str | None = None,
+               *, reserve: float | None = None) -> ReplayResult:
         root = self.case_root(source)
         scenario_arg, faults_arg = self._paths(root, scenario, faults)
         identity = _scenario_hashes(root, scenario_arg, faults_arg)
@@ -140,7 +141,7 @@ class Controller:
         if cached is not None:
             return cached
         result = self.simulator.replay(root, scenario_arg, seed=seed, faults=faults_arg,
-                                       timeout=60, reserve=self.final_reserve)
+                                       timeout=60, reserve=self.final_reserve if reserve is None else reserve)
         result = replace(result, scenario=scenario, faults=faults)
         with self._lock:
             self.runs[result.run_id] = result
@@ -232,9 +233,9 @@ class Controller:
                   for n in range(3)]
         return [value for value in values if value not in self.config.seeds]
 
-    def _matrix(self, source: str, experiments: list[dict]) -> list[ReplayResult]:
+    def _matrix(self, source: str, experiments: list[dict], *, reserve: float | None = None) -> list[ReplayResult]:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(self.replay, source, item["scenario"], item["seed"], item.get("faults"))
+            futures = [pool.submit(self.replay, source, item["scenario"], item["seed"], item.get("faults"), reserve=reserve)
                        for item in experiments]
             return [future.result() for future in futures]
 
@@ -303,8 +304,8 @@ class Controller:
         base = self.sources.candidate / "scenarios/base.yaml"
         if base.is_file():
             experiments.append({"scenario": "base", "seed": self.config.seeds[0]})
-        before = self._matrix("accepted", experiments)
-        after = self._matrix("candidate", experiments)
+        before = self._matrix("accepted", experiments, reserve=install_allowance)
+        after = self._matrix("candidate", experiments, reserve=install_allowance)
         if any(r.status not in VALID_REPLAY_STATUSES for r in after):
             return {"accepted": False, "reason": "runtime or validation error", "results": [brief(r) for r in after]}
         regressions = [brief(new) for old, new in zip(before, after) if old.ok and not new.ok]
