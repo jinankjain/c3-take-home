@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+from fixer.validation import _scenario_hashes
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fixer.runtime import Deadline, ProcessRunner, TimeLimitError
@@ -189,3 +191,30 @@ def test_tests_execute_against_stage_imports_and_environment(fake_case, simulato
 def test_determinism_rejects_unverified_hash_even_with_existing_failures(fake_case, simulator):
     behavior(fake_case, wrong_hash=True, violations=True)
     assert not simulator.determinism(fake_case, seed=11).ok
+
+
+@pytest.mark.parametrize("with_override", [False, True])
+def test_scenario_identity_binds_default_name_for_same_bytes_at_different_filenames(tmp_path, with_override):
+    scenarios = tmp_path / "scenarios"
+    scenarios.mkdir()
+    first, second = scenarios / "first.yaml", scenarios / "second.yaml"
+    first.write_text("end_at: 0.1\n")
+    second.write_bytes(first.read_bytes())
+    profile = scenarios / "faults.yaml"
+    profile.write_text("network: {}\n")
+    faults = str(profile) if with_override else None
+    first_identity = _scenario_hashes(tmp_path, str(first), faults)
+    second_identity = _scenario_hashes(tmp_path, str(second), faults)
+    assert first_identity[0] is not None and second_identity[0] is not None
+    assert first_identity[0] != second_identity[0]
+    assert first_identity[1] == second_identity[1]
+    assert _scenario_hashes(tmp_path, "first", faults) == first_identity
+
+
+def test_explicit_named_same_byte_scenario_aliases_keep_the_same_identity(tmp_path):
+    scenarios = tmp_path / "scenarios"
+    scenarios.mkdir()
+    first, second = scenarios / "first.yaml", scenarios / "second.yaml"
+    first.write_text("name: stable-name\nend_at: 0.1\n")
+    second.write_bytes(first.read_bytes())
+    assert _scenario_hashes(tmp_path, str(first), None) == _scenario_hashes(tmp_path, str(second), None)

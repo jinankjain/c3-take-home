@@ -58,13 +58,23 @@ def _scenario_hashes(root: Path, scenario: str, faults: str | None) -> tuple[str
         return None, None
     try:
         scenario_digest = _file_hash(path)
+        document = None
+        if path.stat().st_size <= 2 * 1024 * 1024:
+            import yaml
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        # c3sim's loader supplies the filename stem when name is absent. Its
+        # value is effective input, so unnamed copies must not share a cache
+        # identity merely because their bytes match. For oversized inputs,
+        # conservatively bind the stem without parsing an unbounded document.
+        if document is None or isinstance(document, dict) and "name" not in document:
+            scenario_digest = hashlib.sha256(
+                ("scenario-default-name-v1\0" + scenario_digest + "\0" + path.stem).encode()
+            ).hexdigest()
         fault_path: Path | None = None
         if faults is not None:
             supplied = Path(faults)
             fault_path = supplied if supplied.is_absolute() else root / supplied
-        elif path.stat().st_size <= 2 * 1024 * 1024:
-            import yaml
-            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        else:
             if isinstance(document, dict) and isinstance(document.get("faults"), str):
                 fault_path = path.parent / document["faults"]
         fault_digest = _file_hash(fault_path) if fault_path is not None and fault_path.is_file() else None
@@ -295,7 +305,11 @@ class Simulator:
             status = "pass"
 
         summary = dict(summary, source_hash=before, scenario_hash=scenario_hash, faults_hash=faults_hash)
-        evidence = summarize_trace(trace, violations, summary) if trace.is_file() else None
+        evidence = summarize_trace(
+            trace, violations, summary,
+            should_stop=lambda: self.runner.deadline.stop_event.is_set()
+            or self.runner.deadline.remaining() <= reserve,
+        ) if trace.is_file() else None
         return ReplayResult(
             source_hash=before, scenario=scenario, seed=seed, faults=faults,
             run_id=run_id, out_dir=out_dir, replay_command=replay, check_command=check,
