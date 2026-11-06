@@ -204,6 +204,7 @@ class ModelClient:
         self._budget_supported: bool | None = None
         self._remote_remaining_usd: float | None = None
         self._payment_rejected = False
+        self._jev_relevance = None
         self._base = self.env.get("ANTHROPIC_BASE_URL", "").rstrip("/")
         parsed = urllib.parse.urlsplit(self._base)
         if (parsed.scheme not in {"http", "https"} or not parsed.hostname
@@ -321,6 +322,14 @@ class ModelClient:
             "upstream model payment was rejected; check the upstream account balance",
             status=402, code="upstream_payment_error", retryable=False,
         )
+
+    def relevance(self, query: str, documents: list[dict], *, reserve: float = 90) -> dict[str, bool] | None:
+        """Keep uncertain lexical hits; optionally classify a small weak shortlist."""
+        if self._jev_relevance is None:
+            from .relevance import JevRelevance
+
+            self._jev_relevance = JevRelevance(self)
+        return self._jev_relevance(query, documents, reserve=reserve)
 
     def messages(self, system: str, messages: list, tools: list,
                  max_tokens: int = 4096, reserve: float = 90, *,
