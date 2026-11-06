@@ -9,12 +9,15 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Any
 
 from .model import BudgetExhausted, ModelClient, ModelError
+from .experiments import select_experiments
 from .patches import PatchError, SourceManager, source_hash
 from .prompts import REVIEW
 from .retrieval import Corpus, FileTools
@@ -81,6 +84,24 @@ def _ledger_review(verdict: dict) -> dict:
     return result
 
 
+def _brief_records(records: list, limit: int) -> list:
+    if len(records) <= limit:
+        return list(records)
+    head = (limit + 1) // 2
+    return records[:head] + records[-(limit - head):]
+
+
+def _brief_window(window: dict) -> dict:
+    records = window.get("events", [])
+    events = _brief_records(records, 8)
+    selected = window.get("selected_events", len(records))
+    selected = selected if isinstance(selected, int) and not isinstance(selected, bool) else len(records)
+    return {**window, "events": events, "returned_events": len(events),
+            "omitted_selected_events": max(0, selected - len(events)),
+            "selection_truncated": bool(window.get("selection_truncated")) or len(events) < len(records),
+            "brief_omitted_events": len(records) - len(events)}
+
+
 def brief(result: ReplayResult, *, timeline: bool = False) -> dict:
     evidence = result.evidence or {}
     output = {
@@ -94,10 +115,20 @@ def brief(result: ReplayResult, *, timeline: bool = False) -> dict:
         "unresolved_actions": evidence.get("unresolved_actions", [])[:4],
     }
     if timeline:
+        records = evidence.get("timeline", [])
+        events = _brief_records(records, 16)
+        matched = evidence.get("timeline_matched_events", len(records))
+        matched = matched if isinstance(matched, int) and not isinstance(matched, bool) else len(records)
         output.update(affected_entities=evidence.get("affected_entities", []),
-                      timeline=evidence.get("timeline", [])[:16],
-                      abnormal_events=evidence.get("abnormal_events", [])[:6],
-                      fault_events=evidence.get("fault_events", [])[:6])
+                      timeline=events, timeline_omitted_events=max(0, matched - len(events)),
+                      timeline_truncated=bool(evidence.get("timeline_truncated")) or len(events) < len(records),
+                      abnormal_events=_brief_records(evidence.get("abnormal_events", []), 6),
+                      fault_events=_brief_records(evidence.get("fault_events", []), 6),
+                      failure_witnesses=_brief_records(evidence.get("failure_witnesses", []), 4),
+                      failure_witnesses_brief_omitted=max(0, len(evidence.get("failure_witnesses", [])) - 4),
+                      causal_windows=[_brief_window(window)
+                                      for window in _brief_records(evidence.get("causal_windows", []), 2)],
+                      causal_windows_brief_omitted=max(0, len(evidence.get("causal_windows", [])) - 2))
     return output
 
 
@@ -166,8 +197,8 @@ class Controller:
         self.probe_root = self.sources.scratch / "probes"
         self.probe_root.mkdir()
         self.simulator = Simulator(self.runner, self.sources.scratch / "runs")
-        self.corpus = Corpus(config.corpus, config.metadata.get("codebase"))
         self.model = model
+        self.corpus = Corpus(config.corpus, config.metadata.get("codebase"), relevancy=self._document_relevance)
         self.runs: dict[str, ReplayResult] = {}
         self.hypotheses: dict[str, dict] = {}
         self.accepted: list[dict] = []
@@ -182,6 +213,160 @@ class Controller:
         self.replay_seconds = 1.0
         self.contract_context = ""
         self.initial_context = ""
+        self.retained_experiments: dict[tuple[str, int], dict] = {}
+        self._experiment_timings: dict[tuple[str | None, int], dict] = {}
+        self.review_seconds = 15.0
+
+    def _document_relevance(self, query: str, documents: list[dict]) -> dict | None:
+        handler = getattr(self.model, "relevance", None)
+        return handler(query, documents, reserve=self.final_reserve) if callable(handler) else None
+
+    def _retain_experiment(self, result: ReplayResult) -> None:
+        if not result.ok or result.scenario_hash is None:
+            return
+        self.retained_experiments[(result.scenario_hash, result.seed)] = {
+            "scenario": result.scenario, "seed": result.seed, "faults": result.faults,
+            "scenario_hash": result.scenario_hash, "faults_hash": result.faults_hash,
+            "source_hash": result.source_hash, "run_id": result.run_id,
+        }
+
+    def _experiment_input(self, item: dict, source: str) -> tuple:
+        root = self.case_root(source)
+        scenario, faults = self._paths(root, item["scenario"], item.get("faults"))
+        return _scenario_hashes(root, scenario, faults)
+
+    def _experiment_cost(self, item: dict, source: str, digest: str) -> float:
+        identity = self._experiment_input(item, source)
+        if (digest, identity, item["seed"]) in self._cache:
+            return 0.0
+        timing = self._experiment_timings.get((identity[0], item["seed"]))
+        return timing["worst_seconds"] if timing else self.replay_seconds
+
+    def _select_validation_experiments(self, reproductions: list[dict], install_allowance: float):
+        required = [{"scenario": "public", "seed": seed, "faults": None} for seed in self.config.seeds]
+        for item in reproductions:
+            if (not isinstance(item, dict) or not isinstance(item.get("scenario"), str)
+                    or not isinstance(item.get("seed"), int) or isinstance(item["seed"], bool)):
+                raise ValueError("each reproduction requires a scenario and integer seed")
+            required.append({"scenario": item["scenario"], "seed": item["seed"], "faults": item.get("faults")})
+        for retained in self.retained_experiments.values():
+            item = {key: retained[key] for key in ("scenario", "seed", "faults")}
+            if self._experiment_input(item, "candidate") != (retained["scenario_hash"], retained["faults_hash"]):
+                raise ValueError("a retained experiment's effective inputs changed")
+            required.append(item)
+        # Existing checkpoint metadata remains sufficient if loaded by a test
+        # harness or an older controller without the richer retained registry.
+        historical_selectors = [item for accepted in self.accepted
+                                for item in [*accepted["reproductions"], *accepted.get("results", [])]]
+        for accepted in self.accepted:
+            required.extend({"scenario": item["scenario"], "seed": item["seed"], "faults": item.get("faults")}
+                            for item in accepted["reproductions"])
+            for obligation in accepted["verified_obligations"]:
+                scenario, seed, expected_hash = (obligation.get(key) for key in ("scenario", "seed", "scenario_hash"))
+                if (not isinstance(scenario, str) or not isinstance(seed, int) or isinstance(seed, bool)
+                        or not isinstance(expected_hash, str) or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None):
+                    raise ValueError("a retained obligation lacks a valid effective input identity")
+                # The recorded scenario must still exist. Older checkpoints did
+                # not store fault selectors; only a matching effective hash from
+                # their historical selectors can recover that missing field.
+                self._paths(self.sources.candidate, scenario, None)
+                choices = [{"scenario": scenario, "seed": seed, "faults": obligation.get("faults")}]
+                if "faults" not in obligation:
+                    choices.extend({"scenario": item["scenario"], "seed": seed, "faults": item.get("faults")}
+                                   for item in historical_selectors if item.get("seed") == seed)
+                matched = None
+                for item in choices:
+                    try:
+                        identity = self._experiment_input(item, "candidate")
+                    except (ValueError, OSError):
+                        continue
+                    if (identity[0] == expected_hash
+                            and ("faults_hash" not in obligation or identity[1] == obligation["faults_hash"])):
+                        matched = item
+                        break
+                if matched is None:
+                    raise ValueError("a retained obligation's effective inputs are missing or changed")
+                # Removing an invariant is a retained obligation even when
+                # other invariants still fail on this scenario and seed.
+                required.append(matched)
+        if (self.sources.candidate / "scenarios/base.yaml").is_file():
+            required.append({"scenario": "base", "seed": self.config.seeds[0], "faults": None})
+        seen = set()
+        unique = []
+        for item in required:
+            identity = (self._experiment_input(item, "candidate"), item["seed"])
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(item)
+        optional = []
+        for seed in self._extra_seeds():
+            item = {"scenario": "public", "seed": seed, "faults": None}
+            identity = (self._experiment_input(item, "candidate"), seed)
+            if identity not in seen:
+                seen.add(identity)
+                optional.append(item)
+        best, current = self.sources.best_hash, self.sources.candidate_hash
+
+        def costs(item):
+            return (self._experiment_cost(item, "accepted", best),
+                    self._experiment_cost(item, "candidate", current))
+
+        def priority(item):
+            identity = self._experiment_input(item, "accepted")
+            previous = self._cache.get((best, identity, item["seed"]))
+            failure = previous is not None and not previous.ok
+            families = len(_invariants([previous])) if previous is not None else 0
+            return (0 if failure else 1 if item["scenario"].startswith("probe:") else 2,
+                    -families, sum(costs(item)), item["scenario"], item["seed"])
+
+        # Extra seeds consume only the space left after required regressions,
+        # deterministic repeats, review and verification of the live install.
+        repeats = (1 + len(reproductions)) * self.replay_seconds * 2
+        available = self.deadline.remaining() - install_allowance - self.review_seconds - repeats
+        selected = select_experiments(unique, optional, costs=costs, priority=priority,
+                                      available_seconds=available)
+        emit("validation_plan", source_hash=current, **selected.summary())
+        return selected
+
+    def _experiment_recommendations(self, current: str, best: str) -> list[dict]:
+        choices = []
+        seen = set()
+        for run in reversed(list(self.runs.values())):
+            if run.source_hash != current or run.ok or run.status not in VALID_REPLAY_STATUSES:
+                continue
+            key = (run.scenario_hash, run.seed)
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence = run.evidence or {}
+            entities = [name for name in evidence.get("affected_entities", [])
+                        if isinstance(name, str) and 0 < len(name) <= 512][:4]
+            arguments = {"run_id": run.run_id, "entities": entities, "limit": 40}
+            windows = evidence.get("causal_windows", [])
+            anchor = windows[0].get("at") if windows and isinstance(windows[0], dict) else None
+            if isinstance(anchor, (int, float)) and not isinstance(anchor, bool) and math.isfinite(anchor):
+                arguments.update(at=anchor, window_s=2.0, context_lines=2)
+            choices.append({"tool": "trace_slice", "arguments": arguments, "source_hash": current,
+                            "reason": "inspect the current failure's affected entities and causal window",
+                            "estimated_seconds": 0.0})
+            if len(choices) == 2:
+                break
+        available = self.deadline.remaining() - self.final_reserve
+        scenarios = ["probe:" + path.stem for path in sorted(self.probe_root.glob("*.yaml"))]
+        if current != best:
+            scenarios += ["public"]
+        for scenario in scenarios:
+            item = {"scenario": scenario, "seed": self.config.seeds[0], "faults": None}
+            for source, digest in (("accepted", best), ("candidate", current)):
+                seconds = self._experiment_cost(item, source, digest)
+                if seconds <= 0 or seconds > available:
+                    continue
+                choices.append({"tool": "replay", "arguments": {"source": source, **item},
+                                "source_hash": digest, "estimated_seconds": round(seconds, 3),
+                                "reason": "compare identical effective scenario inputs before and after the repair"})
+                if len(choices) >= 4:
+                    return choices
+        return choices
 
     def case_root(self, source: str) -> Path:
         roots = {"candidate": self.sources.candidate, "original": self.sources.original,
@@ -233,7 +418,7 @@ class Controller:
         with self._lock:
             cached = self._cache.get(key)
         if cached is not None:
-            return cached
+            return replace(cached, scenario=scenario, faults=faults)
         result = self.simulator.replay(root, scenario_arg, seed=seed, faults=faults_arg,
                                        timeout=60, reserve=self.final_reserve if reserve is None else reserve)
         result = replace(result, scenario=scenario, faults=faults)
@@ -241,6 +426,15 @@ class Controller:
             self.runs[result.run_id] = result
             if identity[0] is not None and result.status in VALID_REPLAY_STATUSES:
                 self._cache[key] = result
+            seconds = result.replay_command.duration + (result.check_command.duration if result.check_command else 0)
+            timing_key = (result.scenario_hash, result.seed)
+            timing = self._experiment_timings.setdefault(timing_key, {"count": 0, "total_seconds": 0.0,
+                                                                     "worst_seconds": 0.0})
+            timing["count"] += 1
+            timing["total_seconds"] += seconds
+            timing["worst_seconds"] = max(timing["worst_seconds"], seconds)
+            if result.source_hash == self.sources.best_hash:
+                self._retain_experiment(result)
             self.replay_seconds = max(self.replay_seconds,
                                       result.replay_command.duration + (result.check_command.duration if result.check_command else 0))
         emit("replay", source=source, scenario=scenario, seed=seed,
@@ -307,6 +501,12 @@ class Controller:
             last_validation = deepcopy(self.validation_history.get(current))
             history = [{key: outcome[key] for key in ("source_hash", "accepted", "reason", "stage", "attempt")}
                        for outcome in self.validation_history.values()]
+            retained = [{"scenario": _ledger_text(item["scenario"], 256), "seed": _ledger_seed(item["seed"]),
+                         "faults": _ledger_text(item["faults"], 256), "scenario_hash": item["scenario_hash"],
+                         "source_hash": item["source_hash"]}
+                        for item in list(self.retained_experiments.values())[-VALIDATION_RESULT_LIMIT:]]
+            timings = list(self._experiment_timings.values())
+            recommendations = self._experiment_recommendations(current, best)
         return {
             "source_hash": current, "accepted_source_hash": best,
             "unaccepted_changes": current != best,
@@ -319,6 +519,11 @@ class Controller:
             "known_failures": failures, "candidate_results": candidate,
             "validation_history": history,
             "hypotheses": list(self.hypotheses.values()),
+            "retained_experiments": retained, "retained_experiment_count": len(self.retained_experiments),
+            "experiment_recommendations": recommendations,
+            "experiment_metrics": {"measured_runs": sum(item["count"] for item in timings),
+                                   "total_compute_seconds": round(sum(item["total_seconds"] for item in timings), 3),
+                                   "worst_replay_seconds": round(self.replay_seconds, 3)},
         }
 
     def _validation_update(self, stage: str, **facts: Any) -> None:
@@ -377,7 +582,12 @@ class Controller:
             "# Current contracts\n" + self.contract_context,
             "# Source diff\n" + changed,
             "# Before/after evidence\n" + json.dumps({"before": [brief(r) for r in before], "after": [brief(r) for r in after]}),
+            "# Focused local failure evidence\n" + json.dumps({
+                "before": [brief(r, timeline=True) for r in before if not r.ok][:2],
+                "after": [brief(r, timeline=True) for r in after if not r.ok][:2],
+            }),
         ])
+        started = time.monotonic()
         try:
             reply = self.model.messages(REVIEW, [{"role": "user", "content": context}], [tool],
                                         max_tokens=2048, reserve=max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5),
@@ -392,6 +602,8 @@ class Controller:
             # A complete passing local matrix can still be accepted. Partial
             # repairs need a review to explain remaining/newly exposed failures.
             return {"approve": full_pass, "issues": [], "missing_evidence": [], "skipped": str(error)}
+        finally:
+            self.review_seconds = max(self.review_seconds, time.monotonic() - started)
 
     def validate(self, plan: dict) -> dict:
         if self._validating:
@@ -442,22 +654,11 @@ class Controller:
         self._validation_update("public_tests", tests=_ledger_tests(tests))
         if not tests.ok or self.sources.candidate_hash != frozen:
             return {"accepted": False, "reason": "public tests failed or source changed", "tests": tests.as_dict()}
-        experiments = [{"scenario": "public", "seed": seed} for seed in self.config.seeds]
-        experiments += [{"scenario": "public", "seed": seed} for seed in self._extra_seeds()]
-        for item in reproductions:
-            if not isinstance(item, dict) or not isinstance(item.get("scenario"), str) or not isinstance(item.get("seed"), int) or isinstance(item["seed"], bool):
-                raise ValueError("each reproduction requires a scenario and integer seed")
-            experiments.append(item)
-        # Carry successful probes from earlier source versions into every later gate.
-        for accepted in self.accepted:
-            for item in accepted["reproductions"]:
-                if item not in experiments:
-                    experiments.append(item)
-        base = self.sources.candidate / "scenarios/base.yaml"
-        if base.is_file():
-            experiments.append({"scenario": "base", "seed": self.config.seeds[0]})
+        selection = self._select_validation_experiments(reproductions, install_allowance)
+        experiments = selection.experiments
         matrix = {"complete": False, "full_pass": None, "before": [], "after": [],
                   "counts": {"experiments": len(experiments), "before": 0, "after": 0},
+                  "selection": selection.summary(),
                   "truncated": len(experiments) > VALIDATION_RESULT_LIMIT}
         self._validation_update("matrix", matrix=matrix)
         before = self._matrix("accepted", experiments, reserve=install_allowance)
@@ -511,7 +712,7 @@ class Controller:
             deterministic = self.simulator.determinism(self.sources.candidate, scenario_arg,
                                                        seed=item["seed"], faults=faults_arg, reserve=install_allowance)
             for run in deterministic.runs:
-                self.runs[run.run_id] = run
+                self.runs[run.run_id] = replace(run, scenario=item["scenario"], faults=item.get("faults"))
             determinism["completed"] += 1
             entry = {
                 "scenario": _ledger_text(item["scenario"], 256), "seed": _ledger_seed(item["seed"]),
@@ -535,7 +736,7 @@ class Controller:
                     "results": [brief(r) for r in after]}
         if self.deadline.remaining() < install_allowance:
             raise TimeLimitError("insufficient time to promote the reviewed candidate")
-        expected = next(r for r in after if r.seed == self.config.seeds[0])
+        expected = next(r for r in after if r.scenario == "public" and r.seed == self.config.seeds[0] and r.faults is None)
         self._validation_update("installation")
         def verify_live(root: Path) -> bool:
             test_result = self.simulator.tests(root, timeout=max(15.0, self.test_seconds * 3), reserve=5)
@@ -551,13 +752,16 @@ class Controller:
         accepted = {"source_hash": frozen, "reason": plan.get("reason", "repair"),
                     "reproductions": reproductions, "review": verdict,
                     "verified_obligations": [
-                        {"scenario_hash": new.scenario_hash, "scenario": item["scenario"], "seed": new.seed,
+                        {"scenario_hash": new.scenario_hash, "faults_hash": new.faults_hash,
+                         "scenario": item["scenario"], "seed": new.seed, "faults": item.get("faults"),
                          "invariants": sorted(_invariants([old]) - _invariants([new]))}
                         for item, old, new in zip(experiments, before, after)
                         if _invariants([old]) - _invariants([new])],
                     "closed_invariants": sorted(closed), "full_local_pass": full_pass,
                     "results": [brief(r) for r in after], "promotion": promotion}
         self.accepted.append(accepted)
+        for run in after:
+            self._retain_experiment(run)
         self._validation_update("accepted")
         emit("repair_accepted", source_hash=frozen, closed_invariants=sorted(closed),
              full_local_pass=full_pass, accepted_repairs=len(self.accepted))

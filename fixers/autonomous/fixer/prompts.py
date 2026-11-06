@@ -66,6 +66,15 @@ defect; do not make speculative edits solely to obtain another source hash.
 
 Before using a new probe as repair evidence, demonstrate its intended failure on
 the previous accepted source, then run the same probe and seeds on the candidate.
+Use status.experiment_recommendations and measured replay costs to choose useful
+counterfactuals. Reuse cached identical inputs and retain successful controls.
+For interacting protocol stages, compose_probe combines supported shipped fault
+profiles and scratch probes. Resolve scalar conflicts through explicit nested
+overrides and keep the implicated workload and expectations intact. A public
+scenario already covering the relevant fault interaction can provide this evidence.
+Use trace_slice with affected entities, global at/window_s and linked RPC context
+to inspect the actual failing transition. Record focused findings and source/run
+identities in the hypothesis before returning to broad source reads.
 Local sim check lacks the grader's I3 reference message counts. Compare message
 volumes and enforce the documented retry/pacing bounds; local passing checks
 alone cannot certify the hidden goodput threshold.
@@ -108,6 +117,9 @@ Judge the stated obligation. A separate remaining bug does not disqualify a
 correct partial repair; explain dependencies when the repaired transition cannot
 yet be verified. Invariant counts alone neither establish nor refute improvement.
 Prefer specific code paths and witness sequences over hypothetical concerns.
+Tie each blocking causal claim to the affected entity, operation/epoch and observed
+transition. Inspect the provided causal windows and completed cleanup events before
+attributing a downstream failure to an earlier operation.
 Require preservation of public interfaces, applicable contracts, previously
 passing controls, and previously verified obligations. A new regression or an
 unrepaired dependency that invalidates the claimed mechanism is blocking. A review
