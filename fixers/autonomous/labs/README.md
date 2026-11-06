@@ -120,3 +120,20 @@ the output directory. Grading reports bugs fixed, the 20-seed checks, tests,
 regressions, wall time and model spend. The retained source-bound traces and
 native reviews show whether the fixer observed the newly exposed failure and
 repaired both mechanisms. Reference success alone gives no autonomous score.
+
+## Recorded autonomous results
+
+The frozen `b347883` image solved **4/4 bugs** on the two labs. Both cases passed
+all 20 seeds per bug with deterministic repeats, eight public tests and four
+private regressions, with no timeout or infrastructure error.
+
+| Case | Bugs fixed | Fixer seconds | Model spend |
+| --- | --- | --- | --- |
+| LC1 | 2/2 | 81.035 | $0.305925 |
+| LC2 | 2/2 | 84.616 | $0.337957 |
+
+Each run repaired both mechanisms in one patch after inspecting source and
+contracts. The offline Controller proof separately exercises partial then full
+promotion. These paid runs did not exercise the stagnation interventions or
+probe composition. Artifacts are under `results/autonomous-chained-labs-r1`,
+including image/runtime metadata and unchanged original fixture inputs.
