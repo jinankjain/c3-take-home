@@ -22,9 +22,9 @@ A full passing local matrix can be accepted if model review is unavailable. Part
 
 ## Verification status
 
-The automated suite has **173 passing tests**, covering invented services and local proxy responses. A baseline smoke run completed on all six practice cases: public tests passed, simulator failures were detected, and service source stayed unchanged.
+The automated suite has **235 passing tests**, covering invented services and local proxy responses. A baseline smoke run completed on all six practice cases: public tests passed, simulator failures were detected, and service source stayed unchanged.
 
-The official B1 directory run reached the proxy, but OpenRouter rejected model requests with HTTP 402 because the account had zero credits. It produced no patch, spent $0, and scored 0/1. Autonomous repair performance remains unmeasured. Exact image build and grading are also pending because Docker is unavailable on this host.
+With the funded key, B1 directory grading fixed **1/1 bug across all 20 grading seeds**, passed public and private regression checks, took 128.9 seconds and spent $0.9807. The `linux/amd64` image builds and loads its pinned dependencies on Docker Desktop 29.9.2. Full image grading is in progress.
 
 See [REVIEW.md](REVIEW.md) for the review findings, regression coverage and remaining verification gates, and [WRITEUP.md](WRITEUP.md) for the submission summary.
 
@@ -68,7 +68,7 @@ This runs tests, replays and corpus retrieval and leaves service source unchange
 ## Build and grade the submission image
 
 ```sh
-docker build --platform linux/amd64 -t c3-fixer-autonomous fixers/autonomous
+docker build --platform linux/amd64 --provenance=false -t c3-fixer-autonomous fixers/autonomous
 C3_GRADER_PYTHON="$PWD/.venv/bin/python" \
 ./grade.sh --fixer c3-fixer-autonomous
 docker save -o c3-fixer-autonomous.tar c3-fixer-autonomous
@@ -76,7 +76,21 @@ docker save -o c3-fixer-autonomous.tar c3-fixer-autonomous
 
 The image uses Python 3.12.12 and installs pinned PyYAML/pytest dependencies at build time. Its entrypoint is `/bin/sh /fixer/run.sh`; `fixer.main` changes to the workspace supplied by `C3_WORKSPACE`. The image contains the fixer package and entrypoint, with no case code, corpus, grader, tests or credentials copied into it. Runtime network access is needed only for the supplied model proxy.
 
-The Docker image has not yet been built or graded on this host. Grade the exact image on every practice case before submission, and check its saved size against the pack's 4 GB limit.
+`--provenance=false` exports a single platform image. On Docker 29, an image index can omit the OS and architecture fields read by the supplied grader. Check the exported image before grading:
+
+```sh
+docker image inspect c3-fixer-autonomous --format '{{.Os}}/{{.Architecture}} {{.Size}}'
+```
+
+The current image reports `linux/amd64`; its saved tarball is 50,516,480 bytes, below the pack's 4 GB limit. Grade the exact image on every practice case before submission.
+
+On macOS, Docker Desktop's CLI may be installed under `$HOME/.docker/bin` without being on `PATH`. In that shell, run:
+
+```sh
+export PATH="$HOME/.docker/bin:$PATH"
+```
+
+The grader's host socket transport was checked successfully on this Docker Desktop installation using a container with network access disabled.
 
 ## Configuration and limits
 
