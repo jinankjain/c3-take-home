@@ -1,0 +1,10 @@
+--- a/src/moraine.py
++++ b/src/moraine.py
+@@ -72,6 +72,7 @@
+         self.journal.append({"type": "lease_closed", "task": task, "lease_id": lease_id,
+                              "outcome": "cancelled"})
+         del self.leases[task]
++        self.used_units -= lease["units"]
+         self.retiring.discard(lease_id)
+         self.states[task] = "cancelled"
+         self.log("retire_complete", task=task, lease_id=lease_id, used_units=self.used_units)

@@ -1,0 +1,2 @@
+# Unified diff fixtures preserve a single space on blank context records.
+*.patch whitespace=-blank-at-eol

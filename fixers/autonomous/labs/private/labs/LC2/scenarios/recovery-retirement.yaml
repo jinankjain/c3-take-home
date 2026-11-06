@@ -1,0 +1,7 @@
+name: recovery-retirement
+world: {capacity: 2}
+params: {horizon: 60}
+actions:
+  - {at: 0, op: acquire, task: recovered-holder, units: 2, duration: 100}
+faults: {restart_at: 5, duplicate_stop_ack: true}
+expect: {completed: 0, cancelled: 1, all_resolved: true}

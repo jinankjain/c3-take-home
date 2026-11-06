@@ -1,0 +1,18 @@
+id: LC2
+codebase: MoraineSlots
+type: chained
+budget_s: 900
+budget_usd: 6
+public_seeds: [17, 37, 59]
+bugs:
+  - id: recovery-retirement
+    invariant: RECOVERY_RETIRE
+    files: [moraine.py]
+    scenario: scenarios/recovery-retirement.yaml
+    expect: {completed: 0, cancelled: 1, all_resolved: true}
+  - id: retired-capacity
+    invariant: CAPACITY_REUSE
+    files: [moraine.py]
+    scenario: scenarios/retired-capacity.yaml
+    gates: [recovery-retirement]
+    expect: {completed: 1, cancelled: 1, all_resolved: true}

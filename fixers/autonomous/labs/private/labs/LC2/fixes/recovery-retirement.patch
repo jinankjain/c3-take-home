@@ -1,0 +1,11 @@
+--- a/src/moraine.py
++++ b/src/moraine.py
+@@ -30,7 +30,7 @@
+         self.log("recovery", epoch=self.epoch, used_units=self.used_units,
+                  live_leases=sorted(row["lease_id"] for row in self.leases.values()))
+         for task, lease in list(self.leases.items()):
+-            if lease["epoch"] >= self.epoch:
++            if lease["epoch"] < self.epoch:
+                 self._retire(task, lease)
+ 
+     def acquire(self, task, units):

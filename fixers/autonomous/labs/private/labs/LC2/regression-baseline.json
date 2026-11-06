@@ -1,0 +1,29 @@
+{
+  "case": "LC2",
+  "key": "4d9685e7d3f5987cba00b78c-c22",
+  "version": "c22-partial-variants",
+  "tests_not_passing": [],
+  "regression_not_passing": [],
+  "tests": [
+    "test_moraine_api::test_completed_state_and_epoch_survive_idle_restart",
+    "test_moraine_api::test_duplicate_acquire_is_idempotent_and_conflicting_units_reject",
+    "test_moraine_api::test_invalid_units_reject_without_reservation[-1]",
+    "test_moraine_api::test_invalid_units_reject_without_reservation[0]",
+    "test_moraine_api::test_invalid_units_reject_without_reservation[1.5]",
+    "test_moraine_api::test_invalid_units_reject_without_reservation[True]",
+    "test_moraine_api::test_old_completion_cannot_release_a_new_lease_with_same_task_name",
+    "test_moraine_api::test_weighted_reservations_reuse_normal_completion_capacity"
+  ],
+  "tests_unmasked": [],
+  "regression": [
+    "test_moraine_regression::test_duplicate_completion_does_not_make_capacity_negative",
+    "test_moraine_regression::test_out_of_order_weighted_completions_do_not_free_other_work",
+    "test_moraine_regression::test_returned_lease_is_a_snapshot",
+    "test_moraine_regression::test_stale_stop_ack_does_not_retire_reused_task_identifier"
+  ],
+  "regression_unmasked": [],
+  "variants": {
+    "recovery-retirement": {},
+    "retired-capacity": {}
+  }
+}
