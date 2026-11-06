@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from fixer.evidence import MAX_TRACE_CHARS, bounded_result, summarize_trace, trace_slice
+from fixer.evidence import MAX_TRACE_CHARS, _matches_error_codes, bounded_result, summarize_trace, trace_slice
 
 
 def write_trace(path: Path, events: list[dict]):
@@ -176,6 +176,43 @@ def test_cancelled_trace_scan_returns_bounded_partial_evidence(tmp_path):
     assert result["scan_cancelled"] and result["scan_truncated"]
     assert [event["seq"] for event in result["events"]] == [0]
     assert result["source_hash"] == "a" * 64
+
+
+@pytest.mark.parametrize("error", [{"code": "CAPACITY"}, ["CAPACITY", "pool is full"], "CAPACITY: pool is full"])
+def test_aggregate_error_windows_exclude_normal_capacity_bookkeeping(tmp_path, error):
+    path = tmp_path / "trace.jsonl"
+    events = [{"kind": "log", "event": "capacity_reserved", "seq": index, "t": index / 10,
+               "job": "tenant:normal-" + str(index)} for index in range(20)]
+    events[0] = {"kind": "log", "event": "scenario", "seq": 0, "t": 0,
+                 "expect": {"rpc_errors_max": [{"code": "CAPACITY", "max": 0}]}}
+    events += [{"kind": "msg_send", "seq": 20, "t": 39,
+                "payload": {"id": "request-right", "method": "submit", "op_id": "tenant:failed"}},
+               {"kind": "msg_send", "seq": 21, "t": 42,
+                "payload": {"id": "request-right", "err": error}},
+               {"kind": "log", "event": "capacity_freed", "seq": 22, "t": 43,
+                "job": "tenant:normal-last"}]
+    write_trace(path, events)
+    result = summarize_trace(path, [{"invariant": "expect", "t": 100,
+                                    "detail": "rpc errors {'code': 'CAPACITY', 'method': 'submit'}: 1 > 0"}], {})
+    assert result["causal_focus_reason"] == "checker_error_witnesses"
+    assert [item["seq"] for item in result["failure_witnesses"]] == [21]
+    assert [window["at"] for window in result["causal_windows"]] == [42]
+    assert any(item["seq"] == 20 for item in result["timeline"]), "linked request outside time window was lost"
+    assert not any(item["seq"] == 0 for item in result["timeline"])
+    assert all(item["selection_role"] == "neighbor" for item in result["timeline"] if item["seq"] < 20)
+
+
+@pytest.mark.parametrize("error", [{"code": "OTHER", "message": "CAPACITY was checked"},
+                                  ["OTHER", "CAPACITY was checked"], ["CAPACITY_DETAIL", "pool full"]])
+def test_typed_error_codes_take_precedence_over_descriptions(error):
+    assert not _matches_error_codes({"payload": {"err": error}}, ["capacity"])
+
+
+def test_error_code_declarations_require_a_failure_context():
+    assert not _matches_error_codes({"event": "capacity_reserved", "code": "CAPACITY"}, ["capacity"])
+    assert not _matches_error_codes({"type": "req", "payload": {"err": ["CAPACITY", "requested data"]}}, ["capacity"])
+    assert _matches_error_codes({"kind": "rpc_error", "code": "CAPACITY"}, ["capacity"])
+    assert not _matches_error_codes({"payload": {"outcome": {"code": "CAPACITY"}}}, ["capacity"])
 
 
 def test_response_fallback_is_bounded_and_never_alters_exact_provenance():

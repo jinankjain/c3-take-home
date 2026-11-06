@@ -177,3 +177,30 @@ def test_causal_review_excerpt_keeps_both_ends_and_reports_its_actual_selection(
     assert [item["seq"] for item in window["events"]] == list(range(4)) + list(range(8, 12))
     assert window["returned_events"] == 8 and window["omitted_selected_events"] == 7
     assert window["selection_truncated"] and window["brief_omitted_events"] == 4
+
+
+def test_causal_review_excerpt_preserves_middle_failure_and_linked_request(controller):
+    events = [{"seq": index} for index in range(24)]
+    events[6].update(selection_role="linked_request_or_reply", required_for_failure=True)
+    events[7].update(selection_role="failure_witness", required_for_failure=True)
+    result = replace(controller.baseline[0], evidence={
+        "timeline": events, "timeline_matched_events": 30,
+        "causal_windows": [{"events": events[:12], "selected_events": 15}],
+    })
+    excerpt = brief(result, timeline=True)
+    assert {6, 7}.issubset(item["seq"] for item in excerpt["timeline"])
+    assert {6, 7}.issubset(item["seq"] for item in excerpt["causal_windows"][0]["events"])
+    assert excerpt["timeline_omitted_events"] == 14
+    assert excerpt["causal_windows"][0]["returned_events"] == 8
+    assert excerpt["causal_windows"][0]["omitted_selected_events"] == 7
+
+
+def test_causal_review_brief_updates_required_event_omissions_after_trimming():
+    from fixer.controller import _brief_window
+    events = [{"seq": index, "required_for_failure": index < 10,
+               "selection_role": "failure_witness" if index == 5 else "linked_request_or_reply"}
+              for index in range(12)]
+    result = _brief_window({"events": events, "selected_events": 14, "required_events_selected": 12,
+                            "returned_required_events": 10, "omitted_selected_required_events": 2})
+    assert result["returned_required_events"] == 8
+    assert result["omitted_selected_required_events"] == 4

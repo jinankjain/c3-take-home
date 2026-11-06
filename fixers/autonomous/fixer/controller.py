@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 from .model import BudgetExhausted, ModelClient, ModelError
+from .evidence import _ends
 from .experiments import select_experiments
 from .patches import PatchError, SourceManager, source_hash
 from .prompts import REVIEW
@@ -85,10 +86,7 @@ def _ledger_review(verdict: dict) -> dict:
 
 
 def _brief_records(records: list, limit: int) -> list:
-    if len(records) <= limit:
-        return list(records)
-    head = (limit + 1) // 2
-    return records[:head] + records[-(limit - head):]
+    return _ends(records, limit)
 
 
 def _brief_window(window: dict) -> dict:
@@ -96,10 +94,16 @@ def _brief_window(window: dict) -> dict:
     events = _brief_records(records, 8)
     selected = window.get("selected_events", len(records))
     selected = selected if isinstance(selected, int) and not isinstance(selected, bool) else len(records)
-    return {**window, "events": events, "returned_events": len(events),
-            "omitted_selected_events": max(0, selected - len(events)),
-            "selection_truncated": bool(window.get("selection_truncated")) or len(events) < len(records),
-            "brief_omitted_events": len(records) - len(events)}
+    result = {**window, "events": events, "returned_events": len(events),
+              "omitted_selected_events": max(0, selected - len(events)),
+              "selection_truncated": bool(window.get("selection_truncated")) or len(events) < len(records),
+              "brief_omitted_events": len(records) - len(events)}
+    if "returned_required_events" in window:
+        returned = sum(event.get("required_for_failure") is True for event in events)
+        required = window.get("required_events_selected", returned)
+        required = required if isinstance(required, int) and not isinstance(required, bool) else returned
+        result.update(returned_required_events=returned, omitted_selected_required_events=max(0, required - returned))
+    return result
 
 
 def brief(result: ReplayResult, *, timeline: bool = False) -> dict:
