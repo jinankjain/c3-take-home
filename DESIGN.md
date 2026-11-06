@@ -282,4 +282,6 @@ Grade the exact final image on every practice case. Prepare the half-page write-
 
 This proposal is based on static review of [README.md](README.md), [RULES.md](RULES.md), the [minimal fixer](fixers/examples/minimal-llm/fix.py), [proxy behavior](proxy/server.py), the [corpus index](corpus/build/practice/INDEX.md), and public practice source, simulator interfaces, and current runbooks.
 
-Runtime and score estimates remain to be measured. The current Python environment lacks PyYAML, so simulator and test execution were deferred during this design review. No model spend was incurred.
+The proposal has been implemented in [fixers/autonomous](fixers/autonomous/README.md), including source snapshots, corpus retrieval, native Sonnet tools, deterministic probes, repair review, budget/deadline controls and recoverable promotion. Jev filtering remains a possible extension.
+
+All 173 automated tests and all six baseline practice workflows pass in a local Python 3.12 environment. Real B1 grading reached the proxy but model requests were rejected because the upstream account had zero credits, producing no patch and no model spend. Autonomous repair performance and exact Docker image grading remain unmeasured. See the [engineering review](fixers/autonomous/REVIEW.md) for evidence and outstanding gates.

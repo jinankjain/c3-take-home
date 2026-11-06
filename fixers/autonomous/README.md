@@ -20,6 +20,14 @@ A full passing local matrix can be accepted if model review is unavailable. Part
 | `patches.py` | Isolated snapshots, exact edits, Python compilation, installation journals and rollback |
 | `model.py`, `runtime.py` | Proxy requests, spend reservations, subprocess limits and cancellation |
 
+## Verification status
+
+The automated suite has **173 passing tests**, covering invented services and local proxy responses. A baseline smoke run completed on all six practice cases: public tests passed, simulator failures were detected, and service source stayed unchanged.
+
+The official B1 directory run reached the proxy, but OpenRouter rejected model requests with HTTP 402 because the account had zero credits. It produced no patch, spent $0, and scored 0/1. Autonomous repair performance remains unmeasured. Exact image build and grading are also pending because Docker is unavailable on this host.
+
+See [REVIEW.md](REVIEW.md) for the review findings, regression coverage and remaining verification gates, and [WRITEUP.md](WRITEUP.md) for the submission summary.
+
 ## Run locally
 
 From the repository root, with Python 3.12 or newer:
@@ -85,6 +93,8 @@ The Docker image has not yet been built or graded on this host. Grade the exact 
 | `FIXER_THINKING_TOKENS` | Optional thinking budget; default `0`, capped by the response allowance and the proxy's 16k limit |
 
 The controller runs at most two tool subprocesses concurrently and up to 32 repair turns. It bounds file scans, context, responses and command output. Model requests reserve their worst estimated spend before submission and settle against returned usage; prompt caching is provided by the proxy. A rejected spend reservation can trigger one smaller-context/output retry.
+
+Upstream account payment failures stop model requests for that case. An unvalidated candidate can receive one final validation attempt when the loop ends. Completed validation verdicts are retained by source hash.
 
 Time is reserved for installed-source verification and rollback, initially up to 120 seconds and adjusted from baseline measurements up to 180 seconds. SIGTERM/SIGINT sets a cancellation flag; local jobs and HTTP workers observe it and stop. HTTP runs in a separate process so a blocked response can be interrupted. Jev is not currently used; adding cheap relevance decisions is a possible extension.
 

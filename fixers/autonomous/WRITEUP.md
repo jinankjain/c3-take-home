@@ -8,7 +8,7 @@ Accepted patches are installed into the actual workspace, checked again there, a
 
 ## Results
 
-Practice grading and exact-image results are pending. Public local checks do not establish hidden-seed coverage, private-test safety or the grader's reference-based goodput bound.
+All 173 automated controller and fake-proxy checks pass. Baseline smoke runs completed on all six practice cases without source changes or model spend. Real B1 grading produced no patch and scored 0/1 because the upstream account had zero credits. Repair performance remains unmeasured; Docker image verification is also pending. Public checks cannot establish hidden-seed coverage or the reference-based goodput bound.
 
 ## What I would do next
 
