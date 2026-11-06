@@ -6,5 +6,6 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
 grader/.cache/
 proxy/.state/
