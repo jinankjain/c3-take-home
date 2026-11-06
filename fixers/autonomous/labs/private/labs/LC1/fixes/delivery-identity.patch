@@ -1,0 +1,11 @@
+--- a/src/citrine.py
++++ b/src/citrine.py
+@@ -59,7 +59,7 @@
+         row = self.jobs[job]
+         attempt = self.attempts.get(job, 0) + 1
+         self.attempts[job] = attempt
+-        operation_id = f"{row['operation_id']}/attempt/{attempt}"
++        operation_id = row["operation_id"]
+         self.log("dispatch", job=job, attempt=attempt, operation_id=operation_id)
+         self.transport.apply(job, operation_id, deepcopy(row["payload"]))
+         self.schedule(8, "on_timeout", job, attempt)

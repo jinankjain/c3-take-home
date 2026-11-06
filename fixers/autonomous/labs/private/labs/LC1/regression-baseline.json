@@ -1,0 +1,29 @@
+{
+  "case": "LC1",
+  "key": "4bf040bfe5923b938a3fbf2c-c22",
+  "version": "c22-partial-variants",
+  "tests_not_passing": [],
+  "regression_not_passing": [],
+  "tests": [
+    "test_citrine_api::test_completed_receipt_survives_restart",
+    "test_citrine_api::test_invalid_admission[-payload0]",
+    "test_citrine_api::test_invalid_admission[x-payload1]",
+    "test_citrine_api::test_invalid_admission[x-payload2]",
+    "test_citrine_api::test_invalid_admission[x-payload3]",
+    "test_citrine_api::test_normal_delivery_and_receipt",
+    "test_citrine_api::test_payload_conflict_preserves_original_intent",
+    "test_citrine_api::test_repeated_accept_keeps_one_effect"
+  ],
+  "tests_unmasked": [],
+  "regression": [
+    "test_citrine_regression::test_caller_mutation_does_not_change_committed_payload",
+    "test_citrine_regression::test_distinct_jobs_have_distinct_effect_domains",
+    "test_citrine_regression::test_namespaces_keep_external_operation_domains_separate",
+    "test_citrine_regression::test_unknown_and_late_receipts_do_not_create_journal_results"
+  ],
+  "regression_unmasked": [],
+  "variants": {
+    "durable-handoff": {},
+    "delivery-identity": {}
+  }
+}
