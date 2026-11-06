@@ -90,6 +90,7 @@ class SourceManager:
         shutil.copytree(self.original, self.best)
         shutil.copytree(self.best, self.candidate)
         self._generation = 0
+        self._history: list[Path] = []
 
     @property
     def candidate_hash(self) -> str:
@@ -289,4 +290,23 @@ class SourceManager:
             self._install(backup, self.best / "src")
             record("rolled_back")
             raise
+        self._history.append(backup)
         return {"source_hash": verified_hash, "journal": str(journal), "accepted": True}
+
+    def rollback_last(self) -> str:
+        """Recover the previous checkpoint when final tests reject an installation."""
+        if not self._history:
+            raise PatchError("no accepted repair is available to roll back")
+        if source_hash(self.live / "src") != self.best_hash:
+            raise PatchError("live source changed outside the fixer; refusing rollback")
+        snapshot = self._history[-1]
+        expected = source_hash(snapshot)
+        directory = Path(tempfile.mkdtemp(prefix="final-rollback-", dir=self.scratch))
+        plan = self._prepare_install(snapshot, self.live / "src", directory / "prepared")
+        with _defer_termination():
+            self._install_prepared(plan, self.live / "src")
+        self._install(snapshot, self.best / "src")
+        if source_hash(self.live / "src") != expected:
+            raise PatchError("rollback did not restore the prior checkpoint")
+        self._history.pop()
+        return expected

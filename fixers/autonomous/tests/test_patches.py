@@ -150,3 +150,14 @@ def test_source_package_named_results_is_staged_and_editable(tmp_path):
     manager = SourceManager(case)
     assert (manager.candidate / "src/results/__init__.py").is_file()
     manager.apply_edits(manager.candidate_hash, [{"path": "src/results/__init__.py", "old": "1", "new": "2"}])
+
+
+def test_final_rollback_retains_the_previous_accepted_repair(manager):
+    first = edit(manager)["source_hash"]
+    manager.promote(first, lambda case: True)
+    manager.apply_edits(manager.candidate_hash, [{"path": "src/service/worker.py", "old": "VALUE = 2", "new": "VALUE = 3"},
+                                                {"path": "src/helper.py", "content": "VALUE = 4\n"}])
+    manager.promote(manager.candidate_hash, lambda case: True)
+    assert manager.rollback_last() == first
+    assert source_hash(manager.live / "src") == first == manager.best_hash
+    assert not (manager.live / "src/helper.py").exists()
