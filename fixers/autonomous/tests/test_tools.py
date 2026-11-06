@@ -136,7 +136,7 @@ def failure(dispatcher, name, args):
 
 def test_schemas_advertise_only_the_safe_controller_tools():
     expected = {"status", "list_files", "read_file", "search", "trace_slice", "replay",
-                "run_tests", "write_probe", "apply_edits", "reset_candidate",
+                "run_tests", "write_probe", "compose_probe", "apply_edits", "reset_candidate",
                 "record_hypothesis", "validate"}
     assert {definition["name"] for definition in TOOL_DEFINITIONS} == expected
     assert len(TOOL_DEFINITIONS) == len(expected)
@@ -274,6 +274,7 @@ def test_replay_execution_preserves_source_choice_and_failure_evidence(controlle
     assert result["status"] == "invariant_failure"
     assert result["run_id"] in controller.runs
     assert result["source_hash"] == controller.sources.best_hash
+    assert result["current_source_hash"] == controller.sources.candidate_hash
 
 
 def test_trace_slice_reads_only_registered_run_and_retains_provenance(controller, dispatcher):
@@ -327,3 +328,184 @@ def test_validate_forwards_plan_without_owning_acceptance(controller, dispatcher
     assert controller.validation_calls[-1]["reproductions"][0]["scenario"] == "public"
     assert controller.validation_calls[-1]["reproductions"][0]["seed"] == 11
     assert result["accepted"] is False
+
+
+def write_fault(controller, name, document):
+    path = controller.sources.candidate / "scenarios" / "faults" / (name + ".yaml")
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    return path
+
+
+def test_composed_restart_loss_probe_is_immutable_and_binds_all_inputs(controller, dispatcher):
+    from fixer.validation import _scenario_hashes
+
+    source_before = controller.sources.candidate_hash
+    shipped = controller.sources.candidate / "scenarios" / "public.yaml"
+    shipped_before = shipped.read_bytes()
+    restart = success(dispatcher, "write_probe", {"name": "restart", "scenario": {
+        "faults": {"nodes": {"crashes": [{"node": "worker-1", "at": 8, "restart_after": 3}]}},
+        "workload": [{"at": 8.5, "action": "submit", "args": {"task": "interaction-task"}}],
+    }})
+    loss = write_fault(controller, "loss", {"network": {"duplicate": .02}, "gpu": {"lost_reply": .3}})
+    args = {"name": "restart-loss", "base": "public", "probes": [restart["probe"]],
+            "fault_profiles": ["scenarios/faults/loss.yaml"]}
+    result = success(dispatcher, "compose_probe", args)
+    path = Path(result["path"])
+    document = yaml.safe_load(path.read_text())
+    assert document["faults"] == {
+        "network": {"drop": .01, "duplicate": .02}, "gpu": {"lost_reply": .3},
+        "nodes": {"crashes": [{"node": "worker-1", "at": 8, "restart_after": 3}]},
+    }
+    assert document["workload"][0]["at"] == 8.5
+    assert result["source_hash"] == source_before
+    assert result["scenario_hash"] == _scenario_hashes(controller.sources.candidate, str(path), None)[0]
+    assert result["probe_hash"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert result["composition"]["base"]["reference"] == "public"
+    assert result["composition"]["probes"][0]["reference"] == "probe:restart"
+    assert result["composition"]["fault_profiles"][0]["sha256"] == hashlib.sha256(loss.read_bytes()).hexdigest()
+    assert result["composition"]["inherited_faults"][0]["reference"] == "scenarios/faults/network.yaml"
+    assert result["composition"]["read_files"] == 4
+    before = path.read_bytes()
+    failure(dispatcher, "compose_probe", args)
+    assert path.read_bytes() == before and shipped.read_bytes() == shipped_before
+    # The effective scenario no longer depends on a subsequently changed profile.
+    loss.write_text("gpu: {lost_reply: 1}\n")
+    assert _scenario_hashes(controller.sources.candidate, str(path), None)[0] == result["scenario_hash"]
+    assert not (controller.sources.live / "scenarios" / "restart-loss.yaml").exists()
+    assert controller.sources.candidate_hash == source_before
+
+
+def test_composition_scalar_conflicts_require_the_matching_nested_override(controller, dispatcher):
+    write_fault(controller, "different-drop", {"network": {"drop": .02}})
+    args = {"name": "conflict", "base": "public", "fault_profiles": ["faults/different-drop.yaml"]}
+    error = failure(dispatcher, "compose_probe", args)
+    assert "faults.network.drop" in error["message"]
+    failure(dispatcher, "compose_probe", {**args, "overrides": {"faults": {"gpu": {"lost_reply": .2}}}})
+    assert not (controller.sources.scratch / "probes" / "conflict.yaml").exists()
+    result = success(dispatcher, "compose_probe", {**args, "overrides": {"faults": {"network": {"drop": .05}}}})
+    assert yaml.safe_load(Path(result["path"]).read_text())["faults"]["network"]["drop"] == .05
+
+
+def test_composition_preserves_ranges_and_rejects_conflicting_clock_records(controller, dispatcher):
+    clock = {"node": "worker-1", "offset": [-.1, .1], "drift_ppm": [-10, 10]}
+    replacement = {**clock, "offset": [-.2, .2]}
+    base = success(dispatcher, "write_probe", {"name": "clock", "scenario": {
+        "faults": {"nodes": {"clocks": [clock]}}
+    }})
+    write_fault(controller, "clock-change", {"nodes": {"clocks": [replacement]}})
+    args = {"name": "clock-range", "base": base["probe"], "fault_profiles": ["faults/clock-change.yaml"]}
+    error = failure(dispatcher, "compose_probe", args)
+    assert "faults.nodes.clocks" in error["message"]
+    result = success(dispatcher, "compose_probe", {**args, "overrides": {
+        "faults": {"nodes": {"clocks": [replacement]}}
+    }})
+    assert yaml.safe_load(Path(result["path"]).read_text())["faults"]["nodes"]["clocks"] == [replacement]
+
+
+def test_composition_deduplicates_identical_records_and_combines_distinct_restart_times(controller, dispatcher):
+    first = {"node": "worker-1", "at": 10, "restart_after": 1}
+    second = {"node": "worker-1", "at": 20, "restart_after": 2}
+    base = success(dispatcher, "write_probe", {"name": "crash-base", "scenario": {
+        "faults": {"nodes": {"crashes": [first]}}
+    }})
+    write_fault(controller, "crash-more", {"nodes": {"crashes": [first, second]}})
+    result = success(dispatcher, "compose_probe", {"name": "crashes", "base": base["probe"],
+            "fault_profiles": ["faults/crash-more.yaml"]})
+    assert yaml.safe_load(Path(result["path"]).read_text())["faults"]["nodes"]["crashes"] == [first, second]
+    write_fault(controller, "crash-conflict", {"nodes": {"crashes": [{**first, "restart_after": 99}]}})
+    failure(dispatcher, "compose_probe", {"name": "bad-crash", "base": base["probe"],
+            "fault_profiles": ["faults/crash-conflict.yaml"]})
+
+
+@pytest.mark.parametrize("reference", ["../outside.yaml", "/outside.yaml", "scenarios/../outside.yaml"])
+def test_composition_rejects_path_escapes_before_publishing(controller, dispatcher, reference):
+    failure(dispatcher, "compose_probe", {"name": "escape", "base": reference})
+    failure(dispatcher, "compose_probe", {"name": "escape", "base": "public", "fault_profiles": [reference]})
+    failure(dispatcher, "compose_probe", {"name": "escape", "base": "public", "overrides": {"faults": reference}})
+    assert not (controller.sources.scratch / "probes" / "escape.yaml").exists()
+
+
+def test_composition_rejects_symlinks_cycles_invalid_yaml_and_oversized_inputs(controller, dispatcher, tmp_path):
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("secret: sentinel\n")
+    (controller.sources.candidate / "scenarios" / "faults" / "linked.yaml").symlink_to(outside)
+    error = failure(dispatcher, "compose_probe", {"name": "link", "base": "public",
+                    "fault_profiles": ["faults/linked.yaml"]})
+    assert "sentinel" not in json.dumps(error)
+    write_fault(controller, "a", {"faults": "b.yaml"})
+    write_fault(controller, "b", {"faults": "a.yaml"})
+    error = failure(dispatcher, "compose_probe", {"name": "cycle", "base": "public", "fault_profiles": ["faults/a.yaml"]})
+    assert "cyclic" in error["message"]
+    invalid = controller.sources.candidate / "scenarios" / "faults" / "invalid.yaml"
+    invalid.write_text("sentinel: [unfinished\n")
+    error = failure(dispatcher, "compose_probe", {"name": "invalid", "base": "public", "fault_profiles": ["faults/invalid.yaml"]})
+    assert "sentinel" not in error["message"]
+    invalid.write_text("payload: " + "x" * 70_000)
+    failure(dispatcher, "compose_probe", {"name": "large", "base": "public", "fault_profiles": ["faults/invalid.yaml"]})
+    assert not list(controller.sources.scratch.glob("probes/*.yaml"))
+
+
+def test_composition_inlines_explicit_fault_reference_override(controller, dispatcher):
+    write_fault(controller, "override", {"gpu": {"lost_reply": .4}})
+    result = success(dispatcher, "compose_probe", {"name": "fault-override", "base": "public",
+            "overrides": {"faults": "faults/override.yaml"}})
+    assert yaml.safe_load(Path(result["path"]).read_text())["faults"] == {"gpu": {"lost_reply": .4}}
+    assert result["composition"]["inherited_faults"][-1]["reference"] == "scenarios/faults/override.yaml"
+
+
+def test_composition_bounds_section_preview_without_losing_reference_hashes(controller, dispatcher):
+    write_fault(controller, "many-sections", {str(i) + "\x01" * 110: {} for i in range(40)})
+    result = success(dispatcher, "compose_probe", {"name": "many", "base": "public", "fault_profiles": ["faults/many-sections.yaml"]})
+    assert len(json.dumps(result, ensure_ascii=False)) <= 24_000
+    assert result["fault_sections_omitted"] == 25
+    assert result["fault_section_names_truncated"] > 0
+    assert len(result["scenario_hash"]) == 64
+    assert result["composition"]["fault_profiles"][0]["reference"] == "faults/many-sections.yaml"
+
+
+def test_large_trace_envelope_remains_valid_json_through_main_rendering(controller, dispatcher):
+    from fixer.main import tool_text
+
+    run = success(dispatcher, "replay", {"source": "accepted", "scenario": "public", "seed": 1})
+    trace = controller.runs[run["run_id"]].trace_path
+    trace.write_text("".join(json.dumps({"kind": "log", "event": "progress", "seq": i, "t": i,
+                    "task": "long-task", "payload": {"blob": "\x01" * 2000}}) + "\n" for i in range(500)))
+    success(dispatcher, "apply_edits", {"base_hash": controller.sources.candidate_hash,
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+    answer = dispatcher.execute("trace_slice", {"run_id": run["run_id"], "entities": ["long-task"], "limit": 200})
+    rendered = tool_text(answer)
+    parsed = json.loads(rendered)["result"]
+    assert len(rendered) <= 32_000
+    assert parsed["source_hash"] == run["source_hash"]
+    assert parsed["current_source_hash"] == controller.sources.candidate_hash != parsed["source_hash"]
+    assert parsed["events"][0]["seq"] == 0 and parsed["events"][-1]["seq"] == 499
+    assert parsed["omitted_events"] == 500 - len(parsed["events"])
+
+
+def test_large_replay_envelope_discloses_omissions_and_preserves_checker_verdict(controller, dispatcher, monkeypatch):
+    from fixer.main import tool_text
+
+    original = FakeRun.as_dict
+
+    def large_result(run, compact=True):
+        result = original(run, compact)
+        result.update(violations=[{"invariant": "EVENTUAL", "t": i, "detail": "d" * 1000} for i in range(1000)],
+                      violation_count=1000)
+        return result
+
+    monkeypatch.setattr(FakeRun, "as_dict", large_result)
+    answer = dispatcher.execute("replay", {"scenario": "public", "seed": 1})
+    parsed = json.loads(tool_text(answer))["result"]
+    assert len(json.dumps(parsed, ensure_ascii=False)) <= 24_000
+    assert parsed["ok"] is False and parsed["status"] == "invariant_failure"
+    assert parsed["violation_count"] == 1000 and parsed["source_hash"] == controller.sources.candidate_hash
+    assert parsed["violations"][0]["t"] == 0 and parsed["violations"][-1]["t"] == 999
+    assert parsed["response_omissions"]["violations"]["items"] == 1000 - len(parsed["violations"])
+
+
+@pytest.mark.parametrize("field,value", [("at", -1), ("at", True), ("at", 2 ** 1024),
+                                        ("window_s", float("inf")), ("window_s", 3601),
+                                        ("context_lines", -1), ("context_lines", True)])
+def test_trace_focus_rejects_invalid_or_unbounded_arguments(controller, dispatcher, field, value):
+    run = success(dispatcher, "replay", {"scenario": "public", "seed": 1})
+    failure(dispatcher, "trace_slice", {"run_id": run["run_id"], "entities": [], field: value})

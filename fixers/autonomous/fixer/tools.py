@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import math
@@ -14,7 +15,7 @@ from typing import Any
 
 import yaml
 
-from .evidence import trace_slice as slice_trace
+from .evidence import MAX_TRACE_CHARS, bounded_result, trace_slice as slice_trace
 from .patches import PatchError, source_hash
 from .retrieval import FileTools
 from .runtime import TimeLimitError
@@ -23,6 +24,8 @@ from .runtime import TimeLimitError
 MAX_ARGUMENT_BYTES = 256 * 1024
 MAX_PROBE_BYTES = 64 * 1024
 MAX_PROBES = 24
+MAX_COMPOSITION_PARTS = 8
+MAX_COMPOSITION_FILES = 32
 _PROBE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCES = ("candidate", "original", "accepted")
@@ -77,10 +80,13 @@ TOOL_DEFINITIONS = [
         "path": _string(), "mode": _enum(("literal", "regex"), "literal"),
         "limit": _integer(40, default=20),
     }, ("query",)),
-    _tool("trace_slice", "Read a retained run's entity history in global trace order; filters may name kinds, log events, RPC methods, or GPU effects. Sampling preserves first and last matching records.", {
+    _tool("trace_slice", "Read a retained run's entity history in global trace order. at/window_s focus on global trace t; context_lines includes neighboring and linked RPC records. Filters select anchors by kind, log event, method, or effect. Complete bounded JSON preserves source provenance and first/last records, with omission counts.", {
         "run_id": _string(64), "entities": _array(_string(512), 40),
         "event_types": {"type": ["array", "null"], "items": _string(100), "maxItems": 40},
         "limit": _integer(200, default=100),
+        "at": {"type": ["number", "null"], "minimum": 0},
+        "window_s": {"type": "number", "minimum": 0, "maximum": 3600, "default": 2.0},
+        "context_lines": _integer(20, minimum=0, default=0),
     }, ("run_id", "entities")),
     _tool("replay", "Replay and check one source snapshot. Use a shipped scenario name/path or probe:name. Invariant failures are evidence; replay exit zero alone does not certify correctness.", {
         "source": _enum(_SOURCES, "candidate"), "scenario": _string(256, default="public"),
@@ -95,6 +101,13 @@ TOOL_DEFINITIONS = [
         "name": _string(64, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"),
         "scenario": {"type": "object"},
     }, ("name", "scenario")),
+    _tool("compose_probe", "Compose an immutable scratch scenario from a shipped/scratch base, additional scenario probes, and fault profiles. References use shipped names/paths or probe:name. Inherited fault files are inlined. Mappings merge; record lists append with exact dedup. Conflicting scalar/range settings require explicit nested overrides. Replay identical inputs on accepted and candidate source before using them as repair evidence.", {
+        "name": _string(64, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"),
+        "base": _string(256),
+        "fault_profiles": _array(_string(256), MAX_COMPOSITION_PARTS),
+        "probes": _array(_string(256), MAX_COMPOSITION_PARTS),
+        "overrides": {"type": "object"},
+    }, ("name", "base")),
     _tool("apply_edits", "Apply coherent edits only to staged src using the current candidate hash. Each edit is path/content, path/old/new (one exact match), or path/delete:true. Python must remain syntactically valid. Validation owns source promotion.", {
         "base_hash": _string(64, pattern=r"^[0-9a-f]{64}$"),
         "edits": _array({
@@ -278,14 +291,35 @@ class ToolDispatcher:
         if kinds is not None:
             kinds = _texts(kinds, "event_types", 40, 100)
         limit = _int(args.get("limit", 100), "limit", 200)
+        at = args.get("at")
+        if at is not None:
+            at = self._finite(args["at"], "at", 0, 1e15)
+        window = self._finite(args.get("window_s", 2.0), "window_s", 0, 3600)
+        context = _int(args.get("context_lines", 0), "context_lines", 20, 0)
         run = self.controller.runs[run_id]
         trace = FileTools(run.out_dir)._resolve("trace.jsonl")
         if not stat.S_ISREG(trace.stat().st_mode):
             raise ValueError("trace must be a regular file")
-        result = slice_trace(trace, entities, event_types=kinds, limit=limit)
-        return {**result, "run_id": run_id, "source_hash": run.source_hash,
-                "scenario": run.scenario, "scenario_hash": run.scenario_hash, "seed": run.seed,
-                "current_source_hash": self.controller.sources.candidate_hash}
+        provenance = {"run_id": run_id, "source_hash": run.source_hash,
+                      "current_source_hash": self.controller.sources.candidate_hash,
+                      "scenario": run.scenario, "scenario_hash": run.scenario_hash, "seed": run.seed,
+                      "faults": getattr(run, "faults", None), "faults_hash": getattr(run, "faults_hash", None)}
+        return slice_trace(trace, entities, event_types=kinds, limit=limit, at=at,
+                           window_s=window, context_lines=context, provenance=provenance,
+                           max_chars=MAX_TRACE_CHARS,
+                           should_stop=lambda: self.controller.deadline.remaining() <= 0)
+
+    @staticmethod
+    def _finite(value: Any, name: str, minimum: float, maximum: float) -> float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a finite number")
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            raise ValueError(f"{name} must be a finite number") from None
+        if not math.isfinite(number) or not minimum <= number <= maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return number
 
     def _replay(self, args: dict) -> dict:
         source = _choice(args.get("source", "candidate"), _SOURCES, "source")
@@ -293,7 +327,8 @@ class ToolDispatcher:
         seed = _int(args["seed"], "seed", 2**63 - 1, 0)
         faults = self._faults(args.get("faults"))
         result = self.controller.replay(source=source, scenario=scenario, seed=seed, faults=faults)
-        return result.as_dict()
+        return bounded_result({**result.as_dict(), "current_source_hash": self.controller.sources.candidate_hash},
+                              MAX_TRACE_CHARS)
 
     def _run_tests(self, args: dict) -> dict:
         source = _choice(args.get("source", "candidate"), _SOURCES, "source")
@@ -351,6 +386,252 @@ class ToolDispatcher:
             return
         else:
             raise ValueError("probe values must be finite JSON data")
+
+    def _composition_path(self, reference: str) -> Path:
+        reference = _text(reference, "composition reference", 256)
+        if any(ord(char) < 32 for char in reference):
+            raise ValueError("composition references cannot contain control characters")
+        if reference.startswith("probe:"):
+            self._scenario(reference)
+            return FileTools(self._probe_root())._resolve(reference[6:] + ".yaml")
+        supplied = _relative(reference)
+        relative = supplied if supplied.parts and supplied.parts[0] == "scenarios" else Path("scenarios") / supplied
+        options = [relative] if relative.suffix else [relative.with_suffix(ext) for ext in (".yaml", ".yml", ".json")]
+        for option in options:
+            try:
+                path = FileTools(self._root("candidate"))._resolve(option)
+            except FileNotFoundError:
+                continue
+            if option.suffix.lower() not in {".yaml", ".yml", ".json"} or not path.is_file():
+                raise ValueError("composition inputs must be regular scenario/fault files")
+            return path
+        raise ValueError("composition input is not a shipped scenario/fault file")
+
+    def _composition_document(self, path: Path, reference: str, reads: list[int]) -> tuple[dict, dict]:
+        if self.controller.deadline.remaining() <= 0:
+            raise TimeLimitError("deadline prevents additional composition reads")
+        reads[0] += 1
+        if reads[0] > MAX_COMPOSITION_FILES:
+            raise ValueError("composition exceeds its input file limit")
+        if not stat.S_ISREG(path.stat().st_mode) or path.stat().st_size > MAX_PROBE_BYTES:
+            raise ValueError("composition input must be a regular file of at most 64 KiB")
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_PROBE_BYTES + 1)
+        if len(raw) > MAX_PROBE_BYTES:
+            raise ValueError("composition input exceeds 64 KiB")
+        try:
+            document = yaml.safe_load(raw)
+        except (yaml.YAMLError, ValueError, UnicodeError):
+            raise ValueError("composition input is not valid YAML/JSON") from None
+        if not isinstance(document, dict):
+            raise ValueError("composition inputs must contain mappings")
+        self._probe_structure(document)
+        document = json.loads(json.dumps(document, ensure_ascii=False, allow_nan=False))
+        candidate = self._root("candidate")
+        resolved = str(path.relative_to(candidate)) if path.is_relative_to(candidate) else "probe:" + path.stem
+        metadata = {"reference": reference, "sha256": hashlib.sha256(raw).hexdigest()}
+        if resolved != reference:
+            metadata["resolved"] = resolved
+        return document, metadata
+
+    def _inline_composition_faults(self, document: dict, origin: Path, reads: list[int],
+                                   inherited: list[dict], stack: tuple[Path, ...] = ()) -> dict:
+        document = deepcopy(document)
+        faults = document.get("faults")
+        if not isinstance(faults, str):
+            return document
+        if len(stack) >= 8:
+            raise ValueError("fault reference chain exceeds eight files")
+        reference = _text(faults, "probe faults", 1024)
+        if any(ord(char) < 32 for char in reference):
+            raise ValueError("fault references cannot contain control characters")
+        raw = Path(reference)
+        candidate = self._root("candidate")
+        if raw.is_absolute():
+            target = raw
+        else:
+            relative = _relative(reference)
+            if relative.parts and relative.parts[0] == "scenarios":
+                target = candidate / relative
+            elif origin.is_relative_to(candidate / "scenarios"):
+                target = origin.parent / relative
+            else:
+                target = candidate / "scenarios" / relative
+        path = Path(self._probe_fault_path(str(target)))
+        if path in stack:
+            raise ValueError("cyclic fault references cannot be composed")
+        profile, metadata = self._composition_document(path, str(path.relative_to(candidate)), reads)
+        inherited.append(metadata)
+        content = profile.get("faults", profile)
+        if isinstance(content, str):
+            content = self._inline_composition_faults({"faults": content}, path, reads,
+                                                      inherited, stack + (path,))["faults"]
+        if not isinstance(content, dict):
+            raise ValueError("fault profiles must contain mappings")
+        document["faults"] = content
+        return document
+
+    @staticmethod
+    def _composition_override(overrides: dict, path: tuple[str, ...]) -> bool:
+        value: Any = overrides
+        for part in path:
+            if not isinstance(value, dict):
+                return True  # An explicit replacement of an ancestor covers it.
+            if part not in value:
+                return False
+            value = value[part]
+        return True
+
+    @staticmethod
+    def _record_identity(record: dict) -> tuple | None:
+        for key in ("id", "name"):
+            if isinstance(record.get(key), (str, int)):
+                return key, json.dumps(record[key], sort_keys=True)
+        if isinstance(record.get("node"), str):
+            schedule = tuple((key, json.dumps(record[key], sort_keys=True))
+                             for key in ("at", "start", "end", "from", "to") if key in record)
+            return ("node", record["node"], *schedule)
+        return None
+
+    @classmethod
+    def _merge_composition(cls, before: Any, after: Any, overrides: dict,
+                           path: tuple[str, ...] = ()) -> Any:
+        if isinstance(before, dict) and isinstance(after, dict):
+            merged = deepcopy(before)
+            for key in sorted(after):
+                merged[key] = cls._merge_composition(merged[key], after[key], overrides, path + (key,)) \
+                    if key in merged else deepcopy(after[key])
+            return merged
+        same_scalar = type(before) is type(after) and before == after
+        same_number = (isinstance(before, (int, float)) and not isinstance(before, bool)
+                       and isinstance(after, (int, float)) and not isinstance(after, bool) and before == after)
+        if not isinstance(before, (dict, list)) and (same_scalar or same_number):
+            return deepcopy(before)
+        if isinstance(before, list) and isinstance(after, list):
+            if not before:
+                return deepcopy(after)
+            if not after:
+                return deepcopy(before)
+            if all(isinstance(item, dict) for item in before + after):
+                result = deepcopy(before)
+                encoded = {json.dumps(item, sort_keys=True, allow_nan=False) for item in result}
+                identities = {cls._record_identity(item): item for item in result if cls._record_identity(item) is not None}
+                for item in after:
+                    text = json.dumps(item, sort_keys=True, allow_nan=False)
+                    if text in encoded:
+                        continue
+                    identity = cls._record_identity(item)
+                    if identity is not None and identity in identities:
+                        if cls._composition_override(overrides, path):
+                            return deepcopy(before)
+                        raise ValueError(f"conflicting records at {'.'.join(path)}; provide an explicit list override")
+                    result.append(deepcopy(item))
+                    encoded.add(text)
+                    if identity is not None:
+                        identities[identity] = item
+                return result
+            if json.dumps(before, sort_keys=True, allow_nan=False) == json.dumps(after, sort_keys=True, allow_nan=False):
+                return deepcopy(before)
+        if cls._composition_override(overrides, path):
+            return deepcopy(before)  # Apply the declared replacement after merging.
+        raise ValueError(f"conflicting probe setting at {'.'.join(path) or '<root>'}; provide a nested override")
+
+    @classmethod
+    def _apply_composition_overrides(cls, before: Any, overrides: Any, path: tuple[str, ...] = ()) -> Any:
+        if isinstance(before, dict) and isinstance(overrides, dict):
+            if not overrides and path:
+                return {}
+            result = deepcopy(before)
+            for key in sorted(overrides):
+                result[key] = cls._apply_composition_overrides(result.get(key), overrides[key], path + (key,))
+            return result
+        return deepcopy(overrides)
+
+    def _compose_probe(self, args: dict) -> dict:
+        name = _text(args["name"], "name", 64)
+        if not _PROBE_NAME.fullmatch(name):
+            raise ValueError("invalid probe name")
+        base = _text(args["base"], "base", 256)
+        profiles = _texts(args.get("fault_profiles", []), "fault_profiles", MAX_COMPOSITION_PARTS, 256)
+        probes = _texts(args.get("probes", []), "probes", MAX_COMPOSITION_PARTS, 256)
+        overrides = args.get("overrides", {})
+        if not isinstance(overrides, dict):
+            raise ValueError("overrides must be a nested mapping")
+        self._probe_structure(overrides)
+        if "name" in overrides and overrides["name"] != name:
+            raise ValueError("the composed scenario name is set by the name argument")
+        reads = [0]
+        inherited: list[dict] = []
+        path = self._composition_path(base)
+        document, base_metadata = self._composition_document(path, base, reads)
+        document = self._inline_composition_faults(document, path, reads, inherited)
+        probe_metadata = []
+        profile_metadata = []
+        for reference in probes:
+            path = self._composition_path(reference)
+            addition, metadata = self._composition_document(path, reference, reads)
+            addition = self._inline_composition_faults(addition, path, reads, inherited)
+            addition.pop("name", None)
+            document = self._merge_composition(document, addition, overrides)
+            probe_metadata.append(metadata)
+        for reference in profiles:
+            path = self._composition_path(reference)
+            addition, metadata = self._composition_document(path, reference, reads)
+            content = addition.get("faults", addition)
+            normalized = self._inline_composition_faults({"faults": content}, path, reads, inherited)
+            if not isinstance(normalized["faults"], dict):
+                raise ValueError("fault profiles must contain mappings")
+            document = self._merge_composition(document, normalized, overrides)
+            profile_metadata.append(metadata)
+        document = self._apply_composition_overrides(document, overrides)
+        document["name"] = name
+        # Override fault references use write_probe's case-relative semantics.
+        # Inline them too so later changes to an external file cannot change
+        # the composed scenario's effective inputs.
+        if isinstance(document.get("faults"), str):
+            document["faults"] = self._probe_fault_path(document["faults"])
+            document = self._inline_composition_faults(document, path, reads, inherited)
+        self._probe_structure(document)
+        composition = {"base": base_metadata, "probes": probe_metadata, "fault_profiles": profile_metadata,
+                       "inherited_faults": deepcopy(inherited), "inherited_faults_omitted": 0,
+                       "fault_manifest_hash": hashlib.sha256(json.dumps(inherited, sort_keys=True).encode()).hexdigest(),
+                       "overrides_hash": hashlib.sha256(json.dumps(overrides, sort_keys=True).encode()).hexdigest(),
+                       "read_files": reads[0], "resolved_hints_omitted": 0}
+        sections = sorted(document.get("faults", {})) if isinstance(document.get("faults"), dict) else []
+        kept_sections = sections[:8] + (sections[-8:] if len(sections) > 16 else sections[8:])
+        # Check response size before publishing. The placeholder scalar fields
+        # are at least as large as write_probe's actual metadata values.
+        preview = {"probe": "probe:" + name, "path": str(self._probe_root() / (name + ".yaml")),
+                   "bytes": MAX_PROBE_BYTES, "probe_hash": "0" * 64,
+                   "source_hash": self.controller.sources.candidate_hash, "probe_count": MAX_PROBES,
+                   "scenario_hash": "0" * 64, "composition": composition,
+                   "fault_sections": [section if len(section) <= 64 else section[:64] + "…" for section in kept_sections],
+                   "fault_sections_omitted": len(sections) - len(kept_sections),
+                   "fault_section_names_truncated": sum(len(section) > 64 for section in kept_sections)}
+        # Explicit component references/hashes remain complete. Only redundant
+        # resolution hints and inherited-file previews may be reduced.
+        if len(json.dumps(preview, ensure_ascii=False)) > MAX_TRACE_CHARS:
+            for metadata in [base_metadata, *probe_metadata, *profile_metadata, *composition["inherited_faults"]]:
+                if metadata.pop("resolved", None) is not None:
+                    composition["resolved_hints_omitted"] += 1
+        while len(json.dumps(preview, ensure_ascii=False)) > MAX_TRACE_CHARS and composition["inherited_faults"]:
+            items = composition["inherited_faults"]
+            head = (len(items) // 2 + 1) // 2
+            tail = len(items) // 2 - head
+            composition["inherited_faults"] = items[:head] + (items[-tail:] if tail else [])
+            composition["inherited_faults_omitted"] = len(inherited) - len(composition["inherited_faults"])
+        if len(json.dumps(preview, ensure_ascii=False)) > MAX_TRACE_CHARS:
+            raise ValueError("composition references exceed the response budget")
+        if self.controller.deadline.remaining() <= 0:
+            raise TimeLimitError("deadline prevents publishing a composed probe")
+        result = self._write_probe({"name": name, "scenario": document})
+        from .validation import _scenario_hashes
+        identity, _ = _scenario_hashes(self._root("candidate"), result["path"], None)
+        result.pop("faults", None)
+        result.update({key: value for key, value in preview.items()
+                       if key in {"composition", "fault_sections", "fault_sections_omitted", "fault_section_names_truncated"}})
+        result["scenario_hash"] = identity
+        return result
 
     def _write_probe(self, args: dict) -> dict:
         name = _text(args["name"], "name", 64)
