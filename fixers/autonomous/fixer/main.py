@@ -81,6 +81,8 @@ def compact_messages(controller: Controller, messages: list[dict], *, force: boo
 
 def repair_loop(controller: Controller, model: ModelClient) -> None:
     controller.model = model
+    validated_hashes = getattr(controller, "_validated_candidate_hashes", set())
+    controller._validated_candidate_hashes = validated_hashes
     dispatcher = ToolDispatcher(controller)
     messages = [{"role": "user", "content": controller.initial_context}]
     output_tokens = 4096
@@ -121,7 +123,10 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             for call in calls:
                 if controller.deadline.remaining() <= 0 or controller.deadline.stop_event.is_set():
                     return
+                validating_hash = controller.sources.candidate_hash if call["name"] == "validate" else None
                 result = dispatcher.execute(call["name"], call["input"])
+                if validating_hash is not None and result.get("ok"):
+                    validated_hashes.add(validating_hash)
                 emit("tool", name=call["name"], ok=result.get("ok"),
                      source_hash=controller.sources.candidate_hash)
                 results.append({"type": "tool_result", "tool_use_id": call["id"],
@@ -134,8 +139,10 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
         pending = controller.sources.candidate_hash != controller.sources.best_hash
         validation = None
         if pending:
+            validating_hash = controller.sources.candidate_hash
             try:
                 validation = controller.validate({"reason": "finalize proposed repair", "target_invariants": []})
+                validated_hashes.add(validating_hash)
             except (ValueError, OSError, TimeLimitError) as error:
                 validation = {"accepted": False, "error": str(error)}
         status = controller.status()
@@ -145,6 +152,45 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
         messages.append({"role": "user", "content": "Continue diagnosing the remaining supported failures/ticket items. "
                          "Read current source where earlier excerpts have changed. Build a targeted probe if the current evidence "
                          "does not establish a repair.\n" + tool_text({"validation": validation}) + "\n" + prompt_status(controller)})
+
+
+def validate_pending_candidate(controller: Controller) -> dict | None:
+    """Give one unvalidated source version a final controller-gated opportunity.
+
+    The repair loop may stop between staging and validation. The controller owns
+    the local evidence, review policy, deadline limits, and recoverable promotion.
+    Previously rejected versions are not retried when review becomes unavailable.
+    """
+    if controller.deadline.stop_event.is_set():
+        emit("final_candidate_validation_skipped", reason="cancelled")
+        return None
+    candidate = controller.sources.candidate_hash
+    if candidate == controller.sources.best_hash:
+        return None
+    validated_hashes = getattr(controller, "_validated_candidate_hashes", set())
+    controller._validated_candidate_hashes = validated_hashes
+    if candidate in validated_hashes:
+        emit("final_candidate_validation_skipped", reason="source version already validated",
+             source_hash=candidate)
+        return None
+    required = controller.test_seconds * 2 + controller.replay_seconds * 3 + 15
+    remaining = controller.deadline.remaining()
+    if remaining < required:
+        emit("final_candidate_validation_skipped", reason="insufficient installation reserve",
+             seconds_remaining=round(remaining, 2), required_seconds=round(required, 2))
+        return None
+    # Record the attempt before entering any expensive gate: this helper must
+    # not repeat model review for the same version if a caller invokes it again.
+    validated_hashes.add(candidate)
+    emit("final_candidate_validation_started", source_hash=candidate)
+    try:
+        result = controller.validate({"reason": "validate final staged repair",
+                                      "target_invariants": [], "reproductions": []})
+    except (TimeLimitError, ModelError, ValueError, OSError) as error:
+        result = {"accepted": False, "reason": str(error)[:2000]}
+    emit("final_candidate_validation", accepted=result.get("accepted", False),
+         reason=result.get("reason"), source_hash=controller.sources.best_hash)
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -168,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.diagnose:
             model = ModelClient(controller.runner, controller.deadline, config.budget_usd)
             repair_loop(controller, model)
+            validate_pending_candidate(controller)
         try:
             final = controller.finalize()
         except TimeLimitError:
