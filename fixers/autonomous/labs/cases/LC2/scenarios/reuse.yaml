@@ -1,0 +1,8 @@
+name: reuse
+world: {capacity: 2}
+params: {horizon: 60}
+actions:
+  - {at: 0, op: acquire, task: reused-name, units: 1, duration: 3}
+  - {at: 20, op: acquire, task: reused-name, units: 2, duration: 4}
+faults: {}
+expect: {completed: 2, cancelled: 0, all_resolved: true}
