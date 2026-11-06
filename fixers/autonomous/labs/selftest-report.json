@@ -1,0 +1,263 @@
+{
+  "model_calls": 0,
+  "cases": {
+    "LC1": {
+      "grading": {
+        "public_tests": 8,
+        "private_regressions": 4,
+        "reference_messages": {
+          "durable-handoff": {
+            "min": 2,
+            "max": 2
+          },
+          "delivery-identity": {
+            "min": 3,
+            "max": 3
+          }
+        }
+      },
+      "stages": {
+        "unfixed": {
+          "bugs_fixed": 0,
+          "seeds_passed": [
+            0,
+            0
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 13,
+              "families": [
+                "DURABLE_HANDOFF"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 31,
+              "families": [
+                "DURABLE_HANDOFF"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 47,
+              "families": [
+                "DURABLE_HANDOFF"
+              ],
+              "resolved": false
+            }
+          ]
+        },
+        "stage1": {
+          "bugs_fixed": 1,
+          "seeds_passed": [
+            20,
+            0
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 13,
+              "families": [
+                "EXACTLY_ONE_EFFECT"
+              ],
+              "resolved": true
+            },
+            {
+              "seed": 31,
+              "families": [
+                "EXACTLY_ONE_EFFECT"
+              ],
+              "resolved": true
+            },
+            {
+              "seed": 47,
+              "families": [
+                "EXACTLY_ONE_EFFECT"
+              ],
+              "resolved": true
+            }
+          ]
+        },
+        "full": {
+          "bugs_fixed": 2,
+          "seeds_passed": [
+            20,
+            20
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 13,
+              "families": [],
+              "resolved": true
+            },
+            {
+              "seed": 31,
+              "families": [],
+              "resolved": true
+            },
+            {
+              "seed": 47,
+              "families": [],
+              "resolved": true
+            }
+          ]
+        }
+      },
+      "logging_boundary": {
+        "logging_only_edit_cannot_avoid_failure": true,
+        "families": [
+          [
+            "DURABLE_HANDOFF"
+          ],
+          [
+            "EXACTLY_ONE_EFFECT"
+          ]
+        ]
+      },
+      "controller": {
+        "partial_accepted": true,
+        "full_accepted": true,
+        "installed_verified": true,
+        "review": "offline native stub; no model calls"
+      }
+    },
+    "LC2": {
+      "grading": {
+        "public_tests": 8,
+        "private_regressions": 4,
+        "reference_messages": {
+          "recovery-retirement": {
+            "min": 4,
+            "max": 4
+          },
+          "retired-capacity": {
+            "min": 6,
+            "max": 6
+          }
+        }
+      },
+      "stages": {
+        "unfixed": {
+          "bugs_fixed": 0,
+          "seeds_passed": [
+            0,
+            0
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 17,
+              "families": [
+                "RECOVERY_RETIRE"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 37,
+              "families": [
+                "RECOVERY_RETIRE"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 59,
+              "families": [
+                "RECOVERY_RETIRE"
+              ],
+              "resolved": false
+            }
+          ]
+        },
+        "stage1": {
+          "bugs_fixed": 1,
+          "seeds_passed": [
+            20,
+            0
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 17,
+              "families": [
+                "CAPACITY_REUSE"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 37,
+              "families": [
+                "CAPACITY_REUSE"
+              ],
+              "resolved": false
+            },
+            {
+              "seed": 59,
+              "families": [
+                "CAPACITY_REUSE"
+              ],
+              "resolved": false
+            }
+          ]
+        },
+        "full": {
+          "bugs_fixed": 2,
+          "seeds_passed": [
+            20,
+            20
+          ],
+          "tests_ok": true,
+          "regression_ok": true,
+          "determinism": true,
+          "public": [
+            {
+              "seed": 17,
+              "families": [],
+              "resolved": true
+            },
+            {
+              "seed": 37,
+              "families": [],
+              "resolved": true
+            },
+            {
+              "seed": 59,
+              "families": [],
+              "resolved": true
+            }
+          ]
+        }
+      },
+      "logging_boundary": {
+        "logging_only_edit_cannot_avoid_failure": true,
+        "families": [
+          [
+            "RECOVERY_RETIRE"
+          ],
+          [
+            "CAPACITY_REUSE"
+          ]
+        ]
+      },
+      "controller": {
+        "partial_accepted": true,
+        "full_accepted": true,
+        "installed_verified": true,
+        "review": "offline native stub; no model calls"
+      }
+    }
+  },
+  "seconds": 40.41,
+  "ok": true
+}
