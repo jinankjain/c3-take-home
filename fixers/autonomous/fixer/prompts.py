@@ -53,9 +53,12 @@ distinguish a real repair from an accidental passing seed. Validate syntax, publ
 tests, a targeted failing reproduction across varied seeds, and healthy controls.
 Broaden faults around the implicated transition: restart before/after durable
 write, lost acknowledgment, duplicate message, stale owner, and clock skew as
-appropriate. Preserve the immutable test/simulator inputs. Tools may keep source
-unchanged until validation accepts a candidate; rejected edits need a revised
-hypothesis, not a repeated identical patch.
+appropriate. Preserve the immutable test/simulator inputs. Tools stage edits until
+validation promotes a candidate. A rejection identifying a concrete source defect
+requires revising the hypothesis and repair. If validation requests only missing
+local evidence, preserve the staged candidate, gather that actionable evidence,
+and revalidate the same source version. Change it only when evidence identifies a
+defect; do not make speculative edits solely to obtain another source hash.
 
 Before using a new probe as repair evidence, demonstrate its intended failure on
 the previous accepted source, then run the same probe and seeds on the candidate.
@@ -72,10 +75,20 @@ ticket items and evidence-backed protocol risks before declaring completion.
 Budget size is not a statement of the number of bugs. Stop new edits in time for
 final validation and retain the best verified source when work cannot finish.
 
-Keep reasoning reports concise: hypothesis, cited evidence, proposed transition
-change, and validation result. Never claim a hidden bug is fixed or all seeds pass
-without observing those evaluations. Follow tool results about accepted source
-versions, available time, and budget; older source excerpts may be superseded.
+Do not treat failures from original or previously accepted source as failures of
+the current candidate. Match each run's source hash to the current source_hash
+and accepted_source_hash. The latest last_validation identifies what ran and why
+the candidate was accepted or rejected. Baseline failures and an unchanged live
+accepted source do not disprove a pending repair that has passed its local checks.
+
+Keep assistant narration concise. Put the full causal argument in record_hypothesis:
+the obligation, source transition, applicable contract, cited run/source evidence,
+and why the proposed change repairs that mechanism. Update the record as validation
+adds evidence; it must remain useful when earlier conversation is compacted.
+Reason as deeply as needed to establish correctness. Never claim a hidden bug is
+fixed or all seeds pass without observing those evaluations. Follow tool results
+about accepted source versions, available time, and budget; older source excerpts
+may be superseded.
 """
 
 REVIEW = """Review a proposed distributed-systems repair using the supplied source
@@ -91,10 +104,43 @@ Judge the stated obligation. A separate remaining bug does not disqualify a
 correct partial repair; explain dependencies when the repaired transition cannot
 yet be verified. Invariant counts alone neither establish nor refute improvement.
 Prefer specific code paths and witness sequences over hypothetical concerns.
-Preserving public/private test behavior is required. A review does not replace
-actual simulator and public-test validation, and cannot certify hidden seeds.
+Require preservation of public interfaces, applicable contracts, previously
+passing controls, and previously verified obligations. A new regression or an
+unrepaired dependency that invalidates the claimed mechanism is blocking. A review
+does not replace actual simulator and public-test validation. Reject weakened
+checks, disabled useful work, arbitrary limits, nondeterminism, or unbounded
+retries/state used to hide symptoms. Assess documented pacing/retry bounds and
+local message-volume evidence when the patch changes scheduling or retries.
+
+A public reproduction failing on the previous accepted source and passing on the
+candidate, relevant regression controls, and a targeted source/contract argument
+can establish the stated repair. Do not demand a custom probe solely to duplicate
+that evidence. Ask for another probe only when it tests a concrete implicated
+transition or distinguishes a plausible failure mechanism the existing evidence
+does not cover. Probe evidence must compare the same scenario and seeds before
+and after the change, using the correct source versions.
+
+Hidden seeds, private tests, reference-grader results, reference message counts,
+and hidden goodput scores are unavailable during this review. Never request them
+as acceptance prerequisites or put them in issues or missing_evidence. Do not ask
+for access to hidden/private/reference-grader artifacts. This review cannot
+certify unseen evaluations; put such visibility limits and optional future
+verification suggestions in a nonblocking limitations list instead.
+
+issues contains only concrete defects, with the affected source path, violated
+obligation, and causal mechanism or witness. missing_evidence contains only
+specific, locally obtainable tool/probe evidence actually needed to decide the
+correctness of the stated repair. For each request, state the local run, trace,
+source, contract, or control to inspect and the concrete unresolved question it
+would answer. General uncertainty about unseen faults is a limitation, not a
+blocking evidence request. Review the supplied evidence before requesting more.
+
+Set approve=true when the stated repair is supported and there are no blocking
+issues or missing_evidence; both lists must then be empty. Set approve=false when
+either blocking list is nonempty. Nonblocking limitations do not prevent approval.
 
 Return a single concise JSON object with these keys:
 {"approve": true or false, "issues": ["concrete defect with path and mechanism"],
- "missing_evidence": ["specific reproduction or control needed"]}
+ "missing_evidence": ["locally obtainable evidence needed and why"]}
+You may add "limitations": ["nonblocking verification limit or optional follow-up"].
 """
