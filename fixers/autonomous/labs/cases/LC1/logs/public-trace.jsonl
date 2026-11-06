@@ -1,0 +1,11 @@
+{"actions":[{"at":0,"job":"parcel","op":"submit","payload":{"amount":7}}],"expect":{"all_resolved":true,"completed":1,"effects":1},"faults":{"crash_after_accept":["parcel"],"lose_first_reply":["parcel"]},"kind":"scenario","scenario":"public","seed":13,"seq":0,"t":0,"world":{"namespace":"citrine"}}
+{"event":"boot","generation":1,"kind":"log","node":"citrine","seq":1,"t":0}
+{"completed":[],"event":"recovery","kind":"log","node":"citrine","queued":[],"seq":2,"t":0}
+{"accepted":false,"action":"submit","action_id":"c0","job":"parcel","kind":"client","outcome":"pending","payload":{"amount":7},"phase":"begin","seq":3,"t":0}
+{"event":"intake_ack","job":"parcel","kind":"log","node":"citrine","operation_id":"citrine/parcel","payload":{"amount":7},"seq":4,"t":0}
+{"accepted":true,"action":"submit","action_id":"c0","job":"parcel","kind":"client","outcome":"pending","payload":{"amount":7},"phase":"accepted","result":{"accepted":true,"job":"parcel","receipt":null},"seq":5,"t":0}
+{"event":"crash","generation":1,"job":"parcel","kind":"fault","node":"citrine","seq":6,"t":0.5}
+{"event":"boot","generation":2,"kind":"log","node":"citrine","seq":7,"t":0.5}
+{"completed":[],"event":"recovery","kind":"log","node":"citrine","queued":[],"seq":8,"t":0.5}
+{"args":["parcel"],"event":"stale_timer_ignored","generation":1,"kind":"log","method":"flush_intake","node":"citrine","seq":9,"t":5}
+{"actions":[{"accepted":true,"action":"submit","action_id":"c0","job":"parcel","outcome":"pending","payload":{"amount":7}}],"error":null,"kind":"final","seq":10,"t":60}

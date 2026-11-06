@@ -1,0 +1,7 @@
+name: reuse
+params: {horizon: 60}
+actions:
+  - {at: 0, op: submit, job: stable-name, payload: {amount: 7}}
+  - {at: 25, op: submit, job: stable-name, payload: {amount: 7}}
+faults: {}
+expect: {completed: 2, effects: 1, all_resolved: true}
