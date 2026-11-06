@@ -27,6 +27,7 @@ VALIDATION_HISTORY_LIMIT = 8
 VALIDATION_RESULT_LIMIT = 12
 VALIDATION_REVIEW_LIMIT = 6
 VALIDATION_TEXT_LIMIT = 800
+REVIEW_TOOL_NAME = "submit_review"
 
 
 def _ledger_text(value: Any, limit: int = VALIDATION_TEXT_LIMIT) -> str | None:
@@ -64,12 +65,17 @@ def _ledger_tests(result: Any) -> dict:
 def _ledger_review(verdict: dict) -> dict:
     issues = verdict.get("issues", [])
     missing = verdict.get("missing_evidence", [])
+    limitations = verdict.get("limitations", [])
     result = {"approve": verdict.get("approve"),
               "issues": [_ledger_text(item) for item in issues[:VALIDATION_REVIEW_LIMIT]],
               "missing_evidence": [_ledger_text(item) for item in missing[:VALIDATION_REVIEW_LIMIT]],
+              "limitations": [_ledger_text(item) for item in limitations[:VALIDATION_REVIEW_LIMIT]],
               "issues_count": len(issues), "missing_evidence_count": len(missing),
-              "truncated": (len(issues) > VALIDATION_REVIEW_LIMIT or len(missing) > VALIDATION_REVIEW_LIMIT
-                            or any(len(str(item)) > VALIDATION_TEXT_LIMIT for item in [*issues, *missing]))}
+              "limitations_count": len(limitations),
+              "truncated": (any(len(items) > VALIDATION_REVIEW_LIMIT for items in (issues, missing, limitations))
+                            or any(len(str(item)) > VALIDATION_TEXT_LIMIT for item in [*issues, *missing, *limitations]))}
+    if "source_hash" in verdict:
+        result["source_hash"] = verdict["source_hash"]
     if "skipped" in verdict:
         result["skipped"] = _ledger_text(verdict["skipped"])
     return result
@@ -99,20 +105,55 @@ def _invariants(results: list[ReplayResult]) -> set[str]:
     return {item["invariant"] for result in results for item in result.violations}
 
 
-def _review_json(content: list[dict]) -> dict:
-    text = "\n".join(block.get("text", "") for block in content if block.get("type") == "text").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
-    try:
-        verdict = json.loads(text)
-    except ValueError as error:
-        raise ModelError("review returned no complete JSON verdict", code="review_protocol") from error
-    if not isinstance(verdict, dict) or not isinstance(verdict.get("approve"), bool):
+def _review_tool(source_hash: str) -> dict:
+    strings = {"type": "array", "items": {"type": "string"}}
+    return {
+        "name": REVIEW_TOOL_NAME,
+        "description": "Submit the independent repair verdict for the supplied candidate source hash.",
+        "input_schema": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "source_hash": {"type": "string", "enum": [source_hash]},
+                "approve": {"type": "boolean"}, "issues": deepcopy(strings),
+                "missing_evidence": deepcopy(strings), "limitations": deepcopy(strings),
+            },
+            "required": ["source_hash", "approve", "issues", "missing_evidence"],
+        },
+    }
+
+
+def _review_verdict(content: list[dict], source_hash: str) -> dict:
+    """Accept one typed native decision bound to the reviewed source version."""
+    if not isinstance(content, list) or any(not isinstance(block, dict) for block in content):
+        raise ModelError("review returned invalid content blocks", code="review_protocol")
+    if any(not isinstance(block.get("type"), str)
+           or block["type"] not in {"text", "thinking", "redacted_thinking", "tool_use"}
+           for block in content):
+        raise ModelError("review returned an unexpected content block", code="review_protocol")
+    decisions = [block for block in content if block.get("type") == "tool_use"]
+    if len(decisions) != 1:
+        raise ModelError("review must return exactly one submit_review decision", code="review_protocol")
+    call = decisions[0]
+    if (call.get("name") != REVIEW_TOOL_NAME or not isinstance(call.get("id"), str)
+            or not call["id"] or not isinstance(call.get("input"), dict)):
+        raise ModelError("review returned an invalid submit_review call", code="review_protocol")
+    verdict = call["input"]
+    required = {"source_hash", "approve", "issues", "missing_evidence"}
+    if not required.issubset(verdict) or set(verdict) - (required | {"limitations"}):
+        raise ModelError("review returned invalid verdict fields", code="review_protocol")
+    if not isinstance(verdict["source_hash"], str) or verdict["source_hash"] != source_hash:
+        raise ModelError("review decision does not match the candidate source hash", code="review_protocol")
+    if not isinstance(verdict["approve"], bool):
         raise ModelError("review returned an invalid approval", code="review_protocol")
-    for key in ("issues", "missing_evidence"):
-        if not isinstance(verdict.get(key), list) or any(not isinstance(v, str) for v in verdict[key]):
-            raise ModelError("review returned invalid evidence requirements", code="review_protocol")
-    return verdict
+    for key in ("issues", "missing_evidence", "limitations"):
+        if key in verdict and (not isinstance(verdict[key], list)
+                               or any(not isinstance(item, str) for item in verdict[key])):
+            raise ModelError("review returned invalid evidence lists", code="review_protocol")
+    result = {"source_hash": source_hash, "approve": verdict["approve"],
+              "issues": list(verdict["issues"]), "missing_evidence": list(verdict["missing_evidence"])}
+    if "limitations" in verdict:
+        result["limitations"] = list(verdict["limitations"])
+    return result
 
 
 class Controller:
@@ -324,8 +365,11 @@ class Controller:
     def _review(self, plan: dict, before: list[ReplayResult], after: list[ReplayResult], full_pass: bool) -> dict:
         if self.model is None:
             return {"approve": False, "issues": [], "missing_evidence": ["model review is unavailable"]}
+        reviewed_hash = self.sources.candidate_hash
+        tool = _review_tool(reviewed_hash)
         changed = self.sources.diff(max_chars=30000)
         context = "\n\n".join([
+            "# Candidate review identity\n" + json.dumps({"source_hash": reviewed_hash}),
             "# Proposed repair\n" + json.dumps(plan), "# Hypotheses\n" + json.dumps(list(self.hypotheses.values())),
             "# Previously accepted obligations\n" + json.dumps([
                 {key: accepted[key] for key in ("source_hash", "reason", "verified_obligations", "reproductions")}
@@ -335,9 +379,12 @@ class Controller:
             "# Before/after evidence\n" + json.dumps({"before": [brief(r) for r in before], "after": [brief(r) for r in after]}),
         ])
         try:
-            reply = self.model.messages(REVIEW, [{"role": "user", "content": context}], [],
-                                        max_tokens=2048, reserve=max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5))
-            verdict = _review_json(reply.content)
+            reply = self.model.messages(REVIEW, [{"role": "user", "content": context}], [tool],
+                                        max_tokens=2048, reserve=max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5),
+                                        tool_choice={"type": "tool", "name": REVIEW_TOOL_NAME})
+            if reply.stop_reason != "tool_use":
+                raise ModelError("review did not finish with a native tool decision", code="review_protocol")
+            verdict = _review_verdict(reply.content, reviewed_hash)
             emit("repair_review", **verdict, cost_usd=reply.cost_usd)
             return verdict
         except (ModelError, TimeLimitError) as error:

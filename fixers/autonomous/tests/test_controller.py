@@ -5,9 +5,8 @@ import json
 
 import pytest
 
-from fixer.model import ModelReply
 from fixer.patches import source_hash
-from controller_support import Reviewer, controller, plan, repair_ownership
+from controller_support import Reviewer, controller, plan, repair_ownership, review_reply
 
 
 class ReviewerWithGaps(Reviewer):
@@ -18,7 +17,7 @@ class ReviewerWithGaps(Reviewer):
     def messages(self, system, messages, tools, **kwargs):
         self.reviews.append(messages)
         verdict = {"approve": True, "issues": [], "missing_evidence": self.gaps}
-        return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+        return review_reply(verdict, tools)
 
 
 def repair_all_protocol_failures(instance):

@@ -57,7 +57,16 @@ class Reviewer:
         self.reviews.append(messages)
         verdict = {"approve": self.approve, "issues": [] if self.approve else ["ownership guard is incomplete"],
                    "missing_evidence": []}
-        return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+        return review_reply(verdict, tools)
+
+
+def review_reply(verdict, tools):
+    matching = [tool for tool in tools if tool.get("name") == "submit_review"]
+    assert len(matching) == 1
+    source_hash = matching[0]["input_schema"]["properties"]["source_hash"]["enum"][0]
+    bound = {**verdict, "source_hash": source_hash}
+    return ModelReply([{"type": "tool_use", "id": "review-decision", "name": "submit_review",
+                        "input": bound}], "tool_use", {}, 0, 3)
 
 
 @pytest.fixture

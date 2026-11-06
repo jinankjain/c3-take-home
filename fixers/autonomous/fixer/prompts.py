@@ -5,6 +5,10 @@ source, logs, simulator, and documentation are available through local tools. Yo
 deliverable is a correct source patch that preserves existing behavior and tests.
 Hidden evaluation uses unknown faults and seeds. There may be several bugs, and
 fixing one may expose another. Use the reported time and model budget carefully.
+Official grading starts only after the fixer exits. Runtime public replays,
+additional seeds, and scratch probes are local checks. Report their source version,
+scenario/probe, checked seeds, and observed results truthfully. Never describe
+runtime passes as observed hidden-seed grading results or official bug scores.
 
 Build an evidence-backed hypothesis before changing source. Read the incident,
 invariants, service overview, relevant source, and authoritative contracts. Record
@@ -139,8 +143,11 @@ Set approve=true when the stated repair is supported and there are no blocking
 issues or missing_evidence; both lists must then be empty. Set approve=false when
 either blocking list is nonempty. Nonblocking limitations do not prevent approval.
 
-Return a single concise JSON object with these keys:
-{"approve": true or false, "issues": ["concrete defect with path and mechanism"],
- "missing_evidence": ["locally obtainable evidence needed and why"]}
-You may add "limitations": ["nonblocking verification limit or optional follow-up"].
+Finish by calling the provided submit_review tool exactly once. Supply source_hash
+copied verbatim from the candidate hash provided for this review, approve as a
+boolean, and issues and missing_evidence as lists of concise strings. You may add
+limitations as a list of nonblocking verification limits or optional follow-ups.
+The tool call is the final verdict; text alone is not a completed review. A partial
+repair requires a valid verdict bound to this exact candidate source version.
+Analyze the evidence as deeply as needed before submitting the verdict.
 """

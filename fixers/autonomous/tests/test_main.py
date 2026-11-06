@@ -8,14 +8,18 @@ import pytest
 from fixer.main import compact_messages, prompt_status, repair_loop, validate_pending_candidate
 from fixer.model import BudgetExhausted, ModelError, ModelReply
 from fixer.patches import source_hash
-from controller_support import Reviewer, controller, plan
+from controller_support import Reviewer, controller, plan, review_reply
+
+
+def is_review(tools):
+    return any(tool.get("name") == "submit_review" for tool in tools)
 
 
 def test_tool_loop_applies_and_validates_a_native_model_patch(controller):
     class ScriptedModel(Reviewer):
         turns = 0
         def messages(self, system, messages, tools, **kwargs):
-            if not tools:
+            if is_review(tools):
                 return super().messages(system, messages, tools, **kwargs)
             self.turns += 1
             if self.turns == 1:
@@ -76,9 +80,9 @@ def test_compaction_retains_pending_diagnosis_review_gap_and_source_bound_result
     candidate = controller.sources.candidate_hash
 
     class NeedsRestartEvidence(Reviewer):
-        def messages(self, *args, **kwargs):
+        def messages(self, system, messages, tools, **kwargs):
             verdict = {"approve": False, "issues": [], "missing_evidence": [gap]}
-            return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+            return review_reply(verdict, tools)
 
     controller.model = NeedsRestartEvidence()
     rejected = controller.validate(plan())
@@ -260,7 +264,7 @@ def test_final_validation_promotes_full_passing_candidate_without_model_review(c
         remaining_budget = .02
 
         def messages(self, system, messages, tools, **kwargs):
-            if tools:
+            if not is_review(tools):
                 self.turns += 1
                 if self.turns == 1:
                     block = {"type": "tool_use", "id": "final-edit", "name": "apply_edits",
@@ -302,12 +306,12 @@ def test_final_validation_does_not_bypass_a_prior_unchanged_review_rejection(con
         review_calls = 0
 
         def messages(self, system, messages, tools, **kwargs):
-            if not tools:
+            if is_review(tools):
                 self.review_calls += 1
                 if self.review_calls == 1:
                     verdict = {"approve": False, "issues": ["external operation identity still changes on retry"],
                                "missing_evidence": []}
-                    return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+                    return review_reply(verdict, tools)
                 raise ModelError("upstream payment unavailable", code="payment_error")
             self.turns += 1
             if self.turns == 1:
@@ -336,11 +340,11 @@ def test_end_turn_does_not_repeat_rejected_source_review_when_review_becomes_una
         final_feedback = ""
 
         def messages(self, system, messages, tools, **kwargs):
-            if not tools:
+            if is_review(tools):
                 self.review_calls += 1
                 if self.review_calls == 1:
                     verdict = {"approve": False, "issues": [defect], "missing_evidence": []}
-                    return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+                    return review_reply(verdict, tools)
                 raise BudgetExhausted(.1, .02)
             self.turns += 1
             if self.turns == 1:
@@ -369,11 +373,11 @@ def test_explicit_validation_can_revisit_same_source_after_new_reproduction_evid
         review_calls = 0
 
         def messages(self, system, messages, tools, **kwargs):
-            if not tools:
+            if is_review(tools):
                 self.review_calls += 1
                 verdict = {"approve": self.review_calls > 1, "issues": [],
                            "missing_evidence": ["Reproduce public seed 99 on original and candidate."] if self.review_calls == 1 else []}
-                return ModelReply([{"type": "text", "text": json.dumps(verdict)}], "end_turn", {}, 0, 3)
+                return review_reply(verdict, tools)
             self.turns += 1
             if self.turns == 1:
                 blocks = [{"type": "tool_use", "id": "edit", "name": "apply_edits", "input": final_patch(controller)}]
