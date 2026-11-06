@@ -120,12 +120,65 @@ def test_native_tools_preserve_blocks_and_account_for_cached_usage(proxy):
     path, request, headers = proxy.posts[0]
     assert path == "/v1/messages" and request["model"] == CANONICAL_MODEL
     assert request["tools"] == tools and request["system"] == "stable system"
+    assert "tool_choice" not in request
     assert headers["X-Api-Key"] == TOKEN
     history += [{"role": "assistant", "content": reply.content},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-1",
                                                 "content": "class Service: pass"}]}]
     client.messages("stable system", history, tools, reserve=0)
     assert proxy.posts[1][1]["messages"][1]["content"] == blocks
+
+
+def test_forced_named_tool_is_sent_and_native_review_block_is_preserved(proxy):
+    verdict = {"approve": True, "issues": [], "missing_evidence": []}
+    block = {"type": "tool_use", "id": "review-1", "name": "submit_review", "input": verdict}
+    proxy.responses = [(200, message(content=[block], stop_reason="tool_use"), {})]
+    tools = [{"name": "submit_review", "description": "Submit the structured repair review",
+              "input_schema": {"type": "object", "properties": {"approve": {"type": "boolean"}},
+                               "required": ["approve"]}}]
+    client = proxy.client()
+    client.env["FIXER_THINKING_TOKENS"] = "2048"
+    reply = client.messages("review the repair", [{"role": "user", "content": "source and replay evidence"}], tools,
+                            max_tokens=2048, reserve=0, tool_choice={"type": "tool", "name": "submit_review"})
+    assert len(proxy.posts) == 1
+    request = proxy.posts[0][1]
+    assert request["tools"] == tools and request["tool_choice"] == {"type": "tool", "name": "submit_review"}
+    assert "thinking" not in request and request["stream"] is False
+    assert reply.stop_reason == "tool_use" and reply.content == [block]
+    assert reply.content[0]["input"] == verdict and reply.cost_usd > 0
+
+
+@pytest.mark.parametrize("choice", [
+    "auto", [], {"type": "auto"}, {"type": "tool"},
+    {"type": "tool", "name": "undeclared"}, {"type": "tool", "name": ""},
+    {"type": "tool", "name": 17}, {"type": "tool", "name": "submit_review", "extra": True},
+])
+def test_invalid_forced_tool_choice_makes_no_http_request(proxy, choice):
+    client = proxy.client()
+    tools = [{"name": "submit_review", "input_schema": {"type": "object"}}]
+    with pytest.raises(ModelError) as error:
+        client.messages("review", [{"role": "user", "content": "evidence"}], tools, reserve=0,
+                        tool_choice=choice)
+    assert error.value.code == "configuration_error"
+    assert proxy.requests == [] and client.spent_usd == 0 and client.ledger == []
+
+
+def test_forced_tool_choice_without_a_declared_tool_makes_no_http_request(proxy):
+    client = proxy.client()
+    with pytest.raises(ModelError) as error:
+        client.messages("review", [{"role": "user", "content": "evidence"}], [], reserve=0,
+                        tool_choice={"type": "tool", "name": "submit_review"})
+    assert error.value.code == "configuration_error" and proxy.requests == []
+
+
+def test_forced_tool_choice_rejects_incompatible_explicit_thinking_locally(proxy):
+    client = proxy.client()
+    client.env["FIXER_THINKING_TOKENS"] = "2048"
+    with pytest.raises(ModelError) as error:
+        client.messages("review", [{"role": "user", "content": "evidence"}],
+                        [{"name": "submit_review", "input_schema": {"type": "object"}}],
+                        max_tokens=4096, reserve=0, tool_choice={"type": "tool", "name": "submit_review"})
+    assert error.value.code == "configuration_error" and proxy.requests == [] and client.spent_usd == 0
 
 
 def test_reservation_counts_full_input_even_when_cache_hits_are_expected():

@@ -323,17 +323,28 @@ class ModelClient:
         )
 
     def messages(self, system: str, messages: list, tools: list,
-                 max_tokens: int = 4096, reserve: float = 90) -> ModelReply:
+                 max_tokens: int = 4096, reserve: float = 90, *,
+                 tool_choice: dict[str, str] | None = None) -> ModelReply:
         if (not isinstance(system, str) or not isinstance(messages, list) or not messages
                 or not isinstance(tools, list) or not isinstance(max_tokens, int)
                 or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 64_000):
             raise ModelError("invalid Messages request arguments", code="configuration_error")
+        if tool_choice is not None:
+            if (not isinstance(tool_choice, dict) or set(tool_choice) != {"type", "name"}
+                    or tool_choice.get("type") != "tool"
+                    or not isinstance(tool_choice.get("name"), str)
+                    or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", tool_choice["name"]) is None
+                    or sum(isinstance(tool, dict) and tool.get("name") == tool_choice["name"]
+                           for tool in tools) != 1):
+                raise ModelError("tool_choice must name one declared local tool", code="configuration_error")
         if self._payment_rejected:
             raise self._payment_error()
         body = {"model": CANONICAL_MODEL, "system": system, "messages": messages,
                 "max_tokens": max_tokens, "stream": False}
         if tools:
             body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = {"type": "tool", "name": tool_choice["name"]}
         # Explicit thinking is opt-in; the short tool loop remains affordable by
         # default. Preserve returned signed blocks for native continuation.
         try:
@@ -341,6 +352,8 @@ class ModelClient:
         except ValueError:
             raise ModelError("invalid thinking configuration", code="configuration_error") from None
         if thinking >= 1024 and max_tokens > 2048:
+            if tool_choice is not None:
+                raise ModelError("forced tool_choice is incompatible with explicit thinking", code="configuration_error")
             body["thinking"] = {"type": "enabled", "budget_tokens": min(
                 thinking, 16_000, max_tokens - 1024)}
         reservation = estimate_reservation(body)
