@@ -1,0 +1,27 @@
+# Only the entrypoint, Python package and dependency lock enter the build.
+*
+!Dockerfile
+!requirements.txt
+!run.sh
+!fixer/
+!fixer/**
+
+# Exclude development/runtime files even if someone places them in the package.
+**/.env
+**/.env.*
+**/.venv
+**/.git
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/tests
+**/logs
+**/runs
+**/results
+**/artifacts
+**/.c3-fixer-*
+**/*.pem
+**/*.key
+**/credentials.json
+**/secrets.json
+**/secrets.yaml
