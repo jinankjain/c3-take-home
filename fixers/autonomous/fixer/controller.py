@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
@@ -22,6 +23,56 @@ from .validation import ReplayResult, Simulator, _scenario_hashes
 
 
 VALID_REPLAY_STATUSES = {"pass", "invariant_failure", "unresolved"}
+VALIDATION_HISTORY_LIMIT = 8
+VALIDATION_RESULT_LIMIT = 12
+VALIDATION_REVIEW_LIMIT = 6
+VALIDATION_TEXT_LIMIT = 800
+
+
+def _ledger_text(value: Any, limit: int = VALIDATION_TEXT_LIMIT) -> str | None:
+    return None if value is None else str(value)[:limit]
+
+
+def _ledger_seed(value: int) -> int | str:
+    if isinstance(value, int) and value.bit_length() > 256:
+        return f"[seed integer omitted: {value.bit_length()} bits]"
+    return value
+
+
+def _ledger_replay(result: ReplayResult, snapshot: str) -> dict:
+    invariants = sorted({str(item.get("invariant", "?"))[:100]
+                         for item in result.violations})[:8]
+    return {
+        "run_id": _ledger_text(result.run_id, 64),
+        "source_hash": _ledger_text(result.source_hash, 128), "snapshot": snapshot,
+        "scenario": _ledger_text(result.scenario, 256),
+        "scenario_hash": _ledger_text(result.scenario_hash, 128),
+        "seed": _ledger_seed(result.seed), "faults": _ledger_text(result.faults, 256),
+        "status": _ledger_text(result.status, 64), "ok": result.ok,
+        "violation_count": len(result.violations), "invariants": invariants,
+        "violations": [{"invariant": name} for name in invariants],
+        "error": _ledger_text(result.error, 400),
+    }
+
+
+def _ledger_tests(result: Any) -> dict:
+    return {"ok": result.ok, "returncode": result.returncode,
+            "timed_out": result.timed_out, "cancelled": result.cancelled,
+            "duration": round(result.duration, 3)}
+
+
+def _ledger_review(verdict: dict) -> dict:
+    issues = verdict.get("issues", [])
+    missing = verdict.get("missing_evidence", [])
+    result = {"approve": verdict.get("approve"),
+              "issues": [_ledger_text(item) for item in issues[:VALIDATION_REVIEW_LIMIT]],
+              "missing_evidence": [_ledger_text(item) for item in missing[:VALIDATION_REVIEW_LIMIT]],
+              "issues_count": len(issues), "missing_evidence_count": len(missing),
+              "truncated": (len(issues) > VALIDATION_REVIEW_LIMIT or len(missing) > VALIDATION_REVIEW_LIMIT
+                            or any(len(str(item)) > VALIDATION_TEXT_LIMIT for item in [*issues, *missing]))}
+    if "skipped" in verdict:
+        result["skipped"] = _ledger_text(verdict["skipped"])
+    return result
 
 
 def brief(result: ReplayResult, *, timeline: bool = False) -> dict:
@@ -82,6 +133,8 @@ class Controller:
         self._cache: dict[tuple, ReplayResult] = {}
         self._lock = threading.RLock()
         self._validating = False
+        self._validation_progress: dict | None = None
+        self.validation_history: dict[str, dict] = {}
         self.baseline: list[ReplayResult] = []
         self.baseline_tests = None
         self.test_seconds = 2.0
@@ -206,16 +259,45 @@ class Controller:
         current = self.sources.candidate_hash
         best = self.sources.best_hash
         with self._lock:
-            failures = [brief(r) for r in self.runs.values() if r.source_hash == best and not r.ok]
+            failures = [_ledger_replay(r, "accepted") for r in self.runs.values()
+                        if r.source_hash == best and not r.ok][-VALIDATION_RESULT_LIMIT:]
+            candidate = [_ledger_replay(r, "candidate") for r in self.runs.values()
+                         if r.source_hash == current][-VALIDATION_RESULT_LIMIT:]
+            last_validation = deepcopy(self.validation_history.get(current))
+            history = [{key: outcome[key] for key in ("source_hash", "accepted", "reason", "stage", "attempt")}
+                       for outcome in self.validation_history.values()]
         return {
             "source_hash": current, "accepted_source_hash": best,
             "unaccepted_changes": current != best,
+            "last_validation": last_validation,
             "seconds_remaining": round(self.deadline.remaining(), 1),
             "final_reserve": round(self.final_reserve, 1),
             "remaining_budget_usd": self.model.remaining_budget if self.model is not None else self.config.budget_usd,
             "public_seeds": self.config.seeds, "accepted_repairs": len(self.accepted),
-            "hypotheses": list(self.hypotheses.values()), "known_failures": failures[-12:],
+            "known_failures_source": "accepted", "known_failures_source_hash": best,
+            "known_failures": failures, "candidate_results": candidate,
+            "validation_history": history,
+            "hypotheses": list(self.hypotheses.values()),
         }
+
+    def _validation_update(self, stage: str, **facts: Any) -> None:
+        if self._validation_progress is not None:
+            self._validation_progress.update(stage=stage, **facts)
+
+    def _record_validation(self, result: dict, *, complete: bool = True) -> None:
+        """Keep source-bound diagnostic history without changing acceptance gates."""
+        if self._validation_progress is None:
+            return
+        outcome = deepcopy(self._validation_progress)
+        outcome.update(accepted=result.get("accepted", False), complete=complete,
+                       reason=_ledger_text(result.get("reason", "validation ended")))
+        key = outcome["source_hash"]
+        with self._lock:
+            previous = self.validation_history.pop(key, None)
+            outcome["attempt"] = previous["attempt"] + 1 if previous is not None else 1
+            self.validation_history[key] = outcome
+            while len(self.validation_history) > VALIDATION_HISTORY_LIMIT:
+                del self.validation_history[next(iter(self.validation_history))]
 
     def record_hypothesis(self, args: dict) -> dict:
         name = args.get("id")
@@ -267,16 +349,37 @@ class Controller:
     def validate(self, plan: dict) -> dict:
         if self._validating:
             raise ValueError("validation is already running")
-        if self.sources.candidate_hash == self.sources.best_hash:
+        candidate_hash = self.sources.candidate_hash
+        accepted_hash = self.sources.best_hash
+        if candidate_hash == accepted_hash:
             return {"accepted": False, "reason": "candidate contains no source change"}
         self._validating = True
+        self._validation_progress = {
+            "source_hash": candidate_hash, "accepted_source_hash": accepted_hash,
+            "proposal_reason": _ledger_text(plan.get("reason") if isinstance(plan, dict) else None),
+            "stage": "starting",
+            "tests": None,
+            "matrix": {"complete": False, "full_pass": None, "before": [], "after": [], "counts": {}},
+            "determinism": {"complete": False, "ok": None, "expected": 0, "completed": 0, "experiments": []},
+            "witnesses": [], "witness_count": 0, "closed_invariants": [], "review": None,
+        }
         try:
-            return self._validate(plan)
+            result = self._validate(plan)
+            self._record_validation(result)
+            if "status" in result:
+                result["status"] = self.status()
+            return result
+        except Exception as error:
+            self._record_validation({"accepted": False, "reason": f"{type(error).__name__}: {error}"},
+                                    complete=False)
+            raise
         finally:
             self._validating = False
+            self._validation_progress = None
 
     def _validate(self, plan: dict) -> dict:
         frozen = self.sources.candidate_hash
+        self._validation_update("planning", source_hash=frozen)
         install_allowance = self.test_seconds * 2 + self.replay_seconds * 3 + 10
         if self.deadline.remaining() < install_allowance + 5:
             raise TimeLimitError("insufficient time for installed-source verification and rollback")
@@ -286,8 +389,10 @@ class Controller:
             raise ValueError("target_invariants must contain invariant names")
         if not isinstance(reproductions, list) or len(reproductions) > 12:
             raise ValueError("at most 12 reproductions are supported")
+        self._validation_update("public_tests")
         tests = self.simulator.tests(self.sources.candidate, timeout=max(30.0, self.test_seconds * 3),
                                      reserve=install_allowance)
+        self._validation_update("public_tests", tests=_ledger_tests(tests))
         if not tests.ok or self.sources.candidate_hash != frozen:
             return {"accepted": False, "reason": "public tests failed or source changed", "tests": tests.as_dict()}
         experiments = [{"scenario": "public", "seed": seed} for seed in self.config.seeds]
@@ -304,8 +409,17 @@ class Controller:
         base = self.sources.candidate / "scenarios/base.yaml"
         if base.is_file():
             experiments.append({"scenario": "base", "seed": self.config.seeds[0]})
+        matrix = {"complete": False, "full_pass": None, "before": [], "after": [],
+                  "counts": {"experiments": len(experiments), "before": 0, "after": 0},
+                  "truncated": len(experiments) > VALIDATION_RESULT_LIMIT}
+        self._validation_update("matrix", matrix=matrix)
         before = self._matrix("accepted", experiments, reserve=install_allowance)
+        matrix.update(before=[_ledger_replay(r, "accepted") for r in before[:VALIDATION_RESULT_LIMIT]])
+        matrix["counts"].update(before=len(before), before_statuses=dict(Counter(r.status for r in before)))
         after = self._matrix("candidate", experiments, reserve=install_allowance)
+        matrix.update(complete=True, full_pass=all(r.ok for r in after),
+                      after=[_ledger_replay(r, "candidate") for r in after[:VALIDATION_RESULT_LIMIT]])
+        matrix["counts"].update(after=len(after), after_statuses=dict(Counter(r.status for r in after)))
         if any(r.status not in VALID_REPLAY_STATUSES for r in after):
             return {"accepted": False, "reason": "runtime or validation error", "results": [brief(r) for r in after]}
         regressions = [brief(new) for old, new in zip(before, after) if old.ok and not new.ok]
@@ -329,6 +443,12 @@ class Controller:
         witnesses = [brief(new) for old, new in zip(before, after)
                      if old.status in VALID_REPLAY_STATUSES | {"runtime_error"} and not old.ok and new.ok]
         full_pass = all(r.ok for r in after)
+        self._validation_update("obligations", closed_invariants=[str(name)[:100] for name in sorted(closed)[:VALIDATION_RESULT_LIMIT]],
+                                witnesses=[_ledger_replay(new, "candidate")
+                                           for old, new in zip(before, after)
+                                           if old.status in VALID_REPLAY_STATUSES | {"runtime_error"}
+                                           and not old.ok and new.ok][:VALIDATION_RESULT_LIMIT],
+                                witness_count=len(witnesses))
         if not closed and not witnesses:
             return {"accepted": False, "reason": "no reproduced obligation was resolved; construct a probe that fails on accepted source and passes on candidate",
                     "before": [brief(r) for r in before], "after": [brief(r) for r in after]}
@@ -336,22 +456,40 @@ class Controller:
         for item in reproductions:
             if item not in determinism_plan:
                 determinism_plan.append(item)
+        determinism = {"complete": False, "ok": None, "expected": len(determinism_plan),
+                       "completed": 0, "experiments": [], "truncated": len(determinism_plan) > VALIDATION_RESULT_LIMIT}
+        self._validation_update("determinism", determinism=determinism)
         for item in determinism_plan:
             scenario_arg, faults_arg = self._paths(self.sources.candidate, item["scenario"], item.get("faults"))
             deterministic = self.simulator.determinism(self.sources.candidate, scenario_arg,
                                                        seed=item["seed"], faults=faults_arg, reserve=install_allowance)
             for run in deterministic.runs:
                 self.runs[run.run_id] = run
+            determinism["completed"] += 1
+            entry = {
+                "scenario": _ledger_text(item["scenario"], 256), "seed": _ledger_seed(item["seed"]),
+                "faults": _ledger_text(item.get("faults"), 256), "ok": deterministic.ok,
+                "run_ids": [_ledger_text(run.run_id, 64) for run in deterministic.runs[:4]],
+                "source_hash": frozen,
+            }
+            if len(determinism["experiments"]) < VALIDATION_RESULT_LIMIT:
+                determinism["experiments"].append(entry)
             if not deterministic.ok or self.sources.candidate_hash != frozen:
+                determinism.update(ok=False, complete=determinism["completed"] == determinism["expected"],
+                                   failed_experiment=entry)
                 return {"accepted": False, "reason": "candidate is nondeterministic or changed", "experiment": item,
                         "determinism": deterministic.as_dict()}
+        determinism.update(complete=True, ok=True)
+        self._validation_update("review")
         verdict = self._review(plan, before, after, full_pass)
+        self._validation_update("review", review=_ledger_review(verdict))
         if not verdict["approve"] or verdict["issues"] or verdict["missing_evidence"]:
             return {"accepted": False, "reason": "repair review requires changes or evidence", "review": verdict,
                     "results": [brief(r) for r in after]}
         if self.deadline.remaining() < install_allowance:
             raise TimeLimitError("insufficient time to promote the reviewed candidate")
         expected = next(r for r in after if r.seed == self.config.seeds[0])
+        self._validation_update("installation")
         def verify_live(root: Path) -> bool:
             test_result = self.simulator.tests(root, timeout=max(15.0, self.test_seconds * 3), reserve=5)
             scenario, _ = self._paths(root, "public", None)
@@ -373,6 +511,7 @@ class Controller:
                     "closed_invariants": sorted(closed), "full_local_pass": full_pass,
                     "results": [brief(r) for r in after], "promotion": promotion}
         self.accepted.append(accepted)
+        self._validation_update("accepted")
         emit("repair_accepted", source_hash=frozen, closed_invariants=sorted(closed),
              full_local_pass=full_pass, accepted_repairs=len(self.accepted))
         return {"accepted": True, **accepted, "status": self.status()}
