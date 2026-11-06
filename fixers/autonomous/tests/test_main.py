@@ -159,6 +159,22 @@ def test_compaction_bounds_escaped_hypothesis_metadata_without_losing_source_ide
     assert len(json.dumps(compacted, ensure_ascii=False)) <= MAX_CONTEXT_CHARS
 
 
+def test_prompt_ledger_keeps_an_older_id_updated_for_current_source(controller):
+    controller.record_hypothesis({"id": "active-identity", "obligation": "One durable operation identity.",
+                                  "mechanism": "Original diagnosis.", "evidence": ["original trace"], "status": "open"})
+    for number in range(7):
+        controller.record_hypothesis({"id": "other-" + str(number), "obligation": "Other obligation.",
+                                      "mechanism": "Earlier investigation.", "evidence": ["earlier source"], "status": "open"})
+    controller.sources.apply_edits(**final_patch(controller))
+    mechanism = "Current source preserves the winning operation identity on retries."
+    controller.record_hypothesis({"id": "active-identity", "obligation": "One durable operation identity.",
+                                  "mechanism": mechanism, "evidence": ["src/service.py:8"], "status": "proposed"})
+    ledger = json.loads(prompt_status(controller))
+    assert len(ledger["hypotheses"]) == 6
+    active = next(row for row in ledger["hypotheses"] if row["id"] == "active-identity")
+    assert active["source_hash"] == controller.sources.candidate_hash and active["mechanism"] == mechanism
+
+
 @pytest.mark.parametrize("force_minimal", [False, True])
 def test_prompt_ledger_terminates_with_enormous_integer_seeds(controller, monkeypatch, force_minimal):
     import threading
@@ -416,3 +432,394 @@ def test_final_validation_skips_when_installation_reserve_cannot_fit(controller,
     monkeypatch.setattr(controller, "validate", lambda _plan: pytest.fail("validation exhausted installation reserve"))
     assert validate_pending_candidate(controller) is None
     assert source_hash(controller.sources.live / "src") == original
+
+
+def log_events(capsys):
+    captured = capsys.readouterr()
+    rows = []
+    for line in (captured.out + "\n" + captured.err).splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def assert_native_pairs(messages):
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant" or not isinstance(message["content"], list):
+            continue
+        ids = [block["id"] for block in message["content"] if block["type"] == "tool_use"]
+        if ids:
+            assert index + 1 < len(messages) and messages[index + 1]["role"] == "user"
+            following = [block["tool_use_id"] for block in messages[index + 1]["content"]
+                         if block["type"] == "tool_result"]
+            assert ids == following
+
+
+def test_repair_loop_continues_past_32_turns_with_resources(controller, capsys):
+    controller.record_hypothesis({"id": "ownership", "obligation": "One durable owner.",
+                                  "mechanism": "Retry must retain the recorded operation identity.",
+                                  "evidence": ["src/service.py: ownership flag"], "status": "open"})
+
+    class ReadingModel(Reviewer):
+        turns = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            self.turns += 1
+            assert_native_pairs(messages)
+            if self.turns > 34:
+                return ModelReply([{"type": "text", "text": "No further supported diagnosis."}], "end_turn", {}, 0, 3)
+            return ModelReply([{"type": "tool_use", "id": str(self.turns), "name": "status", "input": {}}],
+                              "tool_use", {}, 0, 3)
+
+    model = ReadingModel()
+    repair_loop(controller, model)
+    assert model.turns == 37
+    assert controller.deadline.remaining(controller.final_reserve) > 30
+    stopped = [row for row in log_events(capsys) if row["event"] == "repair_loop_stopped"][-1]
+    assert stopped["reason"] == "completion_limit" and stopped["model_turns"] == 37
+
+
+def test_stalled_reads_force_one_durable_hypothesis_that_survives_compaction(controller, monkeypatch, capsys):
+    from fixer.tools import ToolDispatcher
+
+    original_execute = ToolDispatcher.execute
+
+    def execute(self, name, args):
+        if name == "read_file":
+            return {"ok": True, "result": {"source_hash": controller.sources.candidate_hash,
+                                           "content": "numbered source excerpt " + "r" * 31000}}
+        return original_execute(self, name, args)
+
+    monkeypatch.setattr(ToolDispatcher, "execute", execute)
+    controller.initial_context = "incident orientation\n" + "i" * 160000
+    mechanism = "The retry changes durable operation identity after the commit."
+    evidence = "src/service.py:8, original public trace, winning operation identity."
+
+    class ReadingModel(Reviewer):
+        turns = 0
+        forced = 0
+        final_context = ""
+
+        def messages(self, system, messages, tools, **kwargs):
+            self.turns += 1
+            assert_native_pairs(messages)
+            if kwargs.get("tool_choice"):
+                self.forced += 1
+                assert kwargs["tool_choice"] == {"type": "tool", "name": "record_hypothesis"}
+                assert kwargs["max_tokens"] == 2048
+                forced_context = json.dumps(messages, ensure_ascii=False)
+                assert "# Preserve the current finding" in forced_context
+                assert "label unknowns explicitly" in forced_context
+                block = {"type": "tool_use", "id": "remember", "name": "record_hypothesis", "input": {
+                    "id": "durable-identity", "obligation": "An operation has one durable identity.",
+                    "mechanism": mechanism, "evidence": [evidence], "status": "open"}}
+            elif self.turns >= 16:
+                self.final_context = json.dumps(messages, ensure_ascii=False)
+                raise ModelError("script complete", code="script_complete")
+            else:
+                block = {"type": "tool_use", "id": "read-" + str(self.turns),
+                         "name": "read_file", "input": {"path": "src/service.py"}}
+            return ModelReply([block], "tool_use", {}, 0, 3)
+
+    model = ReadingModel()
+    repair_loop(controller, model)
+    assert model.forced == 1 and controller.hypotheses["durable-identity"]["mechanism"] == mechanism
+    assert mechanism in model.final_context and evidence in model.final_context
+    assert controller.sources.candidate_hash in model.final_context
+    events = log_events(capsys)
+    remembered = next(index for index, row in enumerate(events) if row["event"] == "hypothesis")
+    assert any(row["event"] == "context_compacted" for row in events[remembered + 1:])
+
+
+def test_stalled_candidate_gets_actionable_review_before_more_model_work(controller):
+    gap = "Replay original and candidate public seed 99 before accepting durable identity."
+
+    class FeedbackModel(Reviewer):
+        turns = 0
+        review_calls = 0
+        received_gap = False
+
+        def messages(self, system, messages, tools, **kwargs):
+            if is_review(tools):
+                self.review_calls += 1
+                return review_reply({"approve": self.review_calls > 1, "issues": [],
+                                     "missing_evidence": [gap] if self.review_calls == 1 else []}, tools)
+            self.turns += 1
+            assert_native_pairs(messages)
+            if self.turns == 1:
+                blocks = [{"type": "tool_use", "id": "edit", "name": "apply_edits",
+                           "input": final_patch(controller)}]
+            elif self.turns <= 7:
+                blocks = [{"type": "tool_use", "id": "read-" + str(self.turns),
+                           "name": "read_file", "input": {"path": "src/service.py"}}]
+            elif self.turns == 8:
+                context = json.dumps(messages, ensure_ascii=False)
+                self.received_gap = gap in context and controller.sources.candidate_hash in context
+                assert self.review_calls == 1 and self.received_gap
+                assert "tool_choice" not in kwargs, "validation should take priority over forcing a hypothesis"
+                blocks = [{"type": "tool_use", "id": "original-repro", "name": "replay",
+                           "input": {"source": "original", "seed": 99}},
+                          {"type": "tool_use", "id": "candidate-repro", "name": "replay",
+                           "input": {"source": "candidate", "seed": 99}}]
+            elif self.turns == 9:
+                blocks = [{"type": "tool_use", "id": "validate-with-new-evidence", "name": "validate",
+                           "input": {**plan(), "reproductions": [{"scenario": "public", "seed": 99}]}}]
+            else:
+                return ModelReply([{"type": "text", "text": "The local repair is accepted."}], "end_turn", {}, 0, 3)
+            return ModelReply(blocks, "tool_use", {}, 0, 3)
+
+    model = FeedbackModel()
+    repair_loop(controller, model)
+    assert model.received_gap and model.review_calls == 2 and len(controller.accepted) == 1
+    assert source_hash(controller.sources.live / "src") == controller.sources.candidate_hash
+    assert controller.deadline.remaining(controller.final_reserve) > 30
+
+
+@pytest.mark.parametrize("failure", ["budget", "incomplete"])
+def test_stalled_hypothesis_keeps_forced_decision_after_recoverable_request_failure(controller, capsys, failure):
+    class RecoveringModel(Reviewer):
+        turns = 0
+        forced_requests = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            self.turns += 1
+            assert_native_pairs(messages)
+            if kwargs.get("tool_choice"):
+                self.forced_requests += 1
+                assert kwargs["max_tokens"] == 2048
+                assert kwargs["tool_choice"] == {"type": "tool", "name": "record_hypothesis"}
+                assert "# Preserve the current finding" in json.dumps(messages)
+                if self.forced_requests == 1:
+                    if failure == "budget":
+                        raise BudgetExhausted(.1, .09)
+                    raise ModelError("response truncated", code="incomplete_response")
+                return ModelReply([{"type": "tool_use", "id": "remember-after-retry", "name": "record_hypothesis",
+                                    "input": {"id": "retry-identity", "obligation": "One durable identity.",
+                                              "mechanism": "Retry must preserve the committed operation identity.",
+                                              "evidence": ["src/service.py:8"], "status": "open"}}], "tool_use", {}, 0, 3)
+            if self.forced_requests:
+                return ModelReply([{"type": "text", "text": "No further supported findings."}], "end_turn", {}, 0, 3)
+            return ModelReply([{"type": "tool_use", "id": "read-" + str(self.turns), "name": "read_file",
+                                "input": {"path": "src/service.py"}}], "tool_use", {}, 0, 3)
+
+    model = RecoveringModel()
+    repair_loop(controller, model)
+    assert model.forced_requests == 2
+    assert controller.hypotheses["retry-identity"]["source_hash"] == controller.sources.candidate_hash
+    stopped = [row for row in log_events(capsys) if row["event"] == "repair_loop_stopped"][-1]
+    assert stopped["forced_hypothesis_attempts"] == 2 and stopped["forced_hypotheses"] == 1
+
+
+def test_stalled_unchanged_rejection_is_never_automatically_retried(controller):
+    controller.sources.apply_edits(**final_patch(controller))
+    controller.record_hypothesis({"id": "identity", "obligation": "Stable retry identity.",
+                                  "mechanism": "A retry must use its committed identity.",
+                                  "evidence": ["src/service.py:8"], "status": "proposed"})
+    original = controller.sources.best_hash
+
+    class RejectedModel(Reviewer):
+        review_calls = 0
+        turns = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            if is_review(tools):
+                self.review_calls += 1
+                if self.review_calls > 1:
+                    raise BudgetExhausted(.1, .02)
+                return review_reply({"approve": False, "issues": ["Retry identity still changes."],
+                                     "missing_evidence": []}, tools)
+            self.turns += 1
+            if self.turns > 12:
+                return ModelReply([{"type": "text", "text": "The source has not changed."}], "end_turn", {}, 0, 3)
+            return ModelReply([{"type": "tool_use", "id": str(self.turns), "name": "read_file",
+                                "input": {"path": "src/service.py"}}], "tool_use", {}, 0, 3)
+
+    model = RejectedModel()
+    controller.model = model
+    assert not controller.validate(plan())["accepted"]
+    repair_loop(controller, model)
+    assert model.review_calls == 1 and not controller.accepted
+    assert validate_pending_candidate(controller) is None
+    assert model.review_calls == 1 and source_hash(controller.sources.live / "src") == original
+
+
+def test_compaction_leaves_room_for_another_tool_turn_without_reset(controller):
+    from fixer.main import COMPACT_CONTEXT_CHARS, MAX_CONTEXT_CHARS
+
+    controller.initial_context = "stable orientation\n" + "i" * 10000
+    messages = [{"role": "user", "content": controller.initial_context}]
+    for number in range(7):
+        messages += [{"role": "assistant", "content": [{"type": "tool_use", "id": str(number),
+                                                       "name": "read_file", "input": {"path": "src/service.py"}}]},
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": str(number),
+                                                   "content": "r" * 31000}]}]
+    compacted = compact_messages(controller, messages)
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= COMPACT_CONTEXT_CHARS
+    assert_native_pairs(compacted)
+    assert any(message["role"] == "assistant" for message in compacted)
+    grown = compacted + [{"role": "assistant", "content": [{"type": "tool_use", "id": "next",
+                                                           "name": "read_file", "input": {"path": "src/service.py"}}]},
+                         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "next",
+                                                       "content": "new source " + "r" * 31000}]}]
+    assert len(json.dumps(grown, ensure_ascii=False)) < MAX_CONTEXT_CHARS
+    assert compact_messages(controller, grown) is grown
+    assert_native_pairs(grown)
+
+
+def test_compaction_soft_target_has_finite_escape_safe_fallback(controller, monkeypatch):
+    import threading
+    import fixer.main as main
+
+    ledger = {"source_hash": controller.sources.candidate_hash,
+              "accepted_source_hash": controller.sources.best_hash,
+              "hypotheses": [{"mechanism": '"' * 31000, "evidence": ["quote-heavy source fixture"]}]}
+    text = json.dumps(ledger, ensure_ascii=False)
+    assert len(text) < main.MAX_LEDGER_CHARS
+    monkeypatch.setattr(main, "prompt_status", lambda _controller: text)
+    controller.initial_context = '"' * 160000
+    result = []
+    worker = threading.Thread(target=lambda: result.append(compact_messages(
+        controller, [{"role": "user", "content": controller.initial_context}], force=True)), daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    assert not worker.is_alive() and result, "compaction failed to terminate at its soft target"
+    serialized = json.dumps(result[0], ensure_ascii=False)
+    assert main.COMPACT_CONTEXT_CHARS < len(serialized) <= main.MAX_CONTEXT_CHARS
+    preserved = json.loads(result[0][-1]["content"].split("# Current repair ledger\n", 1)[1])
+    assert preserved == ledger
+
+
+def test_compaction_observes_cancellation_during_adaptation(controller, monkeypatch, capsys):
+    import fixer.main as main
+
+    controller.initial_context = '"' * 160000
+    ledger = json.dumps({"source_hash": controller.sources.candidate_hash,
+                         "accepted_source_hash": controller.sources.best_hash})
+    monkeypatch.setattr(main, "prompt_status", lambda _controller: ledger)
+    original_dumps = json.dumps
+    calls = 0
+
+    def dumps(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        value = original_dumps(*args, **kwargs)
+        if calls == 3:
+            controller.deadline.stop_event.set()
+        return value
+
+    monkeypatch.setattr(main.json, "dumps", dumps)
+    messages = [{"role": "user", "content": controller.initial_context}]
+    for number in range(4):
+        messages += [{"role": "assistant", "content": [{"type": "tool_use", "id": str(number),
+                                                       "name": "status", "input": {}}]},
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": str(number),
+                                                   "content": "r" * 31000}]}]
+    compacted = compact_messages(controller, messages, force=True)
+    assert controller.deadline.stop_event.is_set() and calls < 10
+    assert len(original_dumps(compacted, ensure_ascii=False)) <= main.MAX_CONTEXT_CHARS
+    assert_native_pairs(compacted)
+    compacted_event = [row for row in log_events(capsys) if row["event"] == "context_compacted"][-1]
+    assert compacted_event["cancelled"]
+
+
+def test_turn_limit_telemetry_reports_remaining_resources(controller, monkeypatch, capsys):
+    monkeypatch.setattr("fixer.main.MAX_TURNS", 3)
+
+    class LimitedModel(Reviewer):
+        remaining_budget = 2.5
+        spent_usd = .5
+
+        def messages(self, system, messages, tools, **kwargs):
+            return ModelReply([{"type": "tool_use", "id": "status", "name": "status", "input": {}}],
+                              "tool_use", {}, 0, self.remaining_budget)
+
+    repair_loop(controller, LimitedModel())
+    stopped = [row for row in log_events(capsys) if row["event"] == "repair_loop_stopped"][-1]
+    assert stopped["reason"] == "turn_limit" and stopped["model_turns"] == stopped["attempted_turns"] == 3
+    assert stopped["remaining_budget_usd"] == 2.5 and stopped["model_spent_usd"] == .5
+    assert stopped["seconds_remaining"] > stopped["final_reserve"]
+
+
+def test_proactive_validation_keeps_time_for_actionable_feedback(controller, monkeypatch):
+    controller.sources.apply_edits(**final_patch(controller))
+    monkeypatch.setattr(controller, "validate", lambda _plan: pytest.fail("validation consumed feedback reserve"))
+
+    class ReadingModel(Reviewer):
+        turns = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            self.turns += 1
+            if self.turns == 6:
+                monkeypatch.setattr(controller.deadline, "_end", time.monotonic() + controller.final_reserve + 10)
+            if self.turns > 6:
+                raise ModelError("script complete", code="script_complete")
+            return ModelReply([{"type": "tool_use", "id": str(self.turns), "name": "read_file",
+                                "input": {"path": "src/service.py"}}], "tool_use", {}, 0, 3)
+
+    repair_loop(controller, ReadingModel())
+    assert not controller.accepted
+
+
+def test_verified_promotions_allow_more_than_three_partial_repair_endings(controller, monkeypatch):
+    from types import SimpleNamespace
+    from fixer.tools import ToolDispatcher
+
+    class FourObligationController:
+        initial_context = "Repair four supported local obligations."
+
+        def __init__(self):
+            self.deadline = controller.deadline
+            self.final_reserve = controller.final_reserve
+            self.test_seconds = controller.test_seconds
+            self.replay_seconds = controller.replay_seconds
+            self.sources = SimpleNamespace(candidate_hash="0" * 64, best_hash="0" * 64,
+                                           diff=lambda **_kwargs: "one staged protocol correction")
+            self.accepted = []
+
+        def status(self):
+            return {"source_hash": self.sources.candidate_hash, "accepted_source_hash": self.sources.best_hash,
+                    "unaccepted_changes": self.sources.candidate_hash != self.sources.best_hash,
+                    "seconds_remaining": self.deadline.remaining(), "remaining_budget_usd": 3,
+                    "accepted_repairs": len(self.accepted), "hypotheses": [], "candidate_results": [],
+                    "known_failures": [{"scenario": "public", "seed": 1, "status": "invariant_failure",
+                                        "source_hash": self.sources.best_hash, "violations": [{"invariant": "PROTOCOL"}]}]
+                    if len(self.accepted) < 4 else []}
+
+        def validate(self, _plan):
+            # This fake models the Controller contract: only a passing gate
+            # advances best_hash. Other tests exercise the real gate itself.
+            self.sources.best_hash = self.sources.candidate_hash
+            self.accepted.append({"source_hash": self.sources.best_hash, "reason": "verified local obligation",
+                                  "closed_invariants": ["PROTOCOL"]})
+            return {"accepted": True, "source_hash": self.sources.best_hash}
+
+    staged = FourObligationController()
+
+    def execute(self, name, args):
+        assert name == "apply_edits" and args["base_hash"] == self.controller.sources.candidate_hash
+        self.controller.sources.candidate_hash = f"{len(self.controller.accepted) + 1:064x}"
+        return {"ok": True, "result": {"source_hash": self.controller.sources.candidate_hash}}
+
+    monkeypatch.setattr(ToolDispatcher, "execute", execute)
+
+    class FourRepairModel(Reviewer):
+        turns = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            self.turns += 1
+            assert_native_pairs(messages)
+            if self.turns % 2 and len(staged.accepted) < 4:
+                block = {"type": "tool_use", "id": str(self.turns), "name": "apply_edits", "input": {
+                    "base_hash": staged.sources.candidate_hash,
+                    "edits": [{"path": "src/protocol.py", "content": "# coherent protocol correction"}]}}
+                return ModelReply([block], "tool_use", {}, 0, 3)
+            return ModelReply([{"type": "text", "text": "Validate this supported repair."}], "end_turn", {}, 0, 3)
+
+    model = FourRepairModel()
+    repair_loop(staged, model)
+    assert len(staged.accepted) == 4 and model.turns == 9
+    assert staged.sources.candidate_hash == staged.sources.best_hash
