@@ -18,6 +18,7 @@ from typing import Any
 
 from .model import BudgetExhausted, ModelClient, ModelError
 from .evidence import _ends
+from .controls import plan_controls
 from .experiments import select_experiments
 from .patches import PatchError, SourceManager, source_hash
 from .prompts import REVIEW
@@ -483,16 +484,97 @@ class Controller:
              source_hash=self.sources.best_hash, final_reserve=self.final_reserve)
         if not self.baseline_tests.ok:
             raise RuntimeError("public tests failed on the original staged case; baseline is unusable")
+        self._bootstrap_controls()
         self.initial_context = "\n\n".join([
             "# Case documents\n" + json.dumps(documents, ensure_ascii=False),
             "# Source inventory\n" + json.dumps(self.source_inventory(), ensure_ascii=False),
             "# Applicable corpus excerpts\n" + self.contract_context,
             "# Baseline simulator results\n" + json.dumps([brief(r, timeline=i == 0) for i, r in enumerate(self.baseline)], ensure_ascii=False),
+            "# Healthy-control coverage\n" + json.dumps(self.control_coverage),
             "# Current status\n" + json.dumps(self.status()),
             "Read the relevant source and contracts, record a hypothesis, stage a focused repair, then call validate. "
             "Inspect remaining ticket items after acceptance. All tool paths are relative; probes use probe:name.",
         ])
         return self.initial_context
+
+    def _bootstrap_controls(self) -> None:
+        started = time.monotonic()
+        budget = min(30.0, self.deadline.remaining() * 0.03,
+                     self.deadline.remaining(self.final_reserve))
+        end = started + budget
+
+        def stopped() -> bool:
+            return (self.deadline.stop_event.is_set() or time.monotonic() >= end
+                    or self.deadline.remaining(self.final_reserve) <= 0)
+
+        plan = plan_controls(self.sources.original, self.config.seeds, should_stop=stopped)
+        coverage = {**plan.metadata, "budget_s": round(budget, 3), "attempted": 0, "executed": 0,
+                    "retained": 0, "failed": 0, "errors": 0, "cached": 0,
+                    "runtime_errors": 0, "timeouts": 0, "budget_exhausted": False,
+                    "cancelled": self.deadline.stop_event.is_set()}
+        for item in plan.experiments:
+            remaining = min(end - time.monotonic(), self.deadline.remaining(self.final_reserve))
+            estimate = max(0.05, self.replay_seconds)
+            if stopped() or remaining < estimate * 1.25 + 0.05:
+                coverage["budget_exhausted"] = True
+                break
+            # Holding this additional reserve gives both simulator commands and
+            # its evidence scans the same local phase deadline.
+            reserve = max(self.final_reserve, self.deadline.remaining() - remaining)
+            coverage["attempted"] += 1
+            try:
+                scenario, faults = self._paths(self.sources.original, item["scenario"], item["faults"])
+                identity = _scenario_hashes(self.sources.original, scenario, faults)
+                digest = source_hash(self.sources.original / "src")
+                key = (digest, identity, item["seed"])
+                with self._lock:
+                    result = self._cache.get(key)
+                cached = result is not None
+                if cached:
+                    result = replace(result, scenario=item["scenario"], faults=item["faults"])
+                else:
+                    result = self.simulator.replay(
+                        self.sources.original, scenario, seed=item["seed"], faults=faults,
+                        timeout=min(remaining, max(3.0, estimate * 4)), reserve=reserve,
+                    )
+                    result = replace(result, scenario=item["scenario"], faults=item["faults"])
+                    seconds = result.replay_command.duration + (result.check_command.duration if result.check_command else 0)
+                    with self._lock:
+                        self.runs[result.run_id] = result
+                        if identity[0] is not None and result.status in VALID_REPLAY_STATUSES:
+                            self._cache[key] = result
+                        timing = self._experiment_timings.setdefault((result.scenario_hash, result.seed),
+                                                                    {"count": 0, "total_seconds": 0.0, "worst_seconds": 0.0})
+                        timing["count"] += 1
+                        timing["total_seconds"] += seconds
+                        timing["worst_seconds"] = max(timing["worst_seconds"], seconds)
+                        self.replay_seconds = max(self.replay_seconds, seconds)
+                coverage["executed"] += 1
+                coverage["cached"] += int(cached)
+                retained = result.ok and result.source_hash == self.sources.best_hash and result.scenario_hash is not None
+                if retained:
+                    with self._lock:
+                        self._retain_experiment(result)
+                    coverage["retained"] += 1
+                else:
+                    coverage["failed"] += 1
+                coverage["runtime_errors"] += int(result.status == "runtime_error")
+                coverage["timeouts"] += int(result.status == "timeout")
+                emit("healthy_control", source="original", source_hash=result.source_hash,
+                     scenario=item["scenario"], faults=item["faults"], seed=item["seed"],
+                     seed_origin=item["seed_origin"], run_id=result.run_id, status=result.status,
+                     retained=retained, cached=cached)
+            except TimeLimitError:
+                coverage["budget_exhausted"] = True
+                break
+            except (OSError, ValueError) as error:
+                coverage["errors"] += 1
+                emit("healthy_control_error", error_type=type(error).__name__)
+        coverage.update(elapsed_s=round(time.monotonic() - started, 3),
+                        executed_omitted=max(0, len(plan.experiments) - coverage["attempted"]),
+                        cancelled=self.deadline.stop_event.is_set())
+        self.control_coverage = coverage
+        emit("healthy_control_coverage", **coverage)
 
     def status(self) -> dict:
         current = self.sources.candidate_hash
@@ -525,6 +607,7 @@ class Controller:
             "hypotheses": list(self.hypotheses.values()),
             "retained_experiments": retained, "retained_experiment_count": len(self.retained_experiments),
             "experiment_recommendations": recommendations,
+            "control_coverage": deepcopy(getattr(self, "control_coverage", {})),
             "experiment_metrics": {"measured_runs": sum(item["count"] for item in timings),
                                    "total_compute_seconds": round(sum(item["total_seconds"] for item in timings), 3),
                                    "worst_replay_seconds": round(self.replay_seconds, 3)},
