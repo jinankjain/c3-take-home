@@ -39,12 +39,14 @@ Put the supplied practice OpenRouter key in the repository's `.env`, then start 
 Grade a case through the same proxy and budgets as the pack:
 
 ```sh
-C3_FIXER_PYTHON="$PWD/.venv/bin/python" \
+PATH="$PWD/.venv/bin:$PATH" \
 C3_GRADER_PYTHON="$PWD/.venv/bin/python" \
 ./grade.sh --fixer fixers/autonomous --cases practice/B1
 ```
 
 Omit `--cases` to run all practice cases. Grading makes paid model requests using the practice budget. The proxy reads `.env` when it starts; restart it after changing that file.
+
+Directory grading preserves `PATH` but clears custom interpreter overrides, so the virtual environment must be on `PATH`. `C3_FIXER_PYTHON` works for direct entrypoint invocation.
 
 For a baseline investigation with **no model requests**, set the required C3 case environment and run:
 
@@ -79,7 +81,7 @@ The Docker image has not yet been built or graded on this host. Grade the exact 
 | `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY` | Anthropic-format proxy URL and per-case token |
 | `ANTHROPIC_MODEL` | If set, must be `anthropic/claude-sonnet-4.6` |
 | `OPENAI_BASE_URL` | Optional proxy URL for its budget endpoint; local accounting works without it |
-| `C3_FIXER_PYTHON` | Optional interpreter override for directory grading |
+| `C3_FIXER_PYTHON` | Optional interpreter override for direct invocation; directory grading uses `PATH` |
 | `FIXER_THINKING_TOKENS` | Optional thinking budget; default `0`, capped by the response allowance and the proxy's 16k limit |
 
 The controller runs at most two tool subprocesses concurrently and up to 32 repair turns. It bounds file scans, context, responses and command output. Model requests reserve their worst estimated spend before submission and settle against returned usage; prompt caching is provided by the proxy. A rejected spend reservation can trigger one smaller-context/output retry.
