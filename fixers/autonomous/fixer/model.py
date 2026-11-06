@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -22,9 +23,18 @@ from typing import Any, Mapping
 CANONICAL_MODEL = "anthropic/claude-sonnet-4.6"
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
+MAX_ERROR_BYTES = 8 * 1024
 MAX_WORKER_OUTPUT_BYTES = 768 * 1024
 REQUEST_TIMEOUT = 120.0
 TRANSIENT_STATUSES = {408, 429, 500, 502, 503, 504}
+_CASE_BUDGET_MESSAGE = re.compile(
+    r"budget exhausted: this request may cost up to \$[0-9]+\.[0-9]{4}, "
+    r"remaining \$-?[0-9]+\.[0-9]{4}\Z"
+)
+_USAGE_FIELDS = (
+    "cost", "input_tokens", "output_tokens", "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+)
 
 
 class ModelError(RuntimeError):
@@ -85,10 +95,39 @@ def estimate_reservation(body: Mapping[str, Any]) -> float:
 
 def _number(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        value = float(value)
+        try:
+            value = float(value)
+        except (OverflowError, ValueError):
+            return None
         if math.isfinite(value) and value >= 0:
             return value
     return None
+
+
+def _error_kind(status: int, body: Any) -> str | None:
+    """Recognize the pack's exact budget error without returning its text."""
+    if status != 402:
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return "payment_rejected"
+    native = body.get("type") == "error" and error.get("type") == "billing_error"
+    openai = (error.get("type") == "c3_proxy"
+              and type(error.get("code")) is int and error["code"] == 402)
+    message = error.get("message")
+    if (native or openai) and isinstance(message, str) and len(message) <= 1024:
+        if _CASE_BUDGET_MESSAGE.fullmatch(message) is not None:
+            return "case_budget"
+    return "payment_rejected"
+
+
+def _safe_error_usage(body: Any) -> dict | None:
+    usage = body.get("usage") if isinstance(body, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    # Unknown fields and string values can echo request headers. Invalid known
+    # values become null, preserving conservative accounting for malformed usage.
+    return {key: _number(usage[key]) for key in _USAGE_FIELDS if key in usage}
 
 
 def _usage_cost(usage: Any, reservation: float) -> tuple[float, str]:
@@ -163,6 +202,8 @@ class ModelClient:
         self.spent_usd = 0.0
         self.ledger: list[dict[str, Any]] = []
         self._budget_supported: bool | None = None
+        self._remote_remaining_usd: float | None = None
+        self._payment_rejected = False
         self._base = self.env.get("ANTHROPIC_BASE_URL", "").rstrip("/")
         parsed = urllib.parse.urlsplit(self._base)
         if (parsed.scheme not in {"http", "https"} or not parsed.hostname
@@ -247,15 +288,21 @@ class ModelClient:
             self._budget_supported = False
             return False
         raw_remaining = body.get("remaining_usd")
-        remaining = (max(0.0, float(raw_remaining))
-                     if isinstance(raw_remaining, (int, float)) and not isinstance(raw_remaining, bool)
-                     and math.isfinite(raw_remaining) else None)
+        try:
+            remaining = (float(raw_remaining)
+                         if isinstance(raw_remaining, (int, float))
+                         and not isinstance(raw_remaining, bool) else None)
+        except (OverflowError, ValueError):
+            remaining = None
+        if remaining is not None:
+            remaining = max(0.0, remaining) if math.isfinite(remaining) else None
         remote_budget = _number(body.get("budget_usd"))
         if remaining is None:
             self._budget_supported = False
             return False
         if remote_budget is not None:
             self.budget_usd = min(self.budget_usd, remote_budget)
+        self._remote_remaining_usd = min(self.budget_usd, remaining)
         # An interrupted request may still hold a reservation. Never reclaim its
         # local worst-case charge based on a response that could be racing it.
         self.spent_usd = max(self.spent_usd, self.budget_usd - remaining)
@@ -268,12 +315,21 @@ class ModelClient:
                             "cost_usd": cost, "cost_source": source,
                             "remaining_usd": self.remaining_budget})
 
+    @staticmethod
+    def _payment_error() -> ModelError:
+        return ModelError(
+            "upstream model payment was rejected; check the upstream account balance",
+            status=402, code="upstream_payment_error", retryable=False,
+        )
+
     def messages(self, system: str, messages: list, tools: list,
                  max_tokens: int = 4096, reserve: float = 90) -> ModelReply:
         if (not isinstance(system, str) or not isinstance(messages, list) or not messages
                 or not isinstance(tools, list) or not isinstance(max_tokens, int)
                 or isinstance(max_tokens, bool) or not 1 <= max_tokens <= 64_000):
             raise ModelError("invalid Messages request arguments", code="configuration_error")
+        if self._payment_rejected:
+            raise self._payment_error()
         body = {"model": CANONICAL_MODEL, "system": system, "messages": messages,
                 "max_tokens": max_tokens, "stream": False}
         if tools:
@@ -315,9 +371,17 @@ class ModelClient:
                 content, reason = _validate_message(result)
                 return ModelReply(content, reason, usage or {}, cost, self.remaining_budget)
             if status == 402:
-                self._charge(0.0, "rejected", status)
-                self.refresh_budget(reserve=reserve)
-                raise BudgetExhausted(reservation, self.remaining_budget)
+                usage = result.get("usage") if isinstance(result, dict) else None
+                cost, source = (_usage_cost(usage, reservation) if isinstance(usage, dict)
+                                else (0.0, "rejected"))
+                self._charge(cost, source, status)
+                fresh_budget = self.refresh_budget(reserve=reserve)
+                if (response.get("error_kind") == "case_budget"
+                        or (fresh_budget and self._remote_remaining_usd is not None
+                            and reservation > self._remote_remaining_usd + 1e-9)):
+                    raise BudgetExhausted(reservation, self.remaining_budget)
+                self._payment_rejected = True
+                raise self._payment_error()
             # Explicit HTTP errors settle at zero unless usage reports a charge.
             # A transport failure has an unknown outcome, so keep its reservation.
             usage = result.get("usage") if isinstance(result, dict) else None
@@ -364,33 +428,39 @@ def _http_worker() -> int:
             response = error
         with response:
             status = response.code
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
+            limit = MAX_RESPONSE_BYTES if status == 200 else MAX_ERROR_BYTES
+            raw = response.read(limit + 1)
             try:
                 retry_after = _number(float(response.headers.get("retry-after", "0")))
             except ValueError:
                 retry_after = None
             declared_length = response.headers.get("content-length")
         envelope["status"] = status
-        if len(raw) > MAX_RESPONSE_BYTES:
+        if status == 402:
+            envelope["error_kind"] = "payment_rejected"
+        if len(raw) > limit:
             envelope["error"] = "response_size"
         elif declared_length is not None and int(declared_length) != len(raw):
             envelope["error"] = "response_length"
         else:
             try:
                 body = json.loads(raw)
-            except (ValueError, UnicodeError):
+            except (ValueError, UnicodeError, RecursionError):
                 body = None
             if status == 200 and isinstance(body, dict):
                 envelope.update(body=body, complete=True)
             elif status != 200:
                 # Preserve only accounting data, not an upstream diagnostic that
                 # might echo headers. The controller logs a generic status.
-                usage = body.get("usage") if isinstance(body, dict) else None
-                envelope.update(body={"usage": usage} if isinstance(usage, dict) else None,
+                usage = _safe_error_usage(body)
+                envelope.update(body={"usage": usage} if usage is not None else None,
                                 complete=True)
+                kind = _error_kind(status, body)
+                if kind is not None:
+                    envelope["error_kind"] = kind
             if retry_after:
                 envelope["retry_after"] = retry_after
-    except (ValueError, KeyError, TypeError, urllib.error.URLError,
+    except (ValueError, KeyError, TypeError, RecursionError, urllib.error.URLError,
             http.client.HTTPException, OSError) as error:
         envelope.update(status=status, error=type(error).__name__)
     encoded = json.dumps(envelope, ensure_ascii=False)

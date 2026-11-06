@@ -158,6 +158,163 @@ def test_proxy_402_is_not_retried_and_refreshes_remaining_budget(proxy, remainin
     assert TOKEN not in str(error.value)
 
 
+@pytest.mark.parametrize("body", [
+    {"type": "error", "error": {"type": "billing_error", "message":
+        "budget exhausted: this request may cost up to $0.0800, remaining $0.0000"}},
+    {"error": {"type": "c3_proxy", "code": 402, "message":
+        "budget exhausted: this request may cost up to $0.0800, remaining $-0.0100"}},
+])
+def test_known_pack_budget_errors_allow_a_smaller_later_request_without_budget_route(proxy, body):
+    proxy.budget_status = 404
+    proxy.responses = [(402, body, {}), (200, message(), {})]
+    client = proxy.client()
+    with pytest.raises(BudgetExhausted):
+        client.messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert len(proxy.posts) == 1 and client.spent_usd == 0
+    reply = client.messages("system", [{"role": "user", "content": "finish"}], [],
+                            max_tokens=1024, reserve=0)
+    assert reply.stop_reason == "end_turn" and len(proxy.posts) == 2
+    assert proxy.get_count == 1
+
+
+def test_upstream_credit_rejection_is_distinct_from_available_case_budget(proxy, capsys):
+    proxy.responses = [(402, {"error": {"code": 402, "type": "credits_exhausted",
+                                      "message": "Insufficient credits; echo " + TOKEN}}, {})]
+    client = proxy.client()
+    with pytest.raises(ModelError) as error:
+        client.messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert not isinstance(error.value, BudgetExhausted)
+    assert error.value.code == "upstream_payment_error"
+    assert error.value.status == 402 and not error.value.retryable
+    assert client.remaining_budget == 3 and client.spent_usd == 0
+    assert len(proxy.posts) == 1 and proxy.get_count == 2
+    assert client.ledger[0]["cost_source"] == "rejected"
+    captured = capsys.readouterr()
+    assert TOKEN not in str(error.value) + captured.out + captured.err + json.dumps(client.ledger)
+
+
+def test_payment_rejection_blocks_later_model_turns_and_final_review_without_another_post(proxy):
+    proxy.responses = [(402, {"error": {"message": "Insufficient credits " + TOKEN}}, {}),
+                       (200, message(), {})]
+    client = proxy.client()
+    for instruction in ("repair", "repair with smaller context", "review accepted source"):
+        with pytest.raises(ModelError) as error:
+            client.messages("system", [{"role": "user", "content": instruction}], [],
+                            max_tokens=1024, reserve=0)
+        assert error.value.code == "upstream_payment_error"
+    assert len(proxy.posts) == 1 and proxy.get_count == 2
+    assert len(client.ledger) == 1 and client.spent_usd == 0
+    assert len(proxy.responses) == 1
+
+
+def test_payment_error_settles_reported_cost_without_budget_route_or_echoed_diagnostics(proxy, capsys):
+    proxy.budget_status = 404
+    proxy.responses = [(402, {"error": {"message": "Insufficient credits " + TOKEN},
+                               "usage": {"cost": .25, "input_tokens": TOKEN,
+                                         "request_headers": {"x-api-key": TOKEN}}}, {})]
+    client = proxy.client()
+    with pytest.raises(ModelError) as error:
+        client.messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert error.value.code == "upstream_payment_error"
+    assert len(proxy.posts) == 1 and proxy.get_count == 1
+    assert client.spent_usd == .25 and client.remaining_budget == 2.75
+    assert client.ledger == [{"request": 1, "status": 402, "cost_usd": .25,
+                              "cost_source": "upstream", "remaining_usd": 2.75}]
+    captured = capsys.readouterr()
+    assert TOKEN not in str(error.value) + json.dumps(client.ledger) + captured.out + captured.err
+
+
+def test_unknown_402_does_not_infer_remote_exhaustion_from_a_conservative_local_charge(proxy):
+    proxy.responses = [(402, {"error": {"message": "payment rejected"},
+                               "usage": {"cost": 2.95}}, {})]
+    client = proxy.client()
+    with pytest.raises(ModelError) as error:
+        client.messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert error.value.code == "upstream_payment_error"
+    assert not isinstance(error.value, BudgetExhausted)
+    assert client.remaining_budget == pytest.approx(.05)
+    assert client.spent_usd == 2.95 and proxy.get_count == 2
+
+
+@pytest.mark.parametrize("body", [
+    {"error": {"type": "other", "code": 402, "message":
+        "budget exhausted: this request may cost up to $0.0800, remaining $0.0000"}},
+    {"type": "error", "error": {"type": "billing_error", "message":
+        "budget exhausted: this request may cost up to $0.0800, remaining $0.0000 " + TOKEN}},
+    {"error": {"type": "c3_proxy", "code": 402.0, "message":
+        "budget exhausted: this request may cost up to $0.0800, remaining $0.0000"}},
+])
+def test_budget_like_text_requires_the_exact_pack_error_signature(proxy, body):
+    proxy.responses = [(402, body, {})]
+    client = proxy.client()
+    with pytest.raises(ModelError) as error:
+        client.messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert error.value.code == "upstream_payment_error"
+    assert not isinstance(error.value, BudgetExhausted)
+    assert TOKEN not in str(error.value)
+
+
+@pytest.mark.parametrize("budget_status,remaining", [(404, 3), (200, 10 ** 400)])
+def test_unknown_402_requires_a_successful_fresh_budget_to_infer_case_exhaustion(
+        proxy, budget_status, remaining):
+    proxy.responses = [(402, {"error": {"message": "payment rejected"}}, {})]
+    proxy.budgets = [{"budget_usd": 3, "remaining_usd": 3},
+                    {"budget_usd": 3, "remaining_usd": remaining}]
+    if budget_status == 404:
+        proxy.budget_status = budget_status
+    with pytest.raises(ModelError) as error:
+        proxy.client().messages("system", [{"role": "user", "content": "repair"}], [], reserve=0)
+    assert error.value.code == "upstream_payment_error"
+
+
+def test_isolated_worker_exposes_only_fixed_payment_enum_and_sanitized_usage(proxy):
+    proxy.responses = [(402, {"error": {"type": TOKEN, "message": "echo " + TOKEN},
+                               "usage": {"cost": .015, "input_tokens": 123,
+                                         "output_tokens": TOKEN,
+                                         "cache_read_input_tokens": float("inf"),
+                                         "cache_creation_input_tokens": 10 ** 400,
+                                         "debug": TOKEN}}, {})]
+    client = proxy.client()
+    envelope = client._http("POST", proxy.base + "/v1/messages", {"model": CANONICAL_MODEL},
+                            timeout=2, reserve=0)
+    assert envelope["status"] == 402 and envelope["error_kind"] == "payment_rejected"
+    assert envelope["body"] == {"usage": {"cost": .015, "input_tokens": 123.0,
+                                          "output_tokens": None,
+                                          "cache_read_input_tokens": None,
+                                          "cache_creation_input_tokens": None}}
+    assert TOKEN not in json.dumps(envelope)
+
+
+@pytest.mark.parametrize("body,error_code", [
+    ({"error": {"message": TOKEN + "x" * model.MAX_ERROR_BYTES}}, "response_size"),
+    (b'{"error":' + TOKEN.encode(), None),
+    (("[" * 1500 + json.dumps(TOKEN) + "]" * 1500).encode(), None),
+])
+def test_oversized_or_malformed_payment_diagnostics_are_bounded_and_redacted(proxy, body, error_code):
+    proxy.responses = [(402, body, {})]
+    client = proxy.client()
+    envelope = client._http("POST", proxy.base + "/v1/messages", {"model": CANONICAL_MODEL},
+                            timeout=2, reserve=0)
+    assert envelope["status"] == 402 and envelope["error_kind"] == "payment_rejected"
+    assert envelope["body"] is None
+    if error_code:
+        assert envelope["error"] == error_code and not envelope["complete"]
+    assert len(json.dumps(envelope)) < 512 and TOKEN not in json.dumps(envelope)
+
+
+def test_invalid_usage_in_error_keeps_conservative_accounting_without_diagnostics(proxy):
+    proxy.responses = [(400, {"error": {"message": TOKEN},
+                              "usage": {"input_tokens": 1000, "output_tokens": TOKEN}}, {})]
+    client = proxy.client()
+    history = [{"role": "user", "content": "repair"}]
+    with pytest.raises(ModelError) as error:
+        client.messages("system", history, [], reserve=0)
+    assert error.value.status == 400 and TOKEN not in str(error.value)
+    assert client.ledger[-1]["cost_source"] == "reservation"
+    assert client.spent_usd == pytest.approx(client.estimate_reservation(
+        {"system": "system", "messages": history, "max_tokens": 4096}))
+
+
 def test_transient_http_error_retries_once_with_bounded_accounting(proxy):
     proxy.responses = [(503, {"error": {"message": "temporary"}},
                         {"retry-after": "Fri, 31 Dec 2099 23:59:59 GMT"}),
