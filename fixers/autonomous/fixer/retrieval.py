@@ -1,4 +1,4 @@
-"""Bounded file tools and corpus retrieval, without an embedding service.
+"""Bounded file tools and lexical retrieval with optional weak-match decisions.
 
 Corpus metadata is discovered from INDEX.md and document headers. Service and
 platform documents are small enough to inspect locally; background proceedings
@@ -8,13 +8,15 @@ are read only when explicitly requested and are never indexed in full.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import math
 import os
 from pathlib import Path
+import posixpath
 import re
 import stat
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Callable, Iterator, Mapping
 
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -25,6 +27,8 @@ MAX_OUTPUT_CHARS = 48_000
 MAX_QUERY_CHARS = 512
 MAX_METADATA_BYTES = 16_384
 MAX_CACHE_CHARS = 8 * 1024 * 1024
+MAX_RELEVANCE_DOCUMENTS = 8
+MAX_RETAINED_PATHS = 512
 SKIP_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules",
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -290,10 +294,17 @@ class _Document:
 
 
 class Corpus:
-    def __init__(self, corpus_root: Path, codebase: str | None = None):
+    def __init__(
+        self, corpus_root: Path, codebase: str | None = None, *,
+        relevancy: Callable[[str, list[dict]], Mapping[str, bool] | None] | None = None,
+    ):
+        if relevancy is not None and not callable(relevancy):
+            raise ValueError("relevancy must be a callable or None")
         self.files = FileTools(corpus_root)
         self.root = self.files.root
         self.codebase = str(codebase) if codebase is not None else None
+        self.relevancy = relevancy
+        self._retained_paths: dict[str, None] = {}
         self._cache: dict[str, _Document] = {}
         self._cache_chars = 0
         self._indexed_status: dict[str, str] = {}
@@ -472,6 +483,86 @@ class Corpus:
             begin = line_begin
         return text.count("\n", 0, begin), text[begin:begin + cap]
 
+    def _retain(self, path: str) -> None:
+        self._retained_paths.pop(path, None)
+        self._retained_paths[path] = None
+        while len(self._retained_paths) > MAX_RETAINED_PATHS:
+            self._retained_paths.pop(next(iter(self._retained_paths)))
+
+    def _remember_references(self, document_path: str, text: str) -> None:
+        """Retain local document links, without expanding the whole catalog."""
+        references = re.finditer(
+            r"\]\(([^()\s]{1,512})\)|`([^`\n]{1,512})`|((?:platform|service|background)/[\w./-]{1,300})",
+            text[:MAX_FILE_BYTES],
+        )
+        for index, match in enumerate(references):
+            if index >= MAX_RETAINED_PATHS:
+                break
+            groups = match.groups()
+            reference = next((value for value in groups if value), "").split("#", 1)[0]
+            if not reference or ":" in reference or reference.startswith("/"):
+                continue
+            if Path(reference).suffix.lower() not in DOC_SUFFIXES:
+                continue
+            if reference.split("/", 1)[0] in {"service", "platform", "background"}:
+                relative = reference
+            else:
+                relative = posixpath.join(posixpath.dirname(document_path), reference)
+            relative = posixpath.normpath(relative)
+            if (relative.split("/", 1)[0] in {"service", "platform", "background"}
+                    and not _excluded(Path(relative).parts)):
+                self._retain(relative)
+
+    def _protected(self, document: _Document, query: str, terms: set[str], root: str) -> bool:
+        # Current contracts found in the applicable service/platform search are
+        # retained even if a classifier considers their supporting context weak.
+        if (document.truncated or document.path in self._retained_paths
+                or root.rstrip("/") == document.path
+                or document.status == "CURRENT" and document.path.startswith(("service/", "platform/"))):
+            return True
+        lowered = query.casefold()
+        if (document.path.casefold() in lowered
+                or Path(document.path).name.casefold() in lowered
+                or lowered in (document.path + " " + document.title + "\n" + document.text).casefold()):
+            return True
+        # Complete lexical coverage is direct evidence. Jev only receives
+        # partial, weak overlap; one-term literal searches stay lexical.
+        return bool(terms) and terms.issubset(_terms(document.path + " " + document.title + " " + document.text))
+
+    def _filter_relevance(
+        self, query: str, terms: set[str], root: str, results: list[dict],
+        documents: dict[str, _Document],
+    ) -> list[dict]:
+        if self.relevancy is None:
+            return results
+        weak = []
+        seen = set()
+        for result in results:
+            path = result["path"]
+            document = documents[path]
+            if path in seen or self._protected(document, query, terms, root):
+                continue
+            seen.add(path)
+            text = "\n".join(item["text"] for item in results if item["path"] == path)[:3500]
+            weak.append({"path": path, "title": document.title[:200],
+                         "status": document.status, "text": text,
+                         "content_hash": hashlib.sha256(document.text.encode()).hexdigest()})
+            if len(weak) >= MAX_RELEVANCE_DOCUMENTS:
+                break
+        if not weak:
+            return results
+        try:
+            decisions = self.relevancy(query, weak)
+            if not isinstance(decisions, Mapping):
+                return results
+            allowed = {item["path"] for item in weak}
+            rejected = {path for path in allowed if decisions.get(path) is False}
+        except Exception:
+            # Optional ranking must not become a tool failure or suppress facts
+            # when the proxy, budget or classifier is unavailable.
+            return results
+        return [item for item in results if item["path"] not in rejected]
+
     def search(self, query: str, root: str = "service", limit: int = 12) -> list[dict]:
         query = _query(query)
         limit = _bounded_int(limit, 40, "limit")
@@ -479,10 +570,16 @@ class Corpus:
         if not terms:
             return []
         ranked = []
-        for document in self._documents(root, query):
+        documents = {document.path: document for document in self._documents(root, query)}
+        for document in documents.values():
+            remembered = False
             for start, end, text in self._sections(document):
                 score = self._score(document, text, terms)
                 if score:
+                    if (not remembered and document.status == "CURRENT"
+                            and document.path.startswith(("service/", "platform/"))):
+                        self._remember_references(document.path, document.text)
+                        remembered = True
                     ranked.append({
                         "path": document.path, "start": start, "end": end,
                         "status": document.status, "score": score, "text": text,
@@ -492,6 +589,7 @@ class Corpus:
         results = []
         per_document: dict[str, int] = {}
         remaining = MAX_OUTPUT_CHARS
+        shortlist_limit = min(40, limit + MAX_RELEVANCE_DOCUMENTS) if self.relevancy is not None else limit
         for item in ranked:
             if per_document.get(item["path"], 0) >= 2:
                 continue
@@ -502,14 +600,16 @@ class Corpus:
             results.append(item)
             per_document[item["path"]] = per_document.get(item["path"], 0) + 1
             remaining -= len(excerpt)
-            if len(results) >= limit or remaining <= 0:
+            if len(results) >= shortlist_limit or remaining <= 0:
                 break
-        return results
+        return self._filter_relevance(query, terms, root, results, documents)[:limit]
 
     def read(self, path: str, start: int = 1, end: int | None = None, max_chars: int = 16_000) -> dict:
         result = self.files.read(path, start, end, max_chars)
         target = self.files._resolve(path)
         document = self._document(target, max_bytes=MAX_METADATA_BYTES)
+        self._retain(document.path)
+        self._remember_references(document.path, result["text"])
         return {**result, "status": document.status}
 
     def bootstrap(self, query: str, max_chars: int = 40_000) -> str:
@@ -552,6 +652,8 @@ class Corpus:
         selected = core + platform_docs[:6]
         retrieval_reserve = min(10_000, max_chars // 4)
         for position, document in enumerate(selected):
+            self._retain(document.path)
+            self._remember_references(document.path, document.text)
             available = max(0, remaining - retrieval_reserve)
             cap = min(5500, available // max(1, len(selected) - position))
             if cap < 300:

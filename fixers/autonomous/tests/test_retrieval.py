@@ -248,3 +248,152 @@ def test_literal_search_window_contains_match_late_in_long_line(tmp_path: Path):
     result = FileTools(tmp_path).search("needle", path="src")[0]
     assert "needle" in result["text"]
     assert len(result["text"]) <= 1500 and result["truncated"]
+
+
+def test_relevance_only_filters_weak_hits_and_preserves_current_and_direct_evidence(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/current.md", "# Current clock contract\nStatus: CURRENT\nA lease uses the receipt clock.\n")
+    write(tmp_path, "platform/direct.md", "# Historical protocol\nA lease revoke operation fences the holder.\n")
+    write(tmp_path, "platform/weak.md", "# Historical report\nThe lease appears in an unrelated storage report.\n")
+    calls = []
+    def reject_weak(query, documents):
+        calls.append((query, documents))
+        # A classifier cannot suppress a protected path by inventing a decision.
+        return {**{item["path"]: False for item in documents}, "platform/current.md": False}
+    corpus = Corpus(tmp_path, relevancy=reject_weak)
+    results = corpus.search("lease revoke", root="platform")
+    assert {item["path"] for item in results} == {"platform/current.md", "platform/direct.md"}
+    assert len(calls) == 1 and calls[0][0] == "lease revoke"
+    assert [item["path"] for item in calls[0][1]] == ["platform/weak.md"]
+    assert set(calls[0][1][0]) == {"path", "title", "status", "text", "content_hash"}
+    assert len(calls[0][1][0]["content_hash"]) == 64
+
+
+def test_current_selected_service_and_literal_single_term_queries_bypass_relevance(corpus_root: Path):
+    calls = []
+    corpus = Corpus(corpus_root, "nebula", relevancy=lambda query, documents: calls.append(documents))
+    assert corpus.search("lease revoke")
+    assert calls == []
+    # Even an unmarked document is direct evidence for a literal query.
+    write(corpus_root, "platform/weak.md", "# Notes\nlease observations from another system.\n")
+    assert corpus.search("lease", root="platform")
+    assert calls == []
+
+
+def test_focused_search_and_explicit_read_preserve_the_requested_document(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    path = "platform/weak.md"
+    write(tmp_path, path, "# Notes\nlease observations from another mechanism.\n")
+    calls = []
+    corpus = Corpus(tmp_path, relevancy=lambda query, documents: calls.append(documents))
+    assert corpus.search("lease revoke", root=path)
+    assert calls == []
+    corpus.read(path)
+    assert corpus.search("lease revoke", root="platform")
+    assert calls == []
+
+
+@pytest.mark.parametrize("link", ["[Prior detail](weak.md)", "`platform/weak.md`"])
+def test_explicit_reference_from_current_contract_cannot_be_filtered(tmp_path: Path, link: str):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/current.md", "# Current contract\nStatus: CURRENT\nLease receipt clock. See " + link + ".\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nLease observations from another mechanism.\n")
+    calls = []
+    corpus = Corpus(tmp_path, relevancy=lambda query, documents: calls.append(documents))
+    results = corpus.search("lease revoke", root="platform")
+    assert any(item["path"] == "platform/weak.md" for item in results)
+    assert calls == []
+
+
+def test_bootstrap_service_reference_resolves_relative_to_its_document(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "service/nebula/design.md", "# Nebula design overview\nStatus: CURRENT\nLease control. See [history](../../platform/weak.md).\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nLease observations from another mechanism.\n")
+    corpus = Corpus(tmp_path, "nebula")
+    corpus.bootstrap("lease revoke")
+    calls = []
+    corpus.relevancy = lambda query, documents: calls.append(documents)
+    assert corpus.search("lease revoke", root="platform")
+    assert calls == []
+
+
+@pytest.mark.parametrize("verdict", [None, [], True, 0, "unknown"])
+def test_unavailable_or_malformed_relevance_falls_back_to_identical_lexical_rows(tmp_path: Path, verdict):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nlease observations from another mechanism.\n")
+    lexical = Corpus(tmp_path).search("lease revoke", root="platform")
+    corpus = Corpus(tmp_path, relevancy=lambda query, documents: verdict)
+    assert corpus.search("lease revoke", root="platform") == lexical
+
+
+@pytest.mark.parametrize("decision", [None, True, 0, "irrelevant"])
+def test_missing_and_uncertain_document_decisions_keep_the_lexical_match(tmp_path: Path, decision):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nlease observations from another mechanism.\n")
+    corpus = Corpus(tmp_path, relevancy=lambda query, documents: {documents[0]["path"]: decision})
+    assert corpus.search("lease revoke", root="platform")
+
+
+def test_relevance_exception_and_unknown_path_do_not_suppress_evidence(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nlease observations from another mechanism.\n")
+    def unavailable(*_args):
+        raise RuntimeError("optional route unavailable")
+    corpus = Corpus(tmp_path, relevancy=unavailable)
+    assert corpus.search("lease revoke", root="platform")
+    corpus.relevancy = lambda query, documents: {"platform/another-module.md": False}
+    assert corpus.search("lease revoke", root="platform")
+
+
+def test_dynamic_callback_can_stay_lexical_at_bootstrap_then_filter_later(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nlease observations from another mechanism.\n")
+    enabled = False
+    def dynamic(_query, documents):
+        return {item["path"]: False for item in documents} if enabled else None
+    corpus = Corpus(tmp_path, relevancy=dynamic)
+    assert corpus.search("lease revoke", root="platform")
+    enabled = True
+    assert corpus.search("lease revoke", root="platform") == []
+
+
+def test_weak_shortlist_is_bounded_and_refills_output_after_rejections(tmp_path: Path):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    for index in range(20):
+        write(tmp_path, f"platform/doc-{index:02}.md", "# Notes\nlease observations from another mechanism.\n")
+    batches = []
+    def reject(query, documents):
+        batches.append(documents)
+        return {item["path"]: False for item in documents}
+    results = Corpus(tmp_path, relevancy=reject).search("lease revoke", root="platform", limit=1)
+    assert len(batches) == 1 and len(batches[0]) == retrieval.MAX_RELEVANCE_DOCUMENTS
+    assert len(results) == 1 and results[0]["path"] == "platform/doc-08.md"
+    assert all(len(item["text"]) <= 3500 for item in batches[0])
+
+
+def test_incomplete_document_and_catalog_references_are_handled_conservatively(tmp_path: Path, monkeypatch):
+    write(tmp_path, "INDEX.md", "# Corpus\nCatalog: `platform/weak.md`\n")
+    write(tmp_path, "platform/weak.md", "# Notes\nlease observation.\n" + "filler\n" * 100)
+    calls = []
+    def reject(query, documents):
+        calls.append(documents)
+        return {item["path"]: False for item in documents}
+    # A catalog mention alone does not make every file a mandatory reference.
+    assert Corpus(tmp_path, relevancy=reject).search("lease revoke", root="platform") == []
+    assert len(calls) == 1
+    calls.clear()
+    monkeypatch.setattr(retrieval, "MAX_FILE_BYTES", 64)
+    assert Corpus(tmp_path, relevancy=reject).search("lease revoke", root="platform")
+    assert calls == []
+
+
+def test_retained_reference_metadata_is_bounded_and_cannot_escape_the_corpus(tmp_path: Path, monkeypatch):
+    write(tmp_path, "INDEX.md", "# Corpus\n")
+    monkeypatch.setattr(retrieval, "MAX_RETAINED_PATHS", 4)
+    corpus = Corpus(tmp_path)
+    corpus._remember_references("service/nebula/design.md", "[bad](../../../../outside.md) [secret](../../platform/.env.md)")
+    assert not corpus._retained_paths
+    for index in range(10):
+        corpus._remember_references("service/nebula/design.md", f"[detail](../../platform/doc-{index}.md)")
+    assert len(corpus._retained_paths) == 4
+    assert set(corpus._retained_paths) == {f"platform/doc-{index}.md" for index in range(6, 10)}
