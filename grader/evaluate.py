@@ -147,6 +147,31 @@ def run_pytest(tree: Path, which: str, log: Path) -> tuple[bool, str]:
     return ok, msg
 
 
+def baseline_regressions(required: list[str], outcomes: dict[str, str] | None, which: str) -> list[str]:
+    """Match JUnit suite qualification while retaining complete test identities.
+
+    Pytest can report `test_module.Class` or `tests.test_module.Class` for the
+    same suite. Exact IDs take precedence, including failures and skips. An alias
+    already named in the baseline belongs to that test and cannot satisfy another.
+    """
+    outcomes = outcomes or {}
+    expected = set(required)
+    broken = []
+    for test in required:
+        key = test
+        if test not in outcomes and which in {"tests", "regression"}:
+            module, separator, name = test.partition("::")
+            if separator and module:
+                prefix = which + "."
+                alternate = (module.removeprefix(prefix) if module.startswith(prefix)
+                             else prefix + module) + separator + name
+                if alternate not in expected:
+                    key = alternate
+        if outcomes.get(key) != "passed":
+            broken.append(test)
+    return broken
+
+
 # ---------------------------------------------------------------- regression baseline
 
 def per_bug_fixes(case: Case) -> dict[str, str]:
@@ -398,7 +423,7 @@ def evaluate(case: Case, src_dir: Path, work: Path, *, workers: int = 2, runs_pe
             res, msg = pytest_results(tree, which, work / f"{which}.log")
             notes.append(msg)
             res = res or {}
-            broke = [t for t in base.get(which, []) if res.get(t) != "passed"]
+            broke = baseline_regressions(base.get(which, []), res, which)
             result[key] = not broke
             result["baseline_regressions"] += [f"{which}: {t}" for t in broke]
             result[f"{which}_failed"] = sorted(t for t, v in res.items() if v in ("failed", "error"))
