@@ -12,6 +12,7 @@ import json
 import math
 from pathlib import Path
 import re
+import stat
 import threading
 import time
 from typing import Any
@@ -35,6 +36,9 @@ VALIDATION_RESULT_LIMIT = 12
 VALIDATION_REVIEW_LIMIT = 6
 VALIDATION_TEXT_LIMIT = 800
 REVIEW_TOOL_NAME = "submit_review"
+REGRESSION_DIAGNOSTIC_TRACE_BYTES = 32 * 1024 * 1024
+REGRESSION_DIAGNOSTIC_FEEDBACK_SECONDS = 30.0
+REGRESSION_DIAGNOSTIC_READ_SECONDS = 5.0
 
 
 def _ledger_text(value: Any, limit: int = VALIDATION_TEXT_LIMIT) -> str | None:
@@ -115,6 +119,31 @@ def _ledger_review(verdict: dict) -> dict:
     for key in ("evidence_pair_count", "correction_attempted"):
         if key in verdict:
             result[key] = verdict[key]
+    return result
+
+
+def _diagnostic_review(verdict: dict) -> dict:
+    """Bound optional advice while preserving its canonical experiment references."""
+    result = _ledger_review(verdict)
+    for field in ("issues", "missing_evidence", "limitations"):
+        items = result[field]
+        result["truncated"] |= len(items) > 3 or any(len(item) > 400 for item in items)
+        result[field] = [_ledger_text(item, 400) for item in items[:3]]
+    evidence = result.get("issue_evidence", [])
+    result["truncated"] |= len(evidence) > 2
+    if "issue_evidence" in result:
+        result["issue_evidence"] = evidence[:2]
+    for item in result.get("issue_evidence", []):
+        for field in ("detail", "obligation"):
+            text = item[field]
+            result["truncated"] |= isinstance(text, str) and len(text) > 400
+            item[field] = _ledger_text(text, 400)
+        references = item["experiments"]
+        item["experiments_omitted"] += max(0, len(references) - 2)
+        result["truncated"] |= len(references) > 2
+        item["experiments"] = references[:2]
+    if "evidence_error" in result:
+        result["evidence_error"]["detail"] = _ledger_text(result["evidence_error"]["detail"], 400)
     return result
 
 
@@ -201,6 +230,7 @@ class Controller:
         self._cache: dict[tuple, ReplayResult] = {}
         self._lock = threading.RLock()
         self._validating = False
+        self._regression_diagnostic_record: tuple[str, dict] | None = None
         self._validation_progress: dict | None = None
         self.validation_history: dict[str, dict] = {}
         self.baseline: list[ReplayResult] = []
@@ -709,10 +739,152 @@ class Controller:
                        for item in experiments]
             return [future.result() for future in futures]
 
-    def _review(self, plan: dict, before: list[ReplayResult], after: list[ReplayResult], full_pass: bool) -> dict:
+    def _regression_diagnostic(self, plan: dict, before: list[ReplayResult], after: list[ReplayResult],
+                               install_allowance: float) -> dict:
+        """Offer one source-bound causal diagnosis without changing the rejection."""
+        current, best = self.sources.candidate_hash, self.sources.best_hash
+        record = {"scope": "diagnostic_only", "diagnostic_only": True, "authorizes_promotion": False,
+                  "source_hash": current, "accepted_source_hash": best,
+                  "status": "skipped", "reason": "Independent regression diagnosis is unavailable."}
+        claimed_identity = None
+        try:
+            if self.deadline.stop_event.is_set():
+                raise TimeLimitError("regression diagnosis cancelled")
+            evidence = build_review_pairs(before, after, best, current,
+                                          [obligation for accepted in self.accepted
+                                           for obligation in accepted["verified_obligations"]])
+            regressions = [pair for pair in evidence["pairs"] if pair["facts"]["passing_control_regressed"]]
+            if not regressions:
+                raise ValueError("no valid matched passing-control regression is available")
+            identity = hashlib.sha256(json.dumps({
+                "source_hash": current, "accepted_source_hash": best,
+                "pairs": sorted((pair["pair_id"], pair["before"]["run_id"], pair["after"]["run_id"])
+                                for pair in evidence["pairs"]),
+            }, sort_keys=True).encode()).hexdigest()
+            prior = self._regression_diagnostic_record
+            if prior is not None:
+                if prior[0] == identity:
+                    return {**deepcopy(prior[1]), "cached": True}
+                record["reason"] = "The case diagnosis opportunity was used for a different source or input; earlier advice is not attached."
+                return record
+            if self.model is None:
+                raise ValueError("independent regression model is unavailable")
+            balance = getattr(self.model, "remaining_budget", None)
+            if (not isinstance(balance, (int, float)) or isinstance(balance, bool)
+                    or not math.isfinite(balance) or balance <= 0):
+                raise ValueError("no valid model budget remains for regression diagnosis and feedback")
+            # Protect final verification once, plus a later correction/validation
+            # and a primary-model feedback turn. The optional request may use only
+            # time above that floor.
+            correction = self.test_seconds + self.replay_seconds * 4 + self.review_seconds
+            reserve = max(self.final_reserve, install_allowance) + correction + REGRESSION_DIAGNOSTIC_FEEDBACK_SECONDS
+            request_seconds = max(15.0, self.review_seconds * 1.5 + 5)
+            if self.deadline.remaining() < reserve + request_seconds + REGRESSION_DIAGNOSTIC_READ_SECONDS:
+                raise TimeLimitError("insufficient time for regression diagnosis, correction, final verification and feedback")
+            # Registered valid results already carry Simulator's complete checker,
+            # source, input and trace certificate. Recheck every current selector;
+            # re-hash the primary regressing pair whose causal excerpts are used.
+            primary = regressions[0]
+            primary_ids = {primary["before"]["run_id"], primary["after"]["run_id"]}
+            trace_root = (self.sources.scratch / "runs").resolve(strict=True)
+            bytes_read = 0
+            checked_inputs = {}
+            for source, results in (("accepted", before), ("candidate", after)):
+                for run in results:
+                    if (self.deadline.stop_event.is_set()
+                            or self.deadline.remaining() < reserve + request_seconds):
+                        raise TimeLimitError("regression provenance verification interrupted before diagnostic request")
+                    selector = (source, run.scenario, run.faults)
+                    if selector not in checked_inputs:
+                        checked_inputs[selector] = self._experiment_input(
+                            {"scenario": run.scenario, "seed": run.seed, "faults": run.faults}, source)
+                    registered = self.runs.get(run.run_id)
+                    if (registered is None or run.status not in VALID_REPLAY_STATUSES
+                            or (registered.source_hash, registered.scenario_hash, registered.faults_hash,
+                                registered.seed, registered.status) !=
+                            (run.source_hash, run.scenario_hash, run.faults_hash, run.seed, run.status)
+                            or not run.replay_command.ok or run.check_command is None
+                            or run.check_command.cancelled or run.check_command.timed_out or run.check_command.truncated
+                            or run.check_command.returncode not in (0, 1)
+                            or (run.check_command.returncode == 0) != (not run.violations)
+                            or run.summary.get("source_hash") != run.source_hash
+                            or (run.summary.get("scenario_hash"), run.summary.get("faults_hash")) !=
+                            (run.scenario_hash, run.faults_hash)
+                            or checked_inputs[selector] !=
+                            (run.scenario_hash, run.faults_hash)):
+                        raise ValueError("regression traces lack a complete registered source/input/checker certificate")
+                    trace = run.trace_path
+                    if (trace.is_symlink() or not stat.S_ISREG(trace.lstat().st_mode)
+                            or not trace.resolve(strict=True).is_relative_to(trace_root)):
+                        raise ValueError("regression trace is not a regular registered scratch file")
+                    relative = trace.relative_to(trace_root)
+                    cursor = trace_root
+                    for part in relative.parts:
+                        cursor = cursor / part
+                        if cursor.is_symlink():
+                            raise ValueError("regression trace path contains a symlink")
+                    expected = run.summary.get("trace_sha256")
+                    if not isinstance(expected, str) or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+                        raise ValueError("regression trace digest is unavailable")
+                    if run.run_id in primary_ids:
+                        digest = hashlib.sha256()
+                        with trace.open("rb") as stream:
+                            while True:
+                                if (self.deadline.stop_event.is_set()
+                                        or self.deadline.remaining() < reserve + request_seconds):
+                                    raise TimeLimitError("regression trace verification interrupted before diagnostic request")
+                                chunk = stream.read(128 * 1024)
+                                if not chunk:
+                                    break
+                                bytes_read += len(chunk)
+                                if bytes_read > REGRESSION_DIAGNOSTIC_TRACE_BYTES:
+                                    raise ValueError("regression causal trace verification exceeds its byte bound")
+                                digest.update(chunk)
+                        if digest.hexdigest() != expected:
+                            raise ValueError("regression causal trace changed after its checker verdict")
+            if self.sources.candidate_hash != current or self.sources.best_hash != best:
+                raise ValueError("source snapshots changed before regression diagnosis")
+            record.update(evidence_pair_count=len(evidence["pairs"]),
+                          regression_pair_count=len(regressions),
+                          primary_pair={"pair_id": primary["pair_id"], "input": primary["input"],
+                                        "before_run_id": primary["before"]["run_id"],
+                                        "after_run_id": primary["after"]["run_id"],
+                                        "before_source_hash": best, "after_source_hash": current,
+                                        "before_status": primary["before"]["status"],
+                                        "after_status": primary["after"]["status"]})
+            # Claim the single case opportunity before any native request. Its
+            # final memo is reused only for these exact sources and input runs.
+            self._regression_diagnostic_record = (identity, deepcopy(record))
+            claimed_identity = identity
+            verdict = self._review(plan, before, after, full_pass=False,
+                                   diagnostic_only=True, reserve_floor=reserve)
+            record["review"] = _diagnostic_review(verdict)
+            if verdict.get("skipped") or verdict.get("evidence_error"):
+                record.update(status=verdict.get("diagnostic_status", "failed"),
+                              reason=_ledger_text(verdict.get("skipped") or
+                                                  verdict.get("evidence_error", {}).get("detail"), 800))
+            else:
+                record["status"] = "completed"
+                record["reason"] = (
+                    "Independent causal advice is available; the passing-control regression still blocks promotion."
+                    if verdict.get("issues") or verdict.get("missing_evidence") else
+                    "The native request completed without a supported cause or next local measurement; the passing-control regression still blocks promotion."
+                )
+            self._regression_diagnostic_record = (identity, deepcopy(record))
+        except (ModelError, TimeLimitError, ValueError, OSError, RuntimeError, OverflowError) as error:
+            record["reason"] = _ledger_text(str(error), 800)
+            if claimed_identity is not None:
+                record["status"] = "failed"
+                self._regression_diagnostic_record = (claimed_identity, deepcopy(record))
+        emit("regression_diagnostic", **record)
+        return record
+
+    def _review(self, plan: dict, before: list[ReplayResult], after: list[ReplayResult], full_pass: bool,
+                *, diagnostic_only: bool = False, reserve_floor: float | None = None) -> dict:
         reviewed_hash = self.sources.candidate_hash
         started = time.monotonic()
         blocked = None
+        requested = False
         try:
             evidence = build_review_pairs(before, after, self.sources.best_hash, reviewed_hash,
                                           [obligation for accepted in self.accepted
@@ -727,17 +899,23 @@ class Controller:
                                                    stop_event=self.deadline.stop_event)
             old_runs, new_runs = ({r.run_id: r for r in before}, {r.run_id: r for r in after})
             focused = 0
+            primary = next((pair["pair_id"] for pair in evidence["pairs"]
+                            if pair["facts"]["passing_control_regressed"]), None)
             for pair in evidence["pairs"]:
                 old, new = old_runs[pair["before"]["run_id"]], new_runs[pair["after"]["run_id"]]
-                focus = focused < 2 and (not old.ok or not new.ok)
+                focus = pair["pair_id"] == primary if diagnostic_only else focused < 2 and (not old.ok or not new.ok)
                 if focus:
                     focused += 1
                 # Keep both causal excerpts with the one immutable input identity.
-                pair["before"].update(brief(old, timeline=focus and not old.ok))
+                pair["before"].update(brief(old, timeline=focus if diagnostic_only else focus and not old.ok))
                 pair["after"].update(brief(new, timeline=focus and not new.ok))
             tool = _review_tool(reviewed_hash, evidence)
+            identity = {"source_hash": reviewed_hash}
+            if diagnostic_only:
+                identity.update(diagnostic_only=True, authorizes_promotion=False,
+                                accepted_source_hash=evidence["accepted_source_hash"])
             context = "\n\n".join([
-                "# Candidate review identity\n" + json.dumps({"source_hash": reviewed_hash}),
+                "# Candidate review identity\n" + json.dumps(identity),
                 "# Proposed repair\n" + json.dumps(plan),
                 "# Relevant source-bound hypotheses\n" + json.dumps(hypotheses),
                 "# Previously accepted obligations\n" + json.dumps([
@@ -751,13 +929,36 @@ class Controller:
             ])
             messages = [{"role": "user", "content": context}]
             reserve = max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5)
-            for attempt in range(2):
+            system = REVIEW
+            if diagnostic_only:
+                system += (
+                    "\n\nThis is a diagnostic-only consultation after a host-proven passing-control regression. "
+                    "The matrix rejection is authoritative and your approve field cannot authorize promotion. "
+                    "Use the exact regressing pairs, current source including unchanged writers/consumers, "
+                    "captured repair intent and contracts to identify a supported causal source defect. "
+                    "If causality is uncertain, give a specific locally obtainable next measurement in missing_evidence. "
+                    "Do not invent a source defect or reclassify an unrelated failing input as a passing baseline. "
+                    "Return exactly one native submit_review call; no correction or acceptance review follows this request."
+                )
+                reserve = max(reserve, reserve_floor or 0)
+                request_seconds = max(15.0, self.review_seconds * 1.5 + 5)
+                if self.deadline.remaining() < reserve + request_seconds:
+                    raise TimeLimitError("insufficient time remains for diagnostic review and protected feedback")
+                reservation = ModelClient.estimate_reservation({
+                    "system": system, "messages": messages, "tools": [tool], "max_tokens": 2048})
+                balance = getattr(self.model, "remaining_budget", None)
+                if (not isinstance(balance, (int, float)) or isinstance(balance, bool)
+                        or not math.isfinite(balance) or not math.isfinite(reservation)
+                        or balance < reservation + max(0.25, reservation)):
+                    raise ModelError("regression diagnosis cannot reserve its request plus primary-model feedback", code="budget")
+            for attempt in range(1 if diagnostic_only else 2):
                 if self.deadline.stop_event.is_set():
                     raise TimeLimitError("review cancelled")
                 if (self.sources.candidate_hash != reviewed_hash
                         or self.sources.best_hash != evidence["accepted_source_hash"]):
                     raise ReviewEvidenceError("A source snapshot changed during review; rebuild matched evidence for the current sources.")
-                reply = self.model.messages(REVIEW, messages, [tool], max_tokens=2048, reserve=reserve,
+                requested = True
+                reply = self.model.messages(system, messages, [tool], max_tokens=2048, reserve=reserve,
                                             tool_choice={"type": "tool", "name": REVIEW_TOOL_NAME})
                 if self.deadline.stop_event.is_set():
                     raise TimeLimitError("review cancelled")
@@ -770,13 +971,14 @@ class Controller:
                     verdict = _review_verdict(reply.content, reviewed_hash, evidence)
                 except ReviewEvidenceError as error:
                     blocked = error.feedback(reviewed_hash)
-                    emit("review_evidence_rejected", source_hash=reviewed_hash, error=str(error),
+                    emit("regression_diagnostic_evidence_rejected" if diagnostic_only else "review_evidence_rejected",
+                         source_hash=reviewed_hash, error=str(error),
                          correctable=error.correctable, correction_attempt=attempt, cost_usd=reply.cost_usd)
                     available = getattr(self.model, "remaining_budget", None)
                     budget_ok = (available is None or isinstance(available, (int, float))
                                  and not isinstance(available, bool) and math.isfinite(available) and available > 0)
                     time_ok = self.deadline.remaining() > reserve + max(10.0, self.review_seconds) + 5
-                    if attempt or not error.correctable or not budget_ok or not time_ok:
+                    if diagnostic_only or attempt or not error.correctable or not budget_ok or not time_ok:
                         return blocked
                     call = next(block for block in reply.content if block["type"] == "tool_use")
                     messages = [*messages, {"role": "assistant", "content": reply.content},
@@ -786,13 +988,17 @@ class Controller:
                 if attempt:
                     verdict["correction_attempted"] = True
                 verdict["evidence_pair_count"] = len(evidence["pairs"])
-                emit("repair_review", **verdict, cost_usd=reply.cost_usd)
+                emit("regression_diagnostic_review" if diagnostic_only else "repair_review", **verdict, cost_usd=reply.cost_usd)
                 return verdict
         except ReviewEvidenceError as error:
-            emit("review_evidence_rejected", source_hash=reviewed_hash, error=str(error), correctable=False)
+            emit("regression_diagnostic_evidence_rejected" if diagnostic_only else "review_evidence_rejected",
+                 source_hash=reviewed_hash, error=str(error), correctable=False)
             return error.feedback(reviewed_hash)
         except (ModelError, TimeLimitError) as error:
-            emit("review_unavailable", error=str(error))
+            emit("regression_diagnostic_unavailable" if diagnostic_only else "review_unavailable", error=str(error))
+            if diagnostic_only:
+                return {"source_hash": reviewed_hash, "approve": False, "issues": [], "missing_evidence": [],
+                        "skipped": str(error), "diagnostic_status": "failed" if requested else "skipped"}
             if blocked is not None:
                 return blocked
             if self.deadline.stop_event.is_set():
@@ -875,7 +1081,10 @@ class Controller:
             return {"accepted": False, "reason": "runtime or validation error", "results": [brief(r) for r in after]}
         regressions = [brief(new) for old, new in zip(before, after) if old.ok and not new.ok]
         if regressions:
-            return {"accepted": False, "reason": "previously passing scenario regressed", "regressions": regressions}
+            diagnostic = self._regression_diagnostic(plan, before, after, install_allowance)
+            self._validation_update("matrix", regression_diagnostic=diagnostic)
+            return {"accepted": False, "reason": "previously passing scenario regressed",
+                    "regression_diagnostic": diagnostic, "regressions": regressions}
         lost_obligations = []
         for accepted in self.accepted:
             for obligation in accepted["verified_obligations"]:
