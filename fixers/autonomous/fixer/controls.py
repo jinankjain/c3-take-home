@@ -205,11 +205,10 @@ def _seed(raw: bytes, profile: bytes, public_seeds: set[int]) -> tuple[int, str]
 
 def plan_controls(root: Path, public_seeds: list[int], limit: int = MAX_CONTROLS, *,
                   should_stop: Callable[[], bool] | None = None) -> ControlPlan:
-    """Alternate regular scenarios and profile inputs, reserving a seed pair each.
+    """Alternate scenario/profile inputs and cover distinct holdouts first.
 
-    Every selected input gets its first public seed and first stable hash seed
-    before another input can consume a repeated-seed slot. No service or fault
-    family names determine which controls run.
+    Each input gets its stable hash seed before public-seed repeats consume
+    the bounded phase. No service or fault family names determine priority.
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or not 0 <= limit <= 64:
         raise ValueError("control limit must be between zero and 64")
@@ -246,7 +245,8 @@ def plan_controls(root: Path, public_seeds: list[int], limit: int = MAX_CONTROLS
         for queue in (regular_inputs, profile_inputs):
             if queue:
                 inputs.append(queue.popleft())
-    experiments = []
+    holdouts = []
+    repeats = []
     for scenario, profile in inputs:
         path, raw, _ = scenario
         profile_raw = profile[1] if profile else b""
@@ -257,9 +257,10 @@ def plan_controls(root: Path, public_seeds: list[int], limit: int = MAX_CONTROLS
             "control": True, "scenario_input_sha256": hashlib.sha256(raw).hexdigest(),
             "profile_input_sha256": hashlib.sha256(profile_raw).hexdigest() if profile else None,
         }
-        experiments.extend(({**common, "seed": first_seed, "seed_origin": "public"},
-                            {**common, "seed": stable_seed, "seed_origin": SEED_POLICY,
-                             "seed_input_sha256": seed_hash}))
+        holdouts.append({**common, "seed": stable_seed, "seed_origin": SEED_POLICY,
+                         "seed_input_sha256": seed_hash})
+        repeats.append({**common, "seed": first_seed, "seed_origin": "public"})
+    experiments = holdouts + repeats
     metadata = {
         **inventory.counts, "scenario_inputs": len(regular), "profile_inputs": len(profiles),
         "scenario_inputs_omitted": scenario_omitted, "profile_inputs_omitted": profile_omitted,
@@ -267,5 +268,6 @@ def plan_controls(root: Path, public_seeds: list[int], limit: int = MAX_CONTROLS
         "planned_omitted": max(0, len(experiments) - limit), "limit": limit,
         "public_seeds_omitted": max(0, len(public_seeds) - 64),
         "seed_policy": SEED_POLICY,
+        "coverage_order": "distinct_holdouts_then_public",
     }
     return ControlPlan(tuple(experiments[:limit]), metadata)

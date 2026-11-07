@@ -34,20 +34,23 @@ def fixture_inputs(root: Path, *, scenarios=3, profiles=7):
         }))
 
 
-def test_default_cap_pairs_public_and_hash_seed_without_regular_crowding(tmp_path):
+def test_default_cap_covers_distinct_hash_inputs_before_public_repeats(tmp_path):
     fixture_inputs(tmp_path)
     result = controls.plan_controls(tmp_path, [12, 11])
     assert len(result.experiments) == 16 and result.metadata["planned_omitted"] == 4
-    assert [r["seed_origin"] for r in result.experiments] == ["public", controls.SEED_POLICY] * 8
-    # The third discovered profile gets its hash seed even with other scenarios.
+    assert [r["seed_origin"] for r in result.experiments] == [controls.SEED_POLICY] * 10 + ["public"] * 6
+    assert len({(r["scenario"], r["faults"]) for r in result.experiments[:10]}) == 10
+    # The third profile gets independent coverage before any repeated seed.
     pair = [r for r in result.experiments if r["faults"] == "scenarios/faults/profile-2.yaml"]
-    assert len(pair) == 2 and pair[0]["seed"] == 12
+    assert len(pair) == 2 and pair[1]["seed"] == 12
     raw = (tmp_path / "scenarios/base.yaml").read_bytes()
     profile = (tmp_path / "scenarios/faults/profile-2.yaml").read_bytes()
     material = raw + b"\0" + profile + b"\0healthy-control-v1:0"
     seed = int.from_bytes(hashlib.sha256(material).digest()[:4], "big") & 0x7fffffff
-    assert pair[1]["seed"] == seed
-    assert pair[1]["seed_input_sha256"] == hashlib.sha256(material).hexdigest()
+    assert pair[0]["seed"] == seed
+    assert pair[0]["seed_input_sha256"] == hashlib.sha256(material).hexdigest()
+    assert result.experiments.index(pair[0]) < 9
+    assert result.metadata["coverage_order"] == "distinct_holdouts_then_public"
 
 
 def test_order_and_seed_are_stable_and_track_public_input_changes(tmp_path):
@@ -177,7 +180,7 @@ def fake_controller(root, clock, monkeypatch, *, duration=0.25, statuses=()):
     def replay(case, scenario, *, seed, faults, timeout, reserve):
         assert case == root and reserve >= instance.final_reserve
         assert timeout <= instance.deadline.remaining(reserve) + 0.000001
-        calls.append({"seed": seed, "timeout": timeout, "reserve": reserve})
+        calls.append({"scenario": scenario, "faults": faults, "seed": seed, "timeout": timeout, "reserve": reserve})
         clock.now += duration
         index = len(calls) - 1
         status = statuses[index] if index < len(statuses) else "pass"
@@ -206,6 +209,23 @@ def test_bootstrap_budget_is_measured_and_failures_stay_diagnostic(tmp_path, mon
     assert all(item["source_hash"] == original for item in instance.retained_experiments.values())
     assert len(instance.retained_experiments) == coverage["retained"]
     assert source_hash(tmp_path / "src") == original
+
+
+def test_phase_truncation_retains_diverse_holdouts_before_repeating_public_seeds(tmp_path, monkeypatch):
+    fixture_inputs(tmp_path, scenarios=3, profiles=7)
+    clock = Clock()
+    instance, calls = fake_controller(tmp_path, clock, monkeypatch, duration=0.3)
+    planned = controls.plan_controls(tmp_path, instance.config.seeds)
+    target = next(row for row in planned.experiments
+                  if row["faults"] == "scenarios/faults/profile-2.yaml"
+                  and row["seed_origin"] == controls.SEED_POLICY)
+    instance._bootstrap_controls()
+    assert instance.control_coverage["budget_exhausted"]
+    assert len(calls) == instance.control_coverage["executed"] == 9
+    assert len({(row["scenario"], row["faults"]) for row in calls}) == 9
+    assert all(row["seed"] != instance.config.seeds[0] for row in calls)
+    assert any(row["scenario"] == target["scenario"] and row["faults"] == target["faults"]
+               and row["seed"] == target["seed"] for row in instance.retained_experiments.values())
 
 
 def test_cached_controls_are_not_recounted_as_measured_compute(tmp_path, monkeypatch):
