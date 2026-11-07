@@ -13,6 +13,7 @@ import signal
 
 from .controller import Controller
 from .model import BudgetExhausted, ModelClient, ModelError
+from .probe_guidance import bounded_feedback, construction_guidance, correction_record
 from .prompts import SYSTEM
 from .runtime import CaseConfig, ConfigurationError, TimeLimitError, emit
 from .tools import TOOL_DEFINITIONS, ToolDispatcher
@@ -93,6 +94,8 @@ def _ledger_replays(value, *, snapshot: str, limit: int, chars: int,
         }
         if "scenario_hash" in item:
             row["scenario_hash"] = _ledger_text(item["scenario_hash"] or "", 64)
+        if "faults_hash" in item:
+            row["faults_hash"] = _ledger_scalar(item["faults_hash"])
         if "faults" in item:
             row["faults"] = _ledger_text(item["faults"], min(chars, 256)) if item["faults"] is not None else None
         if item.get("error"):
@@ -166,7 +169,43 @@ def _ledger_staged_plan(value, *, chars: int = 800) -> dict | None:
 def _status_for_prompt(controller: Controller) -> dict:
     status = controller.status()
     status["probe_intervention"] = getattr(controller, "_last_probe_intervention", None)
+    status["probe_construction"] = getattr(controller, "_last_probe_construction", None)
     return status
+
+
+def _ledger_probe_construction(status: dict, *, chars: int = 4000) -> dict | None:
+    value = status.get("probe_construction")
+    if (not isinstance(value, dict) or value.get("source_hash") != status.get("source_hash")
+            or value.get("accepted_source_hash") != status.get("accepted_source_hash")):
+        return None
+    return bounded_feedback(value, max_chars=chars)
+
+
+def _review_reference_metadata(review: dict, *, chars: int = 800, count: int = 3) -> dict:
+    metadata = {}
+    error = review.get("evidence_error")
+    if isinstance(error, dict):
+        metadata["evidence_error"] = {"code": _ledger_scalar(error.get("code")),
+                                      "correctable": error.get("correctable") is True,
+                                      "detail": _ledger_text(error.get("detail", ""), chars)}
+    evidence = review.get("issue_evidence")
+    if isinstance(evidence, list):
+        metadata["issue_evidence"] = []
+        for item in evidence[:count]:
+            if not isinstance(item, dict):
+                continue
+            row = {key: _ledger_text(item.get(key, ""), min(chars, limit)) for key, limit in
+                   (("kind", 64), ("source_path", 256), ("obligation", 500), ("detail", 800))}
+            # Controller summaries already bound these immutable references;
+            # preserve their complete identities while shortening narrative text.
+            row["experiments"] = deepcopy(item.get("experiments", [])[:count])
+            row["experiments_omitted"] = item.get("experiments_omitted", 0) + max(0, len(item.get("experiments", [])) - count)
+            metadata["issue_evidence"].append(row)
+        metadata["issue_evidence_count"] = _ledger_scalar(review.get("issue_evidence_count", len(evidence)))
+    for key in ("evidence_pair_count", "correction_attempted"):
+        if key in review:
+            metadata[key] = _ledger_scalar(review[key])
+    return metadata
 
 
 def _minimal_prompt_status(status: dict) -> str:
@@ -187,8 +226,10 @@ def _minimal_prompt_status(status: dict) -> str:
                 "issues": _ledger_strings(review.get("issues"), count=3, chars=200),
                 "missing_evidence": _ledger_strings(review.get("missing_evidence"), count=3, chars=200),
             }
+            compact["last_validation"]["review"].update(_review_reference_metadata(review, chars=200, count=1))
     compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
     compact["staged_repair"] = _ledger_staged_plan(status.get("staged_repair"), chars=400)
+    compact["probe_construction"] = _ledger_probe_construction(status, chars=1800)
     compact["probe_intervention"] = _ledger_probe_pair(
         status.get("probe_intervention"), chars=200,
         current=status.get("source_hash"), best=status.get("accepted_source_hash"))
@@ -230,6 +271,7 @@ def prompt_status(controller: Controller) -> str:
                                          list(status.get("experiment_metrics", {}).items())[:4]}
         compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
         compact["staged_repair"] = _ledger_staged_plan(status.get("staged_repair"), chars=detail_chars)
+        compact["probe_construction"] = _ledger_probe_construction(status, chars=max(1800, detail_chars * 5))
         compact["probe_intervention"] = _ledger_probe_pair(
             status.get("probe_intervention"), chars=detail_chars, current=current, best=best)
         compact["hypotheses"] = [{
@@ -299,6 +341,7 @@ def prompt_status(controller: Controller) -> str:
                                     "missing_evidence": _ledger_strings(review.get("missing_evidence"), count=6, chars=detail_chars)}
                 latest["review"].update({key: _ledger_scalar(review[key]) for key in ("issues_count", "missing_evidence_count", "truncated")
                                          if key in review})
+                latest["review"].update(_review_reference_metadata(review, chars=detail_chars))
                 if "skipped" in review:
                     latest["review"]["skipped"] = _ledger_text(review["skipped"], detail_chars)
             compact["last_validation"] = latest
@@ -575,7 +618,14 @@ def _probe_fingerprints(dispatcher: ToolDispatcher) -> tuple[set[str], _ProbeCon
                     if len(paths) > 32:
                         raise ValueError("probe novelty inventory exceeds its file limit")
     reader = _ProbeConfigReader(controller)
-    fingerprints = {_probe_fingerprint(reader, path) for path in sorted(paths)}
+    fingerprints = set()
+    reader.fingerprint_references = {}
+    for path in sorted(paths):
+        fingerprint = _probe_fingerprint(reader, path)
+        fingerprints.add(fingerprint)
+        reference = ("probe:" + path.stem if path.is_relative_to(dispatcher._probe_root())
+                     else "scenarios/" + path.relative_to(controller.sources.candidate / "scenarios").as_posix())
+        reader.fingerprint_references.setdefault(fingerprint, {"kind": "existing_document", "reference": reference})
     # Healthy controls and previous probes may have paired a scenario with an
     # external override. Comparing their files independently misses that exact
     # effective combination, even when the original experiment was retained.
@@ -587,7 +637,10 @@ def _probe_fingerprints(dispatcher: ToolDispatcher) -> tuple[set[str], _ProbeCon
         raise ValueError("probe novelty combinations exceed their limit")
     for scenario, faults in sorted(combinations):
         path, profile = reader._composition_path(scenario), reader._composition_path(faults)
-        fingerprints.add(_probe_fingerprint(reader, path, faults_path=profile))
+        fingerprint = _probe_fingerprint(reader, path, faults_path=profile)
+        fingerprints.add(fingerprint)
+        reader.fingerprint_references.setdefault(fingerprint, {"kind": "scenario_fault_combination",
+                                                               "scenario": scenario, "faults": faults})
     return fingerprints, reader
 
 
@@ -617,6 +670,7 @@ def _measure_probe(controller: Controller, model, dispatcher: ToolDispatcher, re
         path = dispatcher._composition_path(probe["probe"])
         pair["configuration_hash"] = _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"])
         if pair["configuration_hash"] in fingerprints:
+            pair["duplicate_reference"] = getattr(reader, "fingerprint_references", {}).get(pair["configuration_hash"])
             raise ValueError("probe repeats an existing effective configuration; name/expect changes add no runtime evidence")
 
         def ready(seconds: float) -> None:
@@ -670,6 +724,7 @@ def _measure_single_probe(controller: Controller, model, dispatcher: ToolDispatc
         path = dispatcher._composition_path(probe["probe"])
         observation["configuration_hash"] = _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"])
         if observation["configuration_hash"] in fingerprints:
+            observation["duplicate_reference"] = getattr(reader, "fingerprint_references", {}).get(observation["configuration_hash"])
             raise ValueError("probe repeats an existing effective configuration; name/expect changes add no runtime evidence")
 
         def ready(seconds: float) -> None:
@@ -864,6 +919,10 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                      information_turns=information_turns)
         attempted_turns = turn + 1
         try:
+            if forced_probe:
+                forced_instruction += "\n# Protected construction context and correction\n" + construction_guidance(
+                    probe_reads, [*status.get("candidate_results", []), *status.get("known_failures", [])],
+                    getattr(controller, "_last_probe_construction", None), current, probe_best)
             messages = compact_messages(controller, messages, extra_text=forced_instruction)
             if controller.deadline.stop_event.is_set():
                 stop("cancelled")
@@ -942,6 +1001,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                                               probe_reads, current, probe_slot) if single_probe else
                         _measure_probe(controller, model, dispatcher, result, probe_fingerprints,
                                        probe_reads, current, probe_best, probe_slot))
+                controller._last_probe_construction = correction_record(current, probe_best, call["input"], result, pair)
                 if pair["complete"]:
                     completed_probes.add(current)
                     if single_probe:

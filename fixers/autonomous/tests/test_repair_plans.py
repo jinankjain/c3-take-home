@@ -109,3 +109,30 @@ def test_review_keeps_the_edit_basis_when_new_candidate_findings_arrive(controll
     assert any(item["id"] == "ownership" and item["relation_to_candidate"] == "edit_basis" for item in findings)
     assert any(item["id"] == "additional-7" for item in findings)
     assert len(findings) <= 6
+
+
+def test_a_blocking_review_keeps_its_matching_run_and_input_identities_after_compaction(controller):
+    base, candidate = stage_partial(controller)
+
+    class PairReviewer(Reviewer):
+        def messages(self, system, messages, tools, **kwargs):
+            issue_schema = tools[0]["input_schema"]["properties"]["issues"]["items"]
+            pair_id = issue_schema["properties"]["pair_ids"]["items"]["enum"][0]
+            return review_reply({"approve": False, "issues": [{"kind": "unverified_repair", "pair_ids": [pair_id],
+                                 "source_path": "src/service.py", "obligation": "Inspect the remaining recovery dependency.",
+                                 "detail": "This remaining mechanism requires local causal inspection before approval."}],
+                                 "missing_evidence": []}, tools)
+
+    controller.model = PairReviewer()
+    assert not controller.validate(controller.staged_plan())["accepted"]
+    compacted = compact_messages(controller, [{"role": "user", "content": "Earlier evidence."}], force=True)
+    assert "before_run_id" in json.dumps(compacted)
+    review = json.loads(prompt_status(controller))["last_validation"]["review"]
+    reference = review["issue_evidence"][0]["experiments"][0]
+    assert reference["before_source_hash"] == base and reference["after_source_hash"] == candidate
+    before = controller.runs[reference["before_run_id"]]
+    after = controller.runs[reference["after_run_id"]]
+    assert before.scenario_hash == after.scenario_hash == reference["input"]["scenario_hash"]
+    assert before.faults_hash == after.faults_hash == reference["input"]["faults_hash"]
+    assert before.seed == after.seed == reference["input"]["seed"]
+    assert not controller.accepted
