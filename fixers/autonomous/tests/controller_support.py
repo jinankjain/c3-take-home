@@ -64,7 +64,11 @@ def review_reply(verdict, tools):
     matching = [tool for tool in tools if tool.get("name") == "submit_review"]
     assert len(matching) == 1
     source_hash = matching[0]["input_schema"]["properties"]["source_hash"]["enum"][0]
-    bound = {**verdict, "source_hash": source_hash}
+    # Keep existing fixture callers concise while sending the actual typed native schema.
+    issues = [{"kind": "source_defect", "detail": item, "obligation": "Preserve the service contract",
+               "source_path": "src/service.py", "pair_ids": []} if isinstance(item, str) else item
+              for item in verdict.get("issues", [])]
+    bound = {**verdict, "source_hash": source_hash, "issues": issues}
     return ModelReply([{"type": "tool_use", "id": "review-decision", "name": "submit_review",
                         "input": bound}], "tool_use", {}, 0, 3)
 

@@ -23,6 +23,8 @@ from .experiments import select_experiments
 from .patches import PatchError, SourceManager, source_hash
 from .prompts import REVIEW
 from .retrieval import Corpus, FileTools
+from .review import ReviewEvidenceError, build_review_pairs, review_tool, review_verdict
+from .review_source import review_source_context
 from .runtime import CaseConfig, ProcessRunner, TimeLimitError, emit
 from .validation import ReplayResult, Simulator, _scenario_hashes
 
@@ -54,6 +56,7 @@ def _ledger_replay(result: ReplayResult, snapshot: str) -> dict:
         "scenario": _ledger_text(result.scenario, 256),
         "scenario_hash": _ledger_text(result.scenario_hash, 128),
         "seed": _ledger_seed(result.seed), "faults": _ledger_text(result.faults, 256),
+        "faults_hash": _ledger_text(result.faults_hash, 128),
         "status": _ledger_text(result.status, 64), "ok": result.ok,
         "violation_count": len(result.violations), "invariants": invariants,
         "violations": [{"invariant": name} for name in invariants],
@@ -83,6 +86,35 @@ def _ledger_review(verdict: dict) -> dict:
         result["source_hash"] = verdict["source_hash"]
     if "skipped" in verdict:
         result["skipped"] = _ledger_text(verdict["skipped"])
+    if isinstance(verdict.get("evidence_error"), dict):
+        error = verdict["evidence_error"]
+        result["evidence_error"] = {"code": _ledger_text(error.get("code"), 64),
+                                    "correctable": error.get("correctable") is True,
+                                    "detail": _ledger_text(error.get("detail"), 800)}
+    if isinstance(verdict.get("issue_evidence"), list):
+        summaries = []
+        for item in verdict["issue_evidence"][:3]:
+            summary = {key: _ledger_text(item.get(key), limit) for key, limit in
+                       (("kind", 64), ("detail", 800), ("obligation", 500), ("source_path", 256))}
+            references = item.get("experiments", [])
+            summary["experiments"] = []
+            for experiment in references[:3]:
+                reference = {key: _ledger_text(experiment.get(key), 64) for key in
+                             ("pair_id", "before_run_id", "after_run_id", "before_source_hash", "after_source_hash",
+                              "before_status", "after_status")}
+                inputs = experiment.get("input", {})
+                reference["input"] = {"scenario_hash": _ledger_text(inputs.get("scenario_hash"), 128),
+                                      "faults_hash": _ledger_text(inputs.get("faults_hash"), 128),
+                                      "seed": _ledger_seed(inputs["seed"]) if type(inputs.get("seed")) is int else _ledger_text(inputs.get("seed"), 128)}
+                summary["experiments"].append(reference)
+            summary["experiments_omitted"] = max(0, len(references) - 3)
+            summaries.append(summary)
+        result["issue_evidence"] = summaries
+        result["issue_evidence_count"] = len(verdict["issue_evidence"])
+        result["truncated"] |= len(verdict["issue_evidence"]) > 3 or any(item["experiments_omitted"] for item in summaries)
+    for key in ("evidence_pair_count", "correction_attempted"):
+        if key in verdict:
+            result[key] = verdict[key]
     return result
 
 
@@ -111,7 +143,8 @@ def brief(result: ReplayResult, *, timeline: bool = False) -> dict:
     evidence = result.evidence or {}
     output = {
         "run_id": result.run_id, "source_hash": result.source_hash,
-        "scenario": result.scenario, "seed": result.seed, "faults": result.faults,
+        "scenario": result.scenario, "scenario_hash": result.scenario_hash,
+        "seed": _ledger_seed(result.seed), "faults": result.faults, "faults_hash": result.faults_hash,
         "status": result.status, "ok": result.ok, "error": result.error,
         "violation_count": len(result.violations), "violations": result.violations[:8],
         "messages_sent": result.summary.get("messages_sent"),
@@ -141,55 +174,12 @@ def _invariants(results: list[ReplayResult]) -> set[str]:
     return {item["invariant"] for result in results for item in result.violations}
 
 
-def _review_tool(source_hash: str) -> dict:
-    strings = {"type": "array", "items": {"type": "string"}}
-    return {
-        "name": REVIEW_TOOL_NAME,
-        "description": "Submit the independent repair verdict for the supplied candidate source hash.",
-        "input_schema": {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "source_hash": {"type": "string", "enum": [source_hash]},
-                "approve": {"type": "boolean"}, "issues": deepcopy(strings),
-                "missing_evidence": deepcopy(strings), "limitations": deepcopy(strings),
-            },
-            "required": ["source_hash", "approve", "issues", "missing_evidence"],
-        },
-    }
+def _review_tool(source_hash: str, evidence: dict | None = None) -> dict:
+    return review_tool(source_hash, evidence)
 
 
-def _review_verdict(content: list[dict], source_hash: str) -> dict:
-    """Accept one typed native decision bound to the reviewed source version."""
-    if not isinstance(content, list) or any(not isinstance(block, dict) for block in content):
-        raise ModelError("review returned invalid content blocks", code="review_protocol")
-    if any(not isinstance(block.get("type"), str)
-           or block["type"] not in {"text", "thinking", "redacted_thinking", "tool_use"}
-           for block in content):
-        raise ModelError("review returned an unexpected content block", code="review_protocol")
-    decisions = [block for block in content if block.get("type") == "tool_use"]
-    if len(decisions) != 1:
-        raise ModelError("review must return exactly one submit_review decision", code="review_protocol")
-    call = decisions[0]
-    if (call.get("name") != REVIEW_TOOL_NAME or not isinstance(call.get("id"), str)
-            or not call["id"] or not isinstance(call.get("input"), dict)):
-        raise ModelError("review returned an invalid submit_review call", code="review_protocol")
-    verdict = call["input"]
-    required = {"source_hash", "approve", "issues", "missing_evidence"}
-    if not required.issubset(verdict) or set(verdict) - (required | {"limitations"}):
-        raise ModelError("review returned invalid verdict fields", code="review_protocol")
-    if not isinstance(verdict["source_hash"], str) or verdict["source_hash"] != source_hash:
-        raise ModelError("review decision does not match the candidate source hash", code="review_protocol")
-    if not isinstance(verdict["approve"], bool):
-        raise ModelError("review returned an invalid approval", code="review_protocol")
-    for key in ("issues", "missing_evidence", "limitations"):
-        if key in verdict and (not isinstance(verdict[key], list)
-                               or any(not isinstance(item, str) for item in verdict[key])):
-            raise ModelError("review returned invalid evidence lists", code="review_protocol")
-    result = {"source_hash": source_hash, "approve": verdict["approve"],
-              "issues": list(verdict["issues"]), "missing_evidence": list(verdict["missing_evidence"])}
-    if "limitations" in verdict:
-        result["limitations"] = list(verdict["limitations"])
-    return result
+def _review_verdict(content: list[dict], source_hash: str, evidence: dict | None = None) -> dict:
+    return review_verdict(content, source_hash, evidence)
 
 
 class Controller:
@@ -720,37 +710,94 @@ class Controller:
             return [future.result() for future in futures]
 
     def _review(self, plan: dict, before: list[ReplayResult], after: list[ReplayResult], full_pass: bool) -> dict:
-        if self.model is None:
-            return {"approve": False, "issues": [], "missing_evidence": ["model review is unavailable"]}
         reviewed_hash = self.sources.candidate_hash
-        tool = _review_tool(reviewed_hash)
-        changed = self.sources.diff(max_chars=30000)
-        context = "\n\n".join([
-            "# Candidate review identity\n" + json.dumps({"source_hash": reviewed_hash}),
-            "# Proposed repair\n" + json.dumps(plan), "# Hypotheses\n" + json.dumps(list(self.hypotheses.values())),
-            "# Previously accepted obligations\n" + json.dumps([
-                {key: accepted[key] for key in ("source_hash", "reason", "verified_obligations", "reproductions")}
-                for accepted in self.accepted]),
-            "# Current contracts\n" + self.contract_context,
-            "# Source diff\n" + changed,
-            "# Before/after evidence\n" + json.dumps({"before": [brief(r) for r in before], "after": [brief(r) for r in after]}),
-            "# Focused local failure evidence\n" + json.dumps({
-                "before": [brief(r, timeline=True) for r in before if not r.ok][:2],
-                "after": [brief(r, timeline=True) for r in after if not r.ok][:2],
-            }),
-        ])
         started = time.monotonic()
+        blocked = None
         try:
-            reply = self.model.messages(REVIEW, [{"role": "user", "content": context}], [tool],
-                                        max_tokens=2048, reserve=max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5),
-                                        tool_choice={"type": "tool", "name": REVIEW_TOOL_NAME})
-            if reply.stop_reason != "tool_use":
-                raise ModelError("review did not finish with a native tool decision", code="review_protocol")
-            verdict = _review_verdict(reply.content, reviewed_hash)
-            emit("repair_review", **verdict, cost_usd=reply.cost_usd)
-            return verdict
+            evidence = build_review_pairs(before, after, self.sources.best_hash, reviewed_hash,
+                                          [obligation for accepted in self.accepted
+                                           for obligation in accepted["verified_obligations"]])
+            if self.deadline.stop_event.is_set():
+                raise TimeLimitError("review cancelled")
+            if self.model is None:
+                return {"approve": False, "issues": [], "missing_evidence": ["model review is unavailable"]}
+            hypotheses = self.review_hypotheses(plan)
+            changed = self.sources.diff(max_chars=30000)
+            source_context = review_source_context(self.sources.candidate, changed, hypotheses, max_chars=24000,
+                                                   stop_event=self.deadline.stop_event)
+            old_runs, new_runs = ({r.run_id: r for r in before}, {r.run_id: r for r in after})
+            focused = 0
+            for pair in evidence["pairs"]:
+                old, new = old_runs[pair["before"]["run_id"]], new_runs[pair["after"]["run_id"]]
+                focus = focused < 2 and (not old.ok or not new.ok)
+                if focus:
+                    focused += 1
+                # Keep both causal excerpts with the one immutable input identity.
+                pair["before"].update(brief(old, timeline=focus and not old.ok))
+                pair["after"].update(brief(new, timeline=focus and not new.ok))
+            tool = _review_tool(reviewed_hash, evidence)
+            context = "\n\n".join([
+                "# Candidate review identity\n" + json.dumps({"source_hash": reviewed_hash}),
+                "# Proposed repair\n" + json.dumps(plan),
+                "# Relevant source-bound hypotheses\n" + json.dumps(hypotheses),
+                "# Previously accepted obligations\n" + json.dumps([
+                    {key: accepted[key] for key in ("source_hash", "reason", "verified_obligations", "reproductions")}
+                    for accepted in self.accepted]),
+                "# Current contracts\n" + self.contract_context,
+                "# Source diff\n" + changed,
+                "# Current source and unchanged consumers\n" + json.dumps(source_context, ensure_ascii=False,
+                                                                            separators=(",", ":")),
+                "# Matched experiment pairs and host facts\n" + json.dumps(evidence),
+            ])
+            messages = [{"role": "user", "content": context}]
+            reserve = max(10.0, self.test_seconds * 2 + self.replay_seconds * 3 + 5)
+            for attempt in range(2):
+                if self.deadline.stop_event.is_set():
+                    raise TimeLimitError("review cancelled")
+                if (self.sources.candidate_hash != reviewed_hash
+                        or self.sources.best_hash != evidence["accepted_source_hash"]):
+                    raise ReviewEvidenceError("A source snapshot changed during review; rebuild matched evidence for the current sources.")
+                reply = self.model.messages(REVIEW, messages, [tool], max_tokens=2048, reserve=reserve,
+                                            tool_choice={"type": "tool", "name": REVIEW_TOOL_NAME})
+                if self.deadline.stop_event.is_set():
+                    raise TimeLimitError("review cancelled")
+                if (self.sources.candidate_hash != reviewed_hash
+                        or self.sources.best_hash != evidence["accepted_source_hash"]):
+                    raise ReviewEvidenceError("A source snapshot changed during review; rebuild matched evidence for the current sources.")
+                if reply.stop_reason != "tool_use":
+                    raise ModelError("review did not finish with a native tool decision", code="review_protocol")
+                try:
+                    verdict = _review_verdict(reply.content, reviewed_hash, evidence)
+                except ReviewEvidenceError as error:
+                    blocked = error.feedback(reviewed_hash)
+                    emit("review_evidence_rejected", source_hash=reviewed_hash, error=str(error),
+                         correctable=error.correctable, correction_attempt=attempt, cost_usd=reply.cost_usd)
+                    available = getattr(self.model, "remaining_budget", None)
+                    budget_ok = (available is None or isinstance(available, (int, float))
+                                 and not isinstance(available, bool) and math.isfinite(available) and available > 0)
+                    time_ok = self.deadline.remaining() > reserve + max(10.0, self.review_seconds) + 5
+                    if attempt or not error.correctable or not budget_ok or not time_ok:
+                        return blocked
+                    call = next(block for block in reply.content if block["type"] == "tool_use")
+                    messages = [*messages, {"role": "assistant", "content": reply.content},
+                                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call["id"],
+                                                                "is_error": True, "content": json.dumps(blocked)}]}]
+                    continue
+                if attempt:
+                    verdict["correction_attempted"] = True
+                verdict["evidence_pair_count"] = len(evidence["pairs"])
+                emit("repair_review", **verdict, cost_usd=reply.cost_usd)
+                return verdict
+        except ReviewEvidenceError as error:
+            emit("review_evidence_rejected", source_hash=reviewed_hash, error=str(error), correctable=False)
+            return error.feedback(reviewed_hash)
         except (ModelError, TimeLimitError) as error:
             emit("review_unavailable", error=str(error))
+            if blocked is not None:
+                return blocked
+            if self.deadline.stop_event.is_set():
+                return {"source_hash": reviewed_hash, "approve": False, "issues": [],
+                        "missing_evidence": ["Review was cancelled before a complete verdict."]}
             # A complete passing local matrix can still be accepted. Partial
             # repairs need a review to explain remaining/newly exposed failures.
             return {"approve": full_pass, "issues": [], "missing_evidence": [], "skipped": str(error)}
