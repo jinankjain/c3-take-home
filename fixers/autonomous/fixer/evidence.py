@@ -684,6 +684,41 @@ def _entities(value: Any, out: list[str], depth: int = 0) -> None:
             _entities(item, out, depth + 1)
 
 
+def _prose_entities(detail: str) -> list[str]:
+    """Strip sentence punctuation from prose, leaving structured IDs alone."""
+    tokens = re.findall(
+        r"\b(?:action|job|key|task|op_id|worker|holder)\s*[=:]?\s+([\w:./@-]+)", detail[:1500],
+    )
+    tokens += re.findall(r"\b[\w-]+:[\w:./@-]+", detail[:1500])
+    return list(dict.fromkeys(token.rstrip(":.,;!?")[:512] for token in tokens if token.rstrip(":.,;!?")))[:MAX_ENTITIES]
+
+
+def _checker_linked_event(event: dict, anchors: list[tuple[float, set[str], str]]) -> bool:
+    """Require a checker time, exact entity, and a named event/state fact.
+
+    Time proximity or an abnormal-looking log name alone is context. A checker
+    that names a CANCELLED state at the entity's terminal event provides an
+    actual trace anchor even when it has no RPC error code.
+    """
+    at = _global_time(event)
+    matching = [(entities, detail) for t, entities, detail in anchors
+                if at is not None and abs(t - at) <= 1e-6]
+    if not matching or event.get("event") == "scenario":
+        return False
+    entities: list[str] = []
+    _entities(event, entities)
+    for wanted, detail in matching:
+        if not wanted.intersection(entities):
+            continue
+        for key in ("event", "effect", "state", "status", "outcome"):
+            fact = event.get(key)
+            if isinstance(fact, str) and fact and len(fact) <= 100 and re.search(
+                r"(?<![\w:./@-])" + re.escape(fact.casefold()) + r"(?![\w:./@-])", detail,
+            ):
+                return True
+    return False
+
+
 def _failure_groups(violations: list) -> list[dict]:
     grouped: dict[tuple[str, str], dict] = {}
     for violation in violations:
@@ -738,6 +773,44 @@ def _error_codes(violations: list) -> list[str]:
     return codes
 
 
+def _failure_context(value: dict) -> bool:
+    """A typed failure context, never an error-looking log/counter name."""
+    kind = value.get("kind")
+    error_kind = isinstance(kind, str) and len(kind) <= 100 and re.split(r"[_:. -]", kind.casefold())[-1] in {
+        "error", "exception", "failure", "failed", "rejected", "timeout",
+    }
+    return (value.get("ok") is False or value.get("success") is False
+            or value.get("outcome") in ("error", "failed", "rejected", "timeout")
+            or error_kind)
+
+
+def _explicit_error(event: dict) -> bool:
+    """Recognize actual error records without interpreting generic log names."""
+    if event.get("event") == "scenario" or (str(event.get("type", "")).casefold() in {"req", "request", "rpc_request"}
+                                            and not _failure_context(event)):
+        return False
+
+    def visit(value: Any, depth: int = 0) -> bool:
+        if depth > 6:
+            return False
+        if isinstance(value, dict):
+            if _failure_context(value):
+                return True
+            for key, item in list(value.items())[:32]:
+                field = str(key).casefold()
+                if field in {"expect", "expected", "config", "configuration", "scenario", "meta", "metadata"}:
+                    continue
+                if field in {"err", "error", "exception"} and item:
+                    return True
+                if isinstance(item, (dict, list)) and visit(item, depth + 1):
+                    return True
+        elif isinstance(value, list):
+            return any(visit(item, depth + 1) for item in value[:16])
+        return False
+
+    return visit(event)
+
+
 def _matches_error_codes(event: dict, codes: list[str]) -> bool:
     """Match reported failures in structured error fields, not log names.
 
@@ -747,16 +820,8 @@ def _matches_error_codes(event: dict, codes: list[str]) -> bool:
     expected = set(codes)
     patterns = [re.compile(r"(?<![\w.-])" + re.escape(code) + r"(?![\w.-])") for code in codes]
 
-    def error_context(value: dict) -> bool:
-        outcome = value.get("outcome")
-        return (value.get("ok") is False or value.get("success") is False
-                or any(isinstance(value.get(key), str)
-                       and re.search(r"error|exception|fail|reject", value[key], re.IGNORECASE)
-                       for key in ("kind", "event"))
-                or isinstance(outcome, str) and outcome in {"error", "failed", "rejected", "timeout"})
-
     if event.get("event") == "scenario" or (str(event.get("type", "")).casefold() in {"req", "request", "rpc_request"}
-                                           and not error_context(event)):
+                                            and not _failure_context(event)):
         return False
 
     def visit(value: Any, in_error: bool = False, depth: int = 0) -> bool:
@@ -765,13 +830,13 @@ def _matches_error_codes(event: dict, codes: list[str]) -> bool:
         if isinstance(value, str):
             return in_error and any(pattern.search(value[:512].casefold()) for pattern in patterns)
         if isinstance(value, dict):
-            in_error = in_error or error_context(value)
+            in_error = in_error or _failure_context(value)
             fields = list(value.items())[:32]
             typed_code = any(str(key).casefold() in {"code", "error_code"} and isinstance(item, str)
                              for key, item in fields)
             for key, item in fields:
                 field = str(key).casefold()
-                if not in_error and field in {"expect", "expected", "config", "configuration", "scenario", "metadata"}:
+                if not in_error and field in {"expect", "expected", "config", "configuration", "scenario", "meta", "metadata"}:
                     continue
                 if in_error and field in {"code", "error_code"} and isinstance(item, str) and item.casefold() in expected:
                     return True
@@ -807,8 +872,19 @@ def summarize_trace(trace: Path, violations: list, summary: dict, max_events: in
     header: dict = {}
     faults = _Sample(8)
     abnormal = _Sample(min(12, max(0, int(max_events))))
-    error_witnesses = _Sample(8)
+    failure_witnesses = _Sample(8)
     codes = _error_codes(violations)
+    checker_anchors: list[tuple[float, set[str], str]] = []
+    if not codes:
+        for violation in violations[:40]:
+            if not isinstance(violation, dict) or _global_time(violation) is None:
+                continue
+            related: list[str] = []
+            _entities(violation, related)
+            detail = str(violation.get("detail", ""))[:1500]
+            related += _prose_entities(detail)
+            if related:
+                checker_anchors.append((_global_time(violation), set(related), detail.casefold()))
 
     for line, event in _scan(trace, stats, should_stop):
         kind = str(event.get("kind", "unknown"))[:100]
@@ -820,8 +896,14 @@ def summarize_trace(trace: Path, violations: list, summary: dict, max_events: in
                 header = _bounded(event)
         if _is_abnormal(event):
             abnormal.add(event, line)
-        if codes and _matches_error_codes(event, codes):
-            error_witnesses.add(event, line)
+        basis = "checker_error_code" if codes and _matches_error_codes(event, codes) else None
+        if not codes:
+            if _explicit_error(event):
+                basis = "explicit_error"
+            elif _checker_linked_event(event, checker_anchors):
+                basis = "checker_time_entity_fact"
+        if basis:
+            failure_witnesses.add({**event, "witness_basis": basis}, line)
         if kind == "fault":
             faults.add(event, line)
         if kind == "client":
@@ -857,32 +939,31 @@ def summarize_trace(trace: Path, violations: list, summary: dict, max_events: in
             continue
         _entities(violation, entities)
         detail = str(violation.get("detail", ""))[:1500]
-        for match in re.finditer(
-            r"\b(?:action|job|key|task|op_id|worker|holder)\s*[=:]?\s+([\w:./@-]+)", detail,
-        ):
-            entity = match.group(1)
-            if entity not in entities and len(entities) < MAX_ENTITIES:
-                entities.append(entity)
-        for entity in re.findall(r"\b[\w-]+:[\w:./@-]+", detail):
+        for entity in _prose_entities(detail):
             if entity not in entities and len(entities) < MAX_ENTITIES:
                 entities.append(entity)
 
     focus_reason = "invariant_entities_and_time"
-    witnesses = error_witnesses.events() or abnormal.events()
+    witnesses = failure_witnesses.events()
+    context_events = abnormal.events()
     times = [_global_time(violation) for violation in violations[:40] if isinstance(violation, dict)]
     times = [t for t in times if t is not None]
-    if not entities:
+    if not entities and witnesses:
         # Aggregate expectations often report the scenario's end time. Locate
         # the actual failed response/effect before choosing a causal window.
         for event in witnesses:
             _entities(event, entities)
         witness_times = [_global_time(event) for event in witnesses]
         times = [t for t in witness_times if t is not None] or times
-        focus_reason = "checker_error_witnesses" if error_witnesses.matched else "abnormal_events"
+        focus_reason = "checker_error_witnesses" if codes else "explicit_error_witnesses"
+    elif not entities and not times:
+        for event in context_events:
+            _entities(event, entities)
+        times = [t for event in context_events if (t := _global_time(event)) is not None]
+        focus_reason = "abnormal_context_without_checker_anchor"
     available_times = _representative_times(times)
     times = _ends(available_times, MAX_CAUSAL_WINDOWS)
-    required = [event for event in witnesses if error_witnesses.matched
-                and (_global_time(event) is None
+    required = [event for event in witnesses if (_global_time(event) is None
                      or any(abs(_global_time(event) - at) <= 2.0 for at in times))]
     if entities or times:
         timeline = _select_trace(trace, entities, None, min(200, max(0, int(max_events))), times, 2.0, 2,
@@ -890,9 +971,10 @@ def summarize_trace(trace: Path, violations: list, summary: dict, max_events: in
     else:
         # Without a causal focus, the already collected error witnesses are
         # more useful than another scan of unrelated progress records.
-        witness_count = error_witnesses.matched or abnormal.matched
-        timeline = {"events": witnesses, "eligible_events": witness_count,
-                    "selection_truncated": witness_count > len(witnesses),
+        focused = witnesses or context_events
+        focused_count = failure_witnesses.matched or abnormal.matched
+        timeline = {"events": focused, "eligible_events": focused_count,
+                    "selection_truncated": focused_count > len(focused),
                     "window_match_counts": [], **_stats()}
     if not timeline["events"] and entities:
         # Some schemas omit global timestamps; still retain their entity
@@ -901,7 +983,7 @@ def summarize_trace(trace: Path, violations: list, summary: dict, max_events: in
                                  should_stop, required_events=required)
         focus_reason = "entity_history_without_time_matches"
         times = []
-    timeline_events = timeline["events"] if entities or times else witnesses
+    timeline_events = timeline["events"]
     # Linked requests identify the failed operation even when the reply carries
     # only an RPC id. Retain those entities before unrelated window context.
     for event in sorted(timeline_events, key=lambda item: not item.get("required_for_failure", False)):

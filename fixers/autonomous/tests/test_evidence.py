@@ -215,6 +215,127 @@ def test_error_code_declarations_require_a_failure_context():
     assert not _matches_error_codes({"payload": {"outcome": {"code": "CAPACITY"}}}, ["capacity"])
 
 
+@pytest.mark.parametrize("punctuation", [":", ".", ":."])
+def test_prose_entity_punctuation_keeps_the_checker_linked_terminal_event(tmp_path, punctuation):
+    path = tmp_path / "trace.jsonl"
+    events = [{"kind": "log", "seq": index, "t": 5 + index / 1000,
+               "event": "progress", "key": "Tenant/task"} for index in range(100)]
+    events[50] = {"kind": "log", "seq": 50, "t": 5.05, "event": "task_terminal",
+                  "key": "Tenant/task", "state": "CANCELLED"}
+    events += [{"kind": "log", "seq": 100, "t": 20, "event": "effect_done",
+                "key": "Tenant/task", "state": "SUCCEEDED"}]
+    write_trace(path, events)
+    summary = {"source_hash": "a" * 64, "scenario_hash": "b" * 64,
+               "trace_sha256": "c" * 64, "seed": 7}
+    result = summarize_trace(path, [{"invariant": "CANCELLATION", "t": 5.05,
+                                    "detail": f"job Tenant/task{punctuation} CANCELLED but effect SUCCEEDED"}], summary,
+                             max_events=12)
+    assert "Tenant/task" in result["affected_entities"]
+    assert "Tenant/task" + punctuation not in result["affected_entities"]
+    assert [event["seq"] for event in result["failure_witnesses"]] == [50]
+    assert result["failure_witnesses"][0]["witness_basis"] == "checker_time_entity_fact"
+    assert any(event["seq"] == 50 and event.get("required_for_failure") is True
+               for event in result["timeline"]), "the dense window lost the exact checker anchor"
+    encoded = json.dumps(result, allow_nan=False)
+    assert len(encoded) <= MAX_TRACE_CHARS
+    assert json.loads(encoded)["identity"]["source_hash"] == summary["source_hash"]
+
+
+def test_structured_entity_punctuation_is_not_normalized_as_prose(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    write_trace(path, [{"kind": "log", "seq": 0, "t": 5, "event": "terminal",
+                       "key": "Tenant/task:", "state": "FAILED"}])
+    result = summarize_trace(path, [{"invariant": "RESULT", "t": 5,
+                                    "key": "Tenant/task:", "detail": "terminal state FAILED"}], {})
+    assert "Tenant/task:" in result["affected_entities"]
+    assert "Tenant/task" not in result["affected_entities"]
+    assert result["failure_witnesses"][0]["key"] == "Tenant/task:"
+
+
+def test_nonerror_invariant_never_labels_normal_capacity_context_as_failure(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    write_trace(path, [
+        {"kind": "log", "seq": 0, "t": 1, "event": "capacity_reserved", "key": "Tenant/other"},
+        {"kind": "log", "seq": 1, "t": 5, "event": "capacity_reserved", "key": "Tenant/capacity_reserved"},
+        {"kind": "log", "seq": 2, "t": 6, "event": "capacity_freed", "key": "Tenant/capacity_reserved"},
+    ])
+    result = summarize_trace(path, [{"invariant": "DEADLINE", "t": 5,
+                                    "detail": "job Tenant/capacity_reserved: deadline was exceeded"}],
+                             {"source_hash": "a" * 64})
+    assert result["failure_witnesses"] == []
+    assert result["abnormal_events"], "normal bookkeeping should remain available as context"
+    assert result["causal_windows"][0]["at"] == 5
+    assert "Tenant/capacity_reserved" in result["affected_entities"]
+    assert all(not event.get("required_for_failure") for event in result["timeline"])
+    assert result["identity"]["source_hash"] == "a" * 64
+
+
+def test_untyped_invariant_uses_explicit_response_errors_not_request_data(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    write_trace(path, [
+        {"kind": "log", "seq": 0, "t": 0, "event": "scenario", "expect": {"error": "STALE"}},
+        {"kind": "msg_send", "seq": 1, "t": 1, "type": "req", "msg_id": 17,
+         "payload": {"error": "requested data", "op_id": "Tenant/task"}},
+        {"kind": "log", "seq": 2, "t": 2, "event": "capacity_reserved", "config": {"error": "STALE"}},
+        {"kind": "msg_send", "seq": 3, "t": 20, "type": "rep", "rpc_id": 17,
+         "payload": {"err": ["STALE", "lease no longer valid"]}},
+    ])
+    result = summarize_trace(path, [{"invariant": "COMPLETE", "t": 100,
+                                    "detail": "a remote operation did not complete"}], {})
+    assert [event["seq"] for event in result["failure_witnesses"]] == [3]
+    assert result["failure_witnesses"][0]["witness_basis"] == "explicit_error"
+    assert result["causal_windows"][0]["at"] == 20
+    assert any(event["seq"] == 1 for event in result["timeline"]), "the failed RPC lost its request"
+
+
+@pytest.mark.parametrize("bookkeeping", [
+    {"kind": "log", "event": "error_count", "count": 0, "success": True},
+    {"kind": "failure_count", "event": "metrics", "count": 0, "success": True},
+    {"kind": "x" * 94 + "_error_count", "event": "metrics", "count": 0, "success": True},
+    {"kind": "log", "event": "configuration_applied", "meta": {"error": "configured label"}},
+    {"kind": "log", "event": "configuration_applied", "metadata": {"error": "configured label"}},
+])
+def test_counter_names_and_declarations_do_not_become_explicit_failure_witnesses(tmp_path, bookkeeping):
+    path = tmp_path / "trace.jsonl"
+    write_trace(path, [{**bookkeeping, "seq": 0, "t": 1, "key": "Tenant/other"}])
+    result = summarize_trace(path, [{"invariant": "COMPLETE", "t": 100,
+                                    "detail": "a remote operation did not complete"}],
+                             {"source_hash": "a" * 64})
+    assert result["failure_witnesses"] == []
+    assert result["causal_windows"][0]["at"] == 100, "unrelated bookkeeping displaced the checker time"
+    assert result["timeline"] == []
+    assert result["identity"]["source_hash"] == "a" * 64
+
+
+@pytest.mark.parametrize("kind", ["rpc_error", "transport.exception", "timeout"])
+def test_actual_error_kind_tags_remain_explicit_witnesses(tmp_path, kind):
+    path = tmp_path / "trace.jsonl"
+    write_trace(path, [{"kind": kind, "seq": 0, "t": 12, "op_id": "Tenant/operation"}])
+    result = summarize_trace(path, [{"invariant": "COMPLETE", "t": 100,
+                                    "detail": "a remote operation did not complete"}], {})
+    assert result["failure_witnesses"][0]["kind"] == kind
+    assert result["failure_witnesses"][0]["witness_basis"] == "explicit_error"
+    assert result["causal_windows"][0]["at"] == 12
+
+
+def test_named_error_code_in_meta_remains_declaration_data():
+    assert not _matches_error_codes({"kind": "log", "event": "configuration_applied",
+                                     "meta": {"error": {"code": "CAPACITY"}}}, ["capacity"])
+
+
+def test_typed_code_on_a_successful_counter_is_not_an_error_witness(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    counter = {"kind": "log", "event": "error_count", "code": "CAPACITY",
+               "count": 0, "success": True, "seq": 0, "t": 1}
+    assert not _matches_error_codes(counter, ["capacity"])
+    write_trace(path, [counter])
+    result = summarize_trace(path, [{"invariant": "expect", "t": 100,
+                                    "detail": "rpc errors {'code': 'CAPACITY'}: 1 > 0"}], {})
+    assert result["failure_witnesses"] == []
+    assert result["causal_windows"][0]["at"] == 100
+    assert result["timeline"] == []
+
+
 def test_response_fallback_is_bounded_and_never_alters_exact_provenance():
     result = bounded_result({"run_id": "run-a", "source_hash": "a" * 64,
                              "current_source_hash": "b" * 64, "seed": 17, "ok": False,
