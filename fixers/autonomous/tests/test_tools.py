@@ -463,6 +463,196 @@ def test_composition_bounds_section_preview_without_losing_reference_hashes(cont
     assert result["composition"]["fault_profiles"][0]["reference"] == "faults/many-sections.yaml"
 
 
+def test_composition_reports_all_unresolved_paths_and_publishes_only_after_explicit_resolution(controller, dispatcher):
+    existing = {"network": {"drop.rate": .01}, "gpu": {"latency": [1, 2]},
+                "nodes": {"clocks": [{"node": "worker-1", "offset": .1}]}}
+    incoming = {"network": {"drop.rate": .2}, "gpu": {"latency": [2, 3]},
+                "nodes": {"clocks": [{"node": "worker-1", "offset": .3}]}}
+    shipped = controller.sources.candidate / "scenarios" / "public.yaml"
+    shipped.write_text(yaml.safe_dump({"name": "public", "faults": existing}, sort_keys=False))
+    shipped_bytes = shipped.read_bytes()
+    write_fault(controller, "different-settings", incoming)
+    args = {"name": "resolved-settings", "base": "public", "fault_profiles": ["faults/different-settings.yaml"]}
+    error = failure(dispatcher, "compose_probe", args)
+
+    assert error["code"] == "composition_conflict"
+    assert error["source_hash"] == controller.sources.candidate_hash
+    assert error["conflicts_total"] == 3 and error["conflicts_omitted"] == 0
+    rows = {tuple(row["path"]): row for row in error["conflicts"]}
+    assert set(rows) == {("faults", "network", "drop.rate"), ("faults", "gpu", "latency"),
+                         ("faults", "nodes", "clocks")}
+    assert json.loads(rows[("faults", "network", "drop.rate")]["existing_value"]) == .01
+    assert json.loads(rows[("faults", "network", "drop.rate")]["incoming_value"]) == .2
+    assert rows[("faults", "nodes", "clocks")]["required_override"] == "whole_list"
+    assert not rows[("faults", "gpu", "latency")]["incoming_truncated"]
+    assert not list(controller.probe_root.glob("*.yaml"))
+
+    partial = {**args, "overrides": {"faults": {"network": incoming["network"]}}}
+    remaining = failure(dispatcher, "compose_probe", partial)
+    assert remaining["conflicts_total"] == 2
+    assert not list(controller.probe_root.glob("*.yaml"))
+    result = success(dispatcher, "compose_probe", {**args, "overrides": {"faults": incoming}})
+    assert yaml.safe_load(Path(result["path"]).read_text())["faults"] == incoming
+    assert shipped.read_bytes() == shipped_bytes
+    assert result["probe_hash"] == hashlib.sha256(Path(result["path"]).read_bytes()).hexdigest()
+    failure(dispatcher, "compose_probe", {**args, "overrides": {"faults": incoming}})
+
+
+def test_composition_conflict_previews_and_count_are_bounded(controller, dispatcher):
+    from fixer.evidence import MAX_TRACE_CHARS
+    from fixer.tools import MAX_CONFLICT_VALUE_CHARS
+
+    original = {"setting-" + str(number): '"before\\' * 180 for number in range(16)}
+    changed = {key: '"after\\' * 180 for key in original}
+    base = success(dispatcher, "write_probe", {"name": "many-settings", "scenario": {"faults": original}})
+    write_fault(controller, "many-changes", changed)
+    answer = dispatcher.execute("compose_probe", {"name": "not-published", "base": base["probe"],
+                                                  "fault_profiles": ["faults/many-changes.yaml"]})
+    assert not answer["ok"]
+    error = answer["error"]
+    assert error["conflicts_total"] == 16
+    assert 0 < len(error["conflicts"]) <= 12
+    assert error["conflicts_omitted"] == 16 - len(error["conflicts"])
+    assert len(json.dumps(answer, ensure_ascii=False)) <= MAX_TRACE_CHARS
+    for row in error["conflicts"]:
+        assert row["existing_truncated"] and row["incoming_truncated"]
+        assert len(row["existing_value"]) <= MAX_CONFLICT_VALUE_CHARS
+        assert len(row["incoming_value"]) <= MAX_CONFLICT_VALUE_CHARS
+    assert not (controller.probe_root / "not-published.yaml").exists()
+
+
+def test_composition_preserves_exact_escaped_paths_within_the_response_budget(controller, dispatcher):
+    from fixer.evidence import MAX_TRACE_CHARS
+
+    keys = ['prefix-"\\\n' * 11 + str(number) for number in range(8)]
+
+    def nested(value):
+        document = {"setting-" + str(number): value for number in range(16)}
+        for key in reversed(keys):
+            document = {key: document}
+        return {"faults": document}
+
+    base = success(dispatcher, "write_probe", {"name": "escaped-settings", "scenario": nested('"old\\' * 120)})
+    write_fault(controller, "escaped-changes", nested('"new\\' * 120))
+    answer = dispatcher.execute("compose_probe", {"name": "escaped-result", "base": base["probe"],
+                                                  "fault_profiles": ["faults/escaped-changes.yaml"]})
+    assert not answer["ok"]
+    error = answer["error"]
+    assert error["conflicts_total"] == 16
+    assert error["conflicts_omitted"] == 16 - len(error["conflicts"])
+    assert len(json.dumps(answer, ensure_ascii=False)) <= MAX_TRACE_CHARS
+    assert error["conflicts"]
+    for row in error["conflicts"]:
+        assert row["path"][:-1] == ["faults", *keys]
+        assert row["path"][-1].startswith("setting-")
+    assert not (controller.probe_root / "escaped-result.yaml").exists()
+
+
+def test_composition_cancellation_during_conflict_collection_publishes_nothing(controller, dispatcher, monkeypatch):
+    from fixer.tools import _CompositionConflicts
+
+    write_fault(controller, "cancel-changes", {"network": {"drop": .4, "new_setting": 1}, "other": 2})
+    original_add = _CompositionConflicts.add
+
+    def cancel_after_conflict(self, *args, **kwargs):
+        original_add(self, *args, **kwargs)
+        controller.deadline.stop_event.set()
+
+    monkeypatch.setattr(_CompositionConflicts, "add", cancel_after_conflict)
+    error = failure(dispatcher, "compose_probe", {"name": "cancelled", "base": "public",
+                                                 "fault_profiles": ["faults/cancel-changes.yaml"]})
+    assert error["code"] == "deadline"
+    assert not list(controller.probe_root.glob("*.yaml"))
+
+
+@pytest.mark.parametrize("arguments", [
+    {"name": "bad-keys", "base": "public", "seeds": [1, 2]},
+    {"name": "missing-base"},
+])
+def test_composition_argument_errors_advertise_allowed_and_required_keys(controller, dispatcher, arguments):
+    error = failure(dispatcher, "compose_probe", arguments)
+    assert error["code"] == "invalid_arguments"
+    assert error["allowed_keys"] == ["base", "fault_profiles", "name", "overrides", "probes"]
+    assert error["required_keys"] == ["base", "name"]
+    assert not (controller.sources.scratch / "probes").exists()
+
+
+@pytest.mark.parametrize("plan", [
+    None, {}, {"reason": "valid", "unknown": True}, {"reason": "x" * 6001},
+    {"reason": "valid", "target_invariants": ["INV"] * 13},
+    {"reason": "valid", "reproductions": [{"scenario": "public", "seed": 1}] * 13},
+    {"reason": "valid", "reproductions": [{"scenario": "public", "seed": True}]},
+    {"reason": "valid", "reproductions": [{"scenario": "../outside.yaml", "seed": 1}]},
+    {"reason": "valid", "reproductions": [{"scenario": "public", "seed": 1, "faults": "../outside.yaml"}]},
+])
+def test_invalid_repair_metadata_cannot_change_source_or_capture_intent(controller, dispatcher, plan):
+    calls = []
+    controller.remember_repair_plan = lambda *args: calls.append(args)
+    before = controller.sources.candidate_hash
+    answer = dispatcher.execute("apply_edits", {"base_hash": before, "repair_plan": plan,
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+    assert not answer["ok"] and "result" not in answer
+    assert controller.sources.candidate_hash == before
+    assert (controller.sources.candidate / "src/main.py").read_text() == "VALUE = 1\n"
+    assert not calls
+
+
+def test_edit_plan_is_captured_after_success_with_exact_source_identity(controller, dispatcher):
+    calls = []
+
+    def remember(base_hash, new_hash, plan):
+        assert new_hash == controller.sources.candidate_hash
+        calls.append((base_hash, new_hash, plan))
+        return {**plan, "source_hash": new_hash, "base_source_hash": base_hash}
+
+    controller.remember_repair_plan = remember
+    base = controller.sources.candidate_hash
+    plan = {"reason": "Preserve the operation across recovery.", "target_invariants": ["RECOVERY"],
+            "reproductions": [{"scenario": "public", "seed": 1, "faults": "scenarios/faults/network.yaml"}]}
+    result = success(dispatcher, "apply_edits", {"base_hash": base, "repair_plan": plan,
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+    assert calls == [(base, result["source_hash"], plan)]
+    assert result["repair_plan"] == {**plan, "source_hash": result["source_hash"], "base_source_hash": base}
+    assert not controller.validation_calls
+    assert (controller.sources.live / "src/main.py").read_text() == "VALUE = 1\n"
+
+
+def test_metadata_free_edit_notifies_capture_with_none_and_does_not_reuse_the_previous_plan(controller, dispatcher):
+    calls = []
+    controller.remember_repair_plan = lambda *args: calls.append(args)
+    first_base = controller.sources.candidate_hash
+    first = success(dispatcher, "apply_edits", {"base_hash": first_base, "repair_plan": {"reason": "First repair."},
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+    second = success(dispatcher, "apply_edits", {"base_hash": first["source_hash"],
+            "edits": [{"path": "src/main.py", "content": "VALUE = 3\n"}]})
+    assert calls[0] == (first_base, first["source_hash"],
+                        {"reason": "First repair.", "target_invariants": [], "reproductions": []})
+    assert calls[1] == (first["source_hash"], second["source_hash"], None)
+    assert "repair_plan" not in second
+
+
+@pytest.mark.parametrize("bad_edit", ["syntax", "stale"])
+def test_failed_edit_never_captures_a_repair_plan(controller, dispatcher, bad_edit):
+    calls = []
+    controller.remember_repair_plan = lambda *args: calls.append(args)
+    before = controller.sources.candidate_hash
+    answer = dispatcher.execute("apply_edits", {"base_hash": "0" * 64 if bad_edit == "stale" else before,
+            "repair_plan": {"reason": "Intent must bind only successful edits."},
+            "edits": [{"path": "src/main.py", "content": "this is invalid python (\n" if bad_edit == "syntax" else "VALUE = 2\n"}]})
+    assert not answer["ok"] and "result" not in answer
+    assert controller.sources.candidate_hash == before and not calls
+
+
+def test_legacy_controller_rejects_metadata_before_editing_and_still_allows_metadata_free_edits(controller, dispatcher):
+    assert not hasattr(controller, "remember_repair_plan")
+    before = controller.sources.candidate_hash
+    failure(dispatcher, "apply_edits", {"base_hash": before, "repair_plan": {"reason": "Needs capture support."},
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+    assert controller.sources.candidate_hash == before
+    success(dispatcher, "apply_edits", {"base_hash": before,
+            "edits": [{"path": "src/main.py", "content": "VALUE = 2\n"}]})
+
+
 def test_large_trace_envelope_remains_valid_json_through_main_rendering(controller, dispatcher):
     from fixer.main import tool_text
 

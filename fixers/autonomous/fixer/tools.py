@@ -26,6 +26,9 @@ MAX_PROBE_BYTES = 64 * 1024
 MAX_PROBES = 24
 MAX_COMPOSITION_PARTS = 8
 MAX_COMPOSITION_FILES = 32
+MAX_COMPOSITION_CONFLICTS = 12
+MAX_CONFLICT_VALUE_CHARS = 256
+MAX_CONFLICT_FEEDBACK_CHARS = MAX_TRACE_CHARS - 1600
 _PROBE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCES = ("candidate", "original", "accepted")
@@ -101,15 +104,20 @@ TOOL_DEFINITIONS = [
         "name": _string(64, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"),
         "scenario": {"type": "object"},
     }, ("name", "scenario")),
-    _tool("compose_probe", "Compose an immutable scratch scenario from a shipped/scratch base, additional scenario probes, and fault profiles. References use shipped names/paths or probe:name. Inherited fault files are inlined. Mappings merge; record lists append with exact dedup. Conflicting scalar/range settings require explicit nested overrides. Replay identical inputs on accepted and candidate source before using them as repair evidence.", {
+    _tool("compose_probe", "Compose an immutable scratch scenario from a shipped/scratch base, additional scenario probes, and fault profiles. References use shipped names/paths or probe:name. Inherited fault files are inlined. Mappings merge; record lists append with exact dedup. Conflicts return exact path tokens and bounded existing/incoming values; resolve every conflicting scalar/range with a nested override, or replace the whole conflicting record list explicitly. A faults file in overrides replaces and inlines that entire fault block. Replay identical inputs on accepted and candidate source before using them as repair evidence.", {
         "name": _string(64, pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$"),
         "base": _string(256),
         "fault_profiles": _array(_string(256), MAX_COMPOSITION_PARTS),
         "probes": _array(_string(256), MAX_COMPOSITION_PARTS),
         "overrides": {"type": "object"},
     }, ("name", "base")),
-    _tool("apply_edits", "Apply coherent edits only to staged src using the current candidate hash. Each edit is path/content, path/old/new (one exact match), or path/delete:true. Python must remain syntactically valid. Validation owns source promotion.", {
+    _tool("apply_edits", "Apply coherent edits only to staged src using the current candidate hash. Each edit is path/content, path/old/new (one exact match), or path/delete:true. Python must remain syntactically valid. Optional repair_plan records the stated reason, repaired invariant families, and local reproductions for later controller validation; it does not accept a repair. Validation owns source promotion.", {
         "base_hash": _string(64, pattern=r"^[0-9a-f]{64}$"),
+        "repair_plan": _object({
+            "reason": _string(6000),
+            "target_invariants": _array(_string(100), 12),
+            "reproductions": _array(_reproduction_schema, 12),
+        }, ("reason",)),
         "edits": _array({
             **_object({"path": _string(), "content": {"type": "string", "maxLength": 131072},
                        "old": _string(131072), "new": {"type": "string", "maxLength": 131072},
@@ -133,6 +141,55 @@ TOOL_DEFINITIONS = [
 
 _KEYS = {definition["name"]: set(definition["input_schema"]["properties"]) for definition in TOOL_DEFINITIONS}
 _REQUIRED = {definition["name"]: set(definition["input_schema"]["required"]) for definition in TOOL_DEFINITIONS}
+
+
+class _CompositionConflicts(ValueError):
+    """Collect unresolved settings without retaining unbounded input values."""
+
+    def __init__(self):
+        super().__init__("probe composition has unresolved settings; provide explicit nested overrides")
+        self.conflicts: list[dict] = []
+        self.total = 0
+        self._chars = 0
+
+    @staticmethod
+    def _value(value: Any) -> tuple[str, bool]:
+        text = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        truncated = len(text) > MAX_CONFLICT_VALUE_CHARS
+        return text[:MAX_CONFLICT_VALUE_CHARS], truncated
+
+    def add(self, path: tuple[str, ...], existing: Any, incoming: Any, *, whole_list: bool = False) -> None:
+        self.total += 1
+        if self.total == 1:
+            label = ".".join(path) or "<root>"
+            message = (f"conflicting records at {label}; provide an explicit list override" if whole_list
+                       else f"conflicting probe setting at {label}; provide a nested override")
+            self.args = (message[:1200],)
+        if len(self.conflicts) >= MAX_COMPOSITION_CONFLICTS:
+            return
+        before, before_truncated = self._value(existing)
+        after, after_truncated = self._value(incoming)
+        row = {"path": list(path), "existing_value": before, "incoming_value": after,
+               "existing_truncated": before_truncated, "incoming_truncated": after_truncated,
+               "required_override": "whole_list" if whole_list else "value"}
+        size = len(json.dumps(row, ensure_ascii=False)) + 2
+        # Exact paths are never shortened. Omit a row that cannot fit and make
+        # the omission explicit, while still inspecting subsequent settings.
+        if self._chars + size <= MAX_CONFLICT_FEEDBACK_CHARS:
+            self.conflicts.append(row)
+            self._chars += size
+
+    def as_dict(self) -> dict:
+        rows = list(self.conflicts)
+        result = {"code": "composition_conflict", "message": str(self),
+                  "conflicts": rows, "conflicts_total": self.total,
+                  "conflicts_omitted": self.total - len(rows)}
+        # Count outer JSON escaping as well as previews. Leave room for the
+        # dispatcher envelope and its authoritative source hash.
+        while len(json.dumps(result, ensure_ascii=False)) > MAX_TRACE_CHARS - 256 and rows:
+            rows.pop()
+            result["conflicts_omitted"] = self.total - len(rows)
+        return result
 
 
 def _text(value: Any, name: str, maximum: int = 1024, *, empty: bool = False) -> str:
@@ -225,15 +282,22 @@ class ToolDispatcher:
             if not isinstance(args, dict) or any(not isinstance(key, str) for key in args):
                 raise ValueError("tool arguments must be an object with string keys")
             if set(args) - _KEYS[name]:
-                raise ValueError("unrecognized tool argument keys")
+                return {"ok": False, "error": {"code": "invalid_arguments",
+                        "message": "unrecognized tool argument keys; use only the advertised allowed keys",
+                        "allowed_keys": sorted(_KEYS[name]), "required_keys": sorted(_REQUIRED[name])}}
             if _REQUIRED[name] - set(args):
-                raise ValueError("required tool arguments are missing")
+                return {"ok": False, "error": {"code": "invalid_arguments",
+                        "message": "required tool arguments are missing",
+                        "allowed_keys": sorted(_KEYS[name]), "required_keys": sorted(_REQUIRED[name])}}
             if len(json.dumps(args, ensure_ascii=False).encode()) > MAX_ARGUMENT_BYTES:
                 raise ValueError("tool arguments exceed 256 KiB")
             if name != "status" and self.controller.deadline.remaining() <= 0:
                 raise TimeLimitError("deadline prevents additional tool work")
             result = getattr(self, "_" + name)(args)
             return {"ok": True, "result": result}
+        except _CompositionConflicts as error:
+            return {"ok": False, "error": {**error.as_dict(),
+                    "source_hash": self.controller.sources.candidate_hash}}
         except (TimeLimitError, PatchError, ValueError, TypeError, RecursionError,
                 KeyError, OSError, RuntimeError) as error:
             if isinstance(error, TimeLimitError):
@@ -407,9 +471,14 @@ class ToolDispatcher:
             return path
         raise ValueError("composition input is not a shipped scenario/fault file")
 
+    def _composition_ready(self) -> None:
+        deadline = self.controller.deadline
+        cancellation = getattr(deadline, "stop_event", None)
+        if deadline.remaining() <= 0 or cancellation is not None and cancellation.is_set():
+            raise TimeLimitError("deadline or cancellation prevents additional composition work")
+
     def _composition_document(self, path: Path, reference: str, reads: list[int]) -> tuple[dict, dict]:
-        if self.controller.deadline.remaining() <= 0:
-            raise TimeLimitError("deadline prevents additional composition reads")
+        self._composition_ready()
         reads[0] += 1
         if reads[0] > MAX_COMPOSITION_FILES:
             raise ValueError("composition exceeds its input file limit")
@@ -436,6 +505,7 @@ class ToolDispatcher:
 
     def _inline_composition_faults(self, document: dict, origin: Path, reads: list[int],
                                    inherited: list[dict], stack: tuple[Path, ...] = ()) -> dict:
+        self._composition_ready()
         document = deepcopy(document)
         faults = document.get("faults")
         if not isinstance(faults, str):
@@ -495,11 +565,17 @@ class ToolDispatcher:
 
     @classmethod
     def _merge_composition(cls, before: Any, after: Any, overrides: dict,
-                           path: tuple[str, ...] = ()) -> Any:
+                           path: tuple[str, ...] = (), *, conflicts: _CompositionConflicts | None = None,
+                           check=None) -> Any:
+        if check is not None:
+            check()
         if isinstance(before, dict) and isinstance(after, dict):
             merged = deepcopy(before)
             for key in sorted(after):
-                merged[key] = cls._merge_composition(merged[key], after[key], overrides, path + (key,)) \
+                if check is not None:
+                    check()
+                merged[key] = cls._merge_composition(merged[key], after[key], overrides, path + (key,),
+                                                      conflicts=conflicts, check=check) \
                     if key in merged else deepcopy(after[key])
             return merged
         same_scalar = type(before) is type(after) and before == after
@@ -517,6 +593,8 @@ class ToolDispatcher:
                 encoded = {json.dumps(item, sort_keys=True, allow_nan=False) for item in result}
                 identities = {cls._record_identity(item): item for item in result if cls._record_identity(item) is not None}
                 for item in after:
+                    if check is not None:
+                        check()
                     text = json.dumps(item, sort_keys=True, allow_nan=False)
                     if text in encoded:
                         continue
@@ -524,7 +602,10 @@ class ToolDispatcher:
                     if identity is not None and identity in identities:
                         if cls._composition_override(overrides, path):
                             return deepcopy(before)
-                        raise ValueError(f"conflicting records at {'.'.join(path)}; provide an explicit list override")
+                        if conflicts is None:
+                            raise ValueError(f"conflicting records at {'.'.join(path)}; provide an explicit list override")
+                        conflicts.add(path, before, after, whole_list=True)
+                        return deepcopy(before)
                     result.append(deepcopy(item))
                     encoded.add(text)
                     if identity is not None:
@@ -534,7 +615,10 @@ class ToolDispatcher:
                 return deepcopy(before)
         if cls._composition_override(overrides, path):
             return deepcopy(before)  # Apply the declared replacement after merging.
-        raise ValueError(f"conflicting probe setting at {'.'.join(path) or '<root>'}; provide a nested override")
+        if conflicts is None:
+            raise ValueError(f"conflicting probe setting at {'.'.join(path) or '<root>'}; provide a nested override")
+        conflicts.add(path, before, after)
+        return deepcopy(before)
 
     @classmethod
     def _apply_composition_overrides(cls, before: Any, overrides: Any, path: tuple[str, ...] = ()) -> Any:
@@ -548,6 +632,7 @@ class ToolDispatcher:
         return deepcopy(overrides)
 
     def _compose_probe(self, args: dict) -> dict:
+        self._composition_ready()
         name = _text(args["name"], "name", 64)
         if not _PROBE_NAME.fullmatch(name):
             raise ValueError("invalid probe name")
@@ -567,12 +652,14 @@ class ToolDispatcher:
         document = self._inline_composition_faults(document, path, reads, inherited)
         probe_metadata = []
         profile_metadata = []
+        conflicts = _CompositionConflicts()
         for reference in probes:
             path = self._composition_path(reference)
             addition, metadata = self._composition_document(path, reference, reads)
             addition = self._inline_composition_faults(addition, path, reads, inherited)
             addition.pop("name", None)
-            document = self._merge_composition(document, addition, overrides)
+            document = self._merge_composition(document, addition, overrides, conflicts=conflicts,
+                                               check=self._composition_ready)
             probe_metadata.append(metadata)
         for reference in profiles:
             path = self._composition_path(reference)
@@ -581,8 +668,11 @@ class ToolDispatcher:
             normalized = self._inline_composition_faults({"faults": content}, path, reads, inherited)
             if not isinstance(normalized["faults"], dict):
                 raise ValueError("fault profiles must contain mappings")
-            document = self._merge_composition(document, normalized, overrides)
+            document = self._merge_composition(document, normalized, overrides, conflicts=conflicts,
+                                               check=self._composition_ready)
             profile_metadata.append(metadata)
+        if conflicts.total:
+            raise conflicts
         document = self._apply_composition_overrides(document, overrides)
         document["name"] = name
         # Override fault references use write_probe's case-relative semantics.
@@ -622,8 +712,7 @@ class ToolDispatcher:
             composition["inherited_faults_omitted"] = len(inherited) - len(composition["inherited_faults"])
         if len(json.dumps(preview, ensure_ascii=False)) > MAX_TRACE_CHARS:
             raise ValueError("composition references exceed the response budget")
-        if self.controller.deadline.remaining() <= 0:
-            raise TimeLimitError("deadline prevents publishing a composed probe")
+        self._composition_ready()
         result = self._write_probe({"name": name, "scenario": document})
         from .validation import _scenario_hashes
         identity, _ = _scenario_hashes(self._root("candidate"), result["path"], None)
@@ -683,10 +772,33 @@ class ToolDispatcher:
                 "source_hash": self.controller.sources.candidate_hash,
                 "faults": scenario.get("faults"), "probe_count": count + 1}
 
+    def _repair_plan(self, value: Any) -> dict:
+        fields = {"reason", "target_invariants", "reproductions"}
+        if not isinstance(value, dict) or set(value) - fields or "reason" not in value:
+            raise ValueError("repair_plan needs reason and accepts only reason, target_invariants, reproductions")
+        reason = _text(value["reason"], "repair_plan reason", 6000)
+        invariants = _texts(value.get("target_invariants", []), "repair_plan target_invariants", 12, 100)
+        reproductions = value.get("reproductions", [])
+        if not isinstance(reproductions, list) or len(reproductions) > 12:
+            raise ValueError("repair_plan reproductions must be a list with at most twelve items")
+        clean = []
+        for reproduction in reproductions:
+            if (not isinstance(reproduction, dict) or set(reproduction) - {"scenario", "seed", "faults"}
+                    or not {"scenario", "seed"} <= set(reproduction)):
+                raise ValueError("each repair_plan reproduction needs scenario/seed and optional faults")
+            clean.append({"scenario": self._scenario(reproduction["scenario"]),
+                          "seed": _int(reproduction["seed"], "repair_plan seed", 2**63 - 1, 0),
+                          "faults": self._faults(reproduction.get("faults"))})
+        return {"reason": reason, "target_invariants": invariants, "reproductions": clean}
+
     def _apply_edits(self, args: dict) -> dict:
         base = _text(args["base_hash"], "base_hash", 64)
         if not _HASH.fullmatch(base):
             raise ValueError("base_hash must be a SHA-256 source hash")
+        plan = self._repair_plan(args["repair_plan"]) if "repair_plan" in args else None
+        remember = getattr(self.controller, "remember_repair_plan", None)
+        if plan is not None and not callable(remember):
+            raise ValueError("controller does not support repair_plan metadata")
         edits = args["edits"]
         if not isinstance(edits, list) or not 1 <= len(edits) <= 30:
             raise ValueError("edits must contain one to thirty edits")
@@ -703,7 +815,18 @@ class ToolDispatcher:
                 _text(edit["new"], "new", 131072, empty=True)
             elif fields != {"delete"} or edit["delete"] is not True:
                 raise ValueError("edit must use exactly content, old/new, or delete:true")
-        return self.controller.sources.apply_edits(base, edits)
+        deadline = self.controller.deadline
+        cancellation = getattr(deadline, "stop_event", None)
+        if deadline.remaining() <= 0 or cancellation is not None and cancellation.is_set():
+            raise TimeLimitError("deadline or cancellation prevents source edits")
+        result = self.controller.sources.apply_edits(base, edits)
+        if callable(remember):
+            captured = remember(base, result["source_hash"], plan)
+            if isinstance(captured, dict):
+                result["repair_plan"] = deepcopy(captured)
+            elif plan is not None:
+                result["repair_plan"] = deepcopy(plan)
+        return result
 
     def _reset_candidate(self, args: dict) -> dict:
         return {"source_hash": self.controller.sources.reset_candidate(), "reset": True}
