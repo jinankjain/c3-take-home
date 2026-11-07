@@ -206,6 +206,7 @@ class Controller:
         self.corpus = Corpus(config.corpus, config.metadata.get("codebase"), relevancy=self._document_relevance)
         self.runs: dict[str, ReplayResult] = {}
         self.hypotheses: dict[str, dict] = {}
+        self._repair_plans: dict[str, dict] = {}
         self.accepted: list[dict] = []
         self._cache: dict[tuple, ReplayResult] = {}
         self._lock = threading.RLock()
@@ -605,6 +606,7 @@ class Controller:
             "known_failures": failures, "candidate_results": candidate,
             "validation_history": history,
             "hypotheses": list(self.hypotheses.values()),
+            "staged_repair": (self.staged_plan() if current != best and current in self._repair_plans else None),
             "retained_experiments": retained, "retained_experiment_count": len(self.retained_experiments),
             "experiment_recommendations": recommendations,
             "control_coverage": deepcopy(getattr(self, "control_coverage", {})),
@@ -643,6 +645,67 @@ class Controller:
         self.hypotheses[name] = {**args, "source_hash": self.sources.candidate_hash}
         emit("hypothesis", **self.hypotheses[name])
         return self.hypotheses[name]
+
+    def remember_repair_plan(self, base_hash: str, candidate_hash: str, plan: dict | None) -> dict:
+        """Bind declared intent and its reasoning basis to a successfully staged edit."""
+        if candidate_hash != self.sources.candidate_hash:
+            raise ValueError("repair plan does not match the staged source")
+        if candidate_hash == base_hash:
+            return self.staged_plan()
+        hypotheses = [deepcopy(item) for item in self.hypotheses.values()
+                      if item.get("source_hash") == base_hash][-3:]
+        if plan is None:
+            latest = hypotheses[-1] if hypotheses else {}
+            reason = (str(latest.get("obligation", "")) + "\nMechanism: "
+                      + str(latest.get("mechanism", ""))).strip() if latest else "Validate the staged source repair."
+            proposal = {"reason": reason[:6000], "target_invariants": [], "reproductions": []}
+        else:
+            proposal = deepcopy(plan)
+        proposal.update(source_hash=candidate_hash, base_source_hash=base_hash,
+                        accepted_source_hash=self.sources.best_hash,
+                        hypothesis_ids=[item["id"] for item in hypotheses],
+                        intent_basis="declared_edit_plan" if plan is not None else "edit_base_hypotheses")
+        self._repair_plans.pop(candidate_hash, None)
+        self._repair_plans[candidate_hash] = {"plan": proposal, "hypotheses": hypotheses}
+        while len(self._repair_plans) > VALIDATION_HISTORY_LIMIT:
+            del self._repair_plans[next(iter(self._repair_plans))]
+        emit("staged_repair_plan", source_hash=candidate_hash, base_source_hash=base_hash,
+             hypothesis_ids=proposal["hypothesis_ids"], intent_basis=proposal["intent_basis"])
+        return deepcopy(proposal)
+
+    def staged_plan(self, fallback_reason: str = "Validate the current staged source repair.") -> dict:
+        current = self.sources.candidate_hash
+        stored = self._repair_plans.get(current)
+        if (stored is not None and current != self.sources.best_hash
+                and stored["plan"]["accepted_source_hash"] == self.sources.best_hash):
+            return deepcopy(stored["plan"])
+        return {"reason": fallback_reason, "target_invariants": [], "reproductions": [],
+                "source_hash": current, "accepted_source_hash": self.sources.best_hash,
+                "hypothesis_ids": [], "intent_basis": "uncaptured"}
+
+    def review_hypotheses(self, plan: dict) -> list[dict]:
+        """Expose current reasoning and the captured edit basis, with explicit roles."""
+        current = self.sources.candidate_hash
+        stored = self._repair_plans.get(current)
+        basis = stored["hypotheses"] if stored and stored["plan"]["accepted_source_hash"] == self.sources.best_hash else []
+        selected = {}
+        current_findings = [item for item in self.hypotheses.values() if item.get("source_hash") == current][-3:]
+        for item in [*basis, *current_findings]:
+            selected.pop(item["id"], None)
+            selected[item["id"]] = item
+        result = []
+        for item in list(selected.values())[-6:]:
+            result.append({"id": item["id"], "source_hash": item.get("source_hash"),
+                           "reviewed_source_hash": current,
+                           "relation_to_candidate": "candidate_reasoning" if item.get("source_hash") == current else "edit_basis",
+                           "obligation": str(item.get("obligation", ""))[:1000],
+                           "mechanism": str(item.get("mechanism", ""))[:2000],
+                           "evidence": [str(value)[:1000] for value in item.get("evidence", [])[:4]],
+                           "reasoning_truncated": (len(str(item.get("obligation", ""))) > 1000
+                                                   or len(str(item.get("mechanism", ""))) > 2000
+                                                   or len(item.get("evidence", [])) > 4
+                                                   or any(len(str(value)) > 1000 for value in item.get("evidence", [])))})
+        return result
 
     def _extra_seeds(self) -> list[int]:
         original = source_hash(self.sources.original / "src")
@@ -701,6 +764,10 @@ class Controller:
         accepted_hash = self.sources.best_hash
         if candidate_hash == accepted_hash:
             return {"accepted": False, "reason": "candidate contains no source change"}
+        # Explicit validation arguments take precedence; source identity remains
+        # controller-owned, and automatic callers retain the edit's actual intent.
+        plan = {**self.staged_plan(), **deepcopy(plan), "source_hash": candidate_hash,
+                "accepted_source_hash": accepted_hash}
         self._validating = True
         self._validation_progress = {
             "source_hash": candidate_hash, "accepted_source_hash": accepted_hash,

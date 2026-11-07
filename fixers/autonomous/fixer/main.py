@@ -151,6 +151,18 @@ def _ledger_probe_pair(value, *, chars: int = 400, current=None, best=None) -> d
     return output
 
 
+def _ledger_staged_plan(value, *, chars: int = 800) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    return {"source_hash": _ledger_scalar(value.get("source_hash")),
+            "base_source_hash": _ledger_scalar(value.get("base_source_hash")),
+            "accepted_source_hash": _ledger_scalar(value.get("accepted_source_hash")),
+            "reason": _ledger_text(value.get("reason", ""), chars),
+            "target_invariants": _ledger_strings(value.get("target_invariants"), count=12, chars=100),
+            "hypothesis_ids": _ledger_strings(value.get("hypothesis_ids"), count=3, chars=64),
+            "intent_basis": _ledger_scalar(value.get("intent_basis"))}
+
+
 def _status_for_prompt(controller: Controller) -> dict:
     status = controller.status()
     status["probe_intervention"] = getattr(controller, "_last_probe_intervention", None)
@@ -176,6 +188,7 @@ def _minimal_prompt_status(status: dict) -> str:
                 "missing_evidence": _ledger_strings(review.get("missing_evidence"), count=3, chars=200),
             }
     compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
+    compact["staged_repair"] = _ledger_staged_plan(status.get("staged_repair"), chars=400)
     compact["probe_intervention"] = _ledger_probe_pair(
         status.get("probe_intervention"), chars=200,
         current=status.get("source_hash"), best=status.get("accepted_source_hash"))
@@ -216,6 +229,7 @@ def prompt_status(controller: Controller) -> str:
         compact["experiment_metrics"] = {key: _ledger_scalar(value) for key, value in
                                          list(status.get("experiment_metrics", {}).items())[:4]}
         compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
+        compact["staged_repair"] = _ledger_staged_plan(status.get("staged_repair"), chars=detail_chars)
         compact["probe_intervention"] = _ledger_probe_pair(
             status.get("probe_intervention"), chars=detail_chars, current=current, best=best)
         compact["hypotheses"] = [{
@@ -430,6 +444,13 @@ def _can_validate_with_feedback(controller: Controller) -> bool:
             and controller.deadline.remaining() >= max(controller.final_reserve, installation) + MIN_FEEDBACK_SECONDS)
 
 
+def _automatic_validation_plan(controller: Controller, fallback_reason: str) -> dict:
+    supplier = getattr(controller, "staged_plan", None)
+    if callable(supplier):
+        return supplier(fallback_reason)
+    return {"reason": fallback_reason, "target_invariants": [], "reproductions": []}
+
+
 def _validate_stalled_candidate(controller: Controller, validated_hashes: set[str]) -> dict:
     candidate = controller.sources.candidate_hash
     # Mark before entering expensive gates. An interrupted attempt is bounded,
@@ -437,8 +458,8 @@ def _validate_stalled_candidate(controller: Controller, validated_hashes: set[st
     validated_hashes.add(candidate)
     emit("progress_intervention", kind="validate_candidate", source_hash=candidate)
     try:
-        result = controller.validate({"reason": "validate unchanged staged repair and identify remaining local evidence gaps",
-                                      "target_invariants": [], "reproductions": []})
+        result = controller.validate(_automatic_validation_plan(
+            controller, "Validate the staged repair and identify remaining local evidence gaps."))
     except (TimeLimitError, ModelError, ValueError, OSError) as error:
         result = {"accepted": False, "reason": str(error)[:2000]}
     emit("progress_validation", source_hash=candidate, accepted=result.get("accepted", False),
@@ -992,7 +1013,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                      reason="source version already validated")
             else:
                 try:
-                    validation = controller.validate({"reason": "finalize proposed repair", "target_invariants": []})
+                    validation = controller.validate(_automatic_validation_plan(controller, "Finalize the proposed repair."))
                     validated_hashes.add(validating_hash)
                 except (ValueError, OSError, TimeLimitError) as error:
                     validation = {"accepted": False, "error": str(error)}
@@ -1041,8 +1062,7 @@ def validate_pending_candidate(controller: Controller) -> dict | None:
     validated_hashes.add(candidate)
     emit("final_candidate_validation_started", source_hash=candidate)
     try:
-        result = controller.validate({"reason": "validate final staged repair",
-                                      "target_invariants": [], "reproductions": []})
+        result = controller.validate(_automatic_validation_plan(controller, "Validate the final staged repair."))
     except (TimeLimitError, ModelError, ValueError, OSError) as error:
         result = {"accepted": False, "reason": str(error)[:2000]}
     emit("final_candidate_validation", accepted=result.get("accepted", False),
