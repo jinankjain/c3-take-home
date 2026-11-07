@@ -653,6 +653,148 @@ def test_stalled_candidate_gets_actionable_review_before_more_model_work(control
     assert controller.deadline.remaining(controller.final_reserve) > 30
 
 
+def test_warm_cache_replays_and_interleaved_retrieval_trigger_early_candidate_validation(controller, capsys):
+    from controller_support import repair_ownership
+
+    original = controller.sources.best_hash
+    repair_ownership(controller)
+    candidate = controller.sources.candidate_hash
+    warm = controller.replay("candidate", "public", controller.config.seeds[0])
+    assert not warm.ok  # A checked invariant failure is still a cached observation.
+    gap = "Measure the remaining recovery obligation before promotion."
+
+    class CachedModel(Reviewer):
+        turns = 0
+        review_calls = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            assert_native_pairs(messages)
+            if is_review(tools):
+                self.review_calls += 1
+                return review_reply({"approve": False, "issues": [], "missing_evidence": [gap]}, tools)
+            self.turns += 1
+            if self.turns == 7:
+                assert self.review_calls == 1 and gap in json.dumps(messages)
+                assert candidate in json.dumps(messages) and "tool_choice" not in kwargs
+                raise ModelError("script complete", code="script_complete")
+            name = "replay" if self.turns % 2 else "status"
+            args = {"source": "candidate", "scenario": "public" if self.turns != 3 else "scenarios/public.yaml",
+                    "seed": controller.config.seeds[0]} if name == "replay" else {}
+            return ModelReply([{"type": "tool_use", "id": "cached-" + str(self.turns), "name": name, "input": args}],
+                              "tool_use", {}, 0, 3)
+
+    model = CachedModel()
+    repair_loop(controller, model)
+    assert model.turns == 7 and model.review_calls == 1
+    assert not controller.accepted and controller.sources.best_hash == source_hash(controller.sources.live / "src") == original
+    events = log_events(capsys)
+    replay_tools = [row for row in events if row["event"] == "tool" and row["name"] == "replay"]
+    assert len(replay_tools) == 3 and all(row["fresh_replay"] is False for row in replay_tools)
+    assert any(row["event"] == "progress_intervention" and row.get("kind") == "validate_candidate" for row in events)
+
+
+def test_warm_cache_replays_on_rejected_source_trigger_one_probe_without_review_retry(controller, capsys):
+    candidate, accepted = rejected_probe_candidate(controller)
+    rejection = controller.status()["last_validation"]
+    warm = controller.replay("candidate", "public", controller.config.seeds[0])
+
+    class CachedProbeModel(Reviewer):
+        turns = 0
+        forced = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            assert not is_review(tools), "cached retrieval retried a completed rejection"
+            assert_native_pairs(messages)
+            self.turns += 1
+            if kwargs.get("tool_choice"):
+                self.forced += 1
+                assert self.turns == 7 and kwargs["tool_choice"] == {"type": "tool", "name": "compose_probe"}
+                assert kwargs["max_tokens"] == 2048 and [tool["name"] for tool in tools] == ["compose_probe"]
+                return probe_reply()
+            if self.forced:
+                assert controller._last_probe_intervention["complete"]
+                return ModelReply([{"type": "text", "text": "The unchanged rejected source needs more evidence."}],
+                                  "end_turn", {}, 0, 3)
+            name = "status" if self.turns % 3 == 0 else "replay"
+            args = {"source": "candidate", "scenario": "scenarios/public.yaml" if self.turns % 2 else "public",
+                    "seed": controller.config.seeds[0]} if name == "replay" else {}
+            return ModelReply([{"type": "tool_use", "id": "cached-" + str(self.turns), "name": name, "input": args}],
+                              "tool_use", {}, 0, 3)
+
+    model = CachedProbeModel()
+    repair_loop(controller, model)
+    pair = controller._last_probe_intervention
+    assert model.forced == 1 and pair["complete"]
+    assert pair["before"]["source_hash"] == accepted and pair["after"]["source_hash"] == candidate
+    assert pair["before"]["run_id"] != pair["after"]["run_id"] and pair["after"]["run_id"] != warm.run_id
+    assert controller.status()["last_validation"] == rejection and validate_pending_candidate(controller) is None
+    assert not controller.accepted and source_hash(controller.sources.live / "src") == accepted
+    cached_tools = [row for row in log_events(capsys) if row["event"] == "tool" and row["name"] == "replay"]
+    assert len(cached_tools) == 4 and all(row["fresh_replay"] is False for row in cached_tools)
+
+
+@pytest.mark.parametrize("fresh_kind", ["new_seed", "explicit_repeat"])
+def test_fresh_replays_reset_stalls_by_registered_run_identity_not_cache_flags(controller, monkeypatch, capsys, fresh_kind):
+    from fixer.tools import ToolDispatcher
+
+    current = accepted_probe_source(controller)
+    warm = controller.replay("accepted", "public", controller.config.seeds[0])
+    actual_runs = []
+    real_replay = controller.replay
+    original_execute = ToolDispatcher.execute
+
+    def replay(source, scenario, seed, faults=None, **kwargs):
+        ordinary = "reserve" not in kwargs
+        if ordinary and model.turns == 6 and fresh_kind == "explicit_repeat":
+            # Deliberately rerun identical inputs rather than retrieving their
+            # cache entry. Controller records the actual fresh simulator job.
+            controller._cache.clear()
+        run = real_replay(source, scenario, seed, faults, **kwargs)
+        if ordinary:
+            actual_runs.append(run.run_id)
+        return run
+
+    def execute(self, name, args):
+        result = original_execute(self, name, args)
+        if name == "replay":
+            # Misleading response flags cannot override the controller registry.
+            result["result"]["cached"] = model.turns == 6
+        return result
+
+    monkeypatch.setattr(controller, "replay", replay)
+    monkeypatch.setattr(ToolDispatcher, "execute", execute)
+    monkeypatch.setattr(controller, "validate", lambda *a, **k: pytest.fail("single-source diagnostic validated a repair"))
+
+    class FreshModel(Reviewer):
+        turns = 0
+        forced = 0
+
+        def messages(self, system, messages, tools, **kwargs):
+            assert not is_review(tools)
+            assert_native_pairs(messages)
+            self.turns += 1
+            if kwargs.get("tool_choice"):
+                self.forced += 1
+                assert self.turns == 13 and kwargs["tool_choice"] == {"type": "tool", "name": "compose_probe"}
+                assert kwargs["max_tokens"] == 2048
+                return probe_reply()
+            if self.forced:
+                assert controller._last_probe_intervention["complete"]
+                raise ModelError("script complete", code="script_complete")
+            seed = 99 if fresh_kind == "new_seed" and self.turns >= 6 else controller.config.seeds[0]
+            return ModelReply([{"type": "tool_use", "id": "replay-" + str(self.turns), "name": "replay", "input": {
+                "source": "accepted", "scenario": "public" if self.turns % 2 else "scenarios/public.yaml", "seed": seed}}],
+                "tool_use", {}, 0, 3)
+
+    model = FreshModel()
+    repair_loop(controller, model)
+    assert model.forced == 1 and actual_runs[:5] == [warm.run_id] * 5
+    assert actual_runs[5] != warm.run_id and actual_runs[6:] == [actual_runs[5]] * 6
+    assert controller.sources.candidate_hash == controller.sources.best_hash == current and not controller.accepted
+    tools = [row for row in log_events(capsys) if row["event"] == "tool" and row["name"] == "replay"]
+    assert [row["fresh_replay"] for row in tools] == [False] * 5 + [True] + [False] * 6
+
+
 @pytest.mark.parametrize("failure", ["budget", "incomplete"])
 def test_stalled_hypothesis_keeps_forced_decision_after_recoverable_request_failure(controller, capsys, failure):
     class RecoveringModel(Reviewer):

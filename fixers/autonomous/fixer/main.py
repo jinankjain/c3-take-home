@@ -946,20 +946,29 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             continue
         if calls:
             results = []
+            information_only = True
             for call in calls:
                 if controller.deadline.remaining() <= 0 or controller.deadline.stop_event.is_set():
                     stop("cancelled" if controller.deadline.stop_event.is_set() else "deadline")
                     return
                 validating_hash = controller.sources.candidate_hash if call["name"] == "validate" else None
+                recorded_runs = set(controller.runs) if call["name"] == "replay" else None
                 result = dispatcher.execute(call["name"], call["input"])
+                # Re-reading a cached trace is retrieval, even when the model
+                # requests another alias for the same input. A real replay or
+                # explicit repeat registers a fresh controller-owned run ID.
+                fresh_replay = recorded_runs is not None and any(run_id not in recorded_runs for run_id in controller.runs)
+                information_only &= (call["name"] in INFORMATION_TOOLS
+                                     or call["name"] == "replay" and not fresh_replay)
                 if validating_hash is not None and result.get("ok"):
                     validated_hashes.add(validating_hash)
                 emit("tool", name=call["name"], ok=result.get("ok"),
-                     source_hash=controller.sources.candidate_hash)
+                     source_hash=controller.sources.candidate_hash,
+                     **({"fresh_replay": fresh_replay} if recorded_runs is not None else {}))
                 results.append({"type": "tool_result", "tool_use_id": call["id"],
                                 "content": tool_text(result), "is_error": not result.get("ok", False)})
             after_source = controller.sources.candidate_hash
-            if all(call["name"] in INFORMATION_TOOLS for call in calls) and after_source == observed_source:
+            if information_only and after_source == observed_source:
                 information_turns += 1
             else:
                 information_turns = 0
