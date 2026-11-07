@@ -42,6 +42,12 @@ class _Symbol:
     calls: set[str] = field(default_factory=set)
     fields: set[str] = field(default_factory=set)
     messages: set[str] = field(default_factory=set)
+    owner: tuple[str, int] | None = None
+    returned_attrs: set[str] = field(default_factory=set)
+    writes: set[str] = field(default_factory=set)
+    dynamic_writes: set[str] = field(default_factory=set)
+    state_limited: bool = False
+    state_rebound: bool = False
 
     @property
     def key(self) -> tuple[str, int]:
@@ -159,6 +165,46 @@ def _module_name(path: str) -> str:
     return ".".join(parts)
 
 
+def _instance_target(node, instance: str | None) -> set[str]:
+    """Resolve direct instance targets, including indexed containers."""
+    if instance is None:
+        return set()
+    found, todo = set(), [node]
+    while todo:
+        current = todo.pop()
+        if isinstance(current, ast.Attribute) and isinstance(current.value, ast.Name) and current.value.id == instance:
+            found.add(current.attr)
+        elif isinstance(current, (ast.Subscript, ast.Starred)):
+            todo.append(current.value)
+        elif isinstance(current, (ast.Tuple, ast.List)):
+            todo.extend(current.elts)
+    return found
+
+
+def _returned_attrs(expressions, bindings, instance: str | None, stopped) -> tuple[set[str], bool]:
+    """Follow bounded local aliases of returned data; never execute a call."""
+    if instance is None:
+        return set(), False
+    found, seen = set(), set()
+    todo = list(expressions)
+    while todo and not stopped():
+        node = todo.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if len(seen) > MAX_FILE_BYTES:
+            return found, True
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == instance:
+            found.add(node.attr)
+        elif isinstance(node, ast.Name):
+            todo.extend(bindings.get(node.id, ()))
+        # A function's return value is not evidence that its call arguments are
+        # returned fields. Direct helpers already have their own call edges.
+        if not isinstance(node, (ast.Call, ast.Await, ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            todo.extend(ast.iter_child_nodes(node))
+    return found, bool(todo)
+
+
 def _analyse(path: str, text: str, stopped) -> tuple[list[_Symbol], set[str], bool]:
     try:
         tree = ast.parse(text, filename=path)
@@ -175,22 +221,31 @@ def _analyse(path: str, text: str, stopped) -> tuple[list[_Symbol], set[str], bo
             if module:
                 imports.add(module)
     symbols = []
-    pending = [(node, "") for node in reversed(tree.body)]
+    pending = [(node, "", None) for node in reversed(tree.body)]
     while pending and len(symbols) < MAX_SYMBOLS and not stopped():
-        node, prefix = pending.pop()
+        node, prefix, owner = pending.pop()
         if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             name = prefix + node.name
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
-                symbol = _Symbol(path, name, start, node.end_lineno or node.lineno)
+                symbol = _Symbol(path, name, start, node.end_lineno or node.lineno, owner=owner)
+                positional = [*node.args.posonlyargs, *node.args.args]
+                static = any((isinstance(decorator, ast.Name) and decorator.id == "staticmethod")
+                             or (isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod")
+                             for decorator in node.decorator_list)
+                instance = positional[0].arg if owner is not None and positional and not static else None
+                returns, bindings = [], {}
                 todo = [node]
                 visited = 0
                 while todo and not stopped():
                     child = todo.pop()
-                    if child is not node and isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if child is not node and isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        if instance is not None and getattr(child, "name", None) == instance:
+                            symbol.state_rebound = True
                         continue
                     visited += 1
                     if visited > MAX_FILE_BYTES:
+                        symbol.state_limited = True
                         break
                     if isinstance(child, ast.Call):
                         if isinstance(child.func, ast.Name):
@@ -200,6 +255,44 @@ def _analyse(path: str, text: str, stopped) -> tuple[list[_Symbol], set[str], bo
                         symbol.messages.update(arg.value for arg in child.args
                                                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
                                                and _IDENTIFIER.fullmatch(arg.value) and len(arg.value) <= 80)
+                    if instance is not None and isinstance(child, ast.Return) and child.value is not None:
+                        if len(returns) < MAX_LINKS:
+                            returns.append(child.value)
+                        else:
+                            symbol.state_limited = True
+                    if instance is not None:
+                        if isinstance(child, ast.Name) and child.id == instance and isinstance(child.ctx, (ast.Store, ast.Del)):
+                            symbol.state_rebound = True
+                        elif isinstance(child, ast.ExceptHandler) and child.name == instance:
+                            symbol.state_rebound = True
+                        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+                            symbol.state_rebound |= any((alias.asname or alias.name.split(".")[0]) == instance
+                                                        for alias in child.names)
+                        elif isinstance(child, (ast.MatchAs, ast.MatchStar)) and child.name == instance:
+                            symbol.state_rebound = True
+                        elif isinstance(child, ast.MatchMapping) and child.rest == instance:
+                            symbol.state_rebound = True
+                    if instance is not None and isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                        if child.value is not None:
+                            written = set().union(*(_instance_target(target, instance) for target in targets))
+                            symbol.writes.update(written)
+                            if isinstance(child, ast.AugAssign) or not isinstance(child.value, ast.Constant):
+                                symbol.dynamic_writes.update(written)
+                            for target in targets:
+                                if isinstance(target, ast.Name):
+                                    if target.id not in bindings and len(bindings) >= MAX_LINKS:
+                                        symbol.state_limited = True
+                                        continue
+                                    values = bindings.setdefault(target.id, [])
+                                    if len(values) < MAX_LINKS:
+                                        values.append(child.value)
+                                    else:
+                                        symbol.state_limited = True
+                    elif instance is not None and isinstance(child, ast.Delete):
+                        written = set().union(*(_instance_target(target, instance) for target in child.targets))
+                        symbol.writes.update(written)
+                        symbol.dynamic_writes.update(written)
                     if isinstance(child, ast.Attribute):
                         symbol.fields.add(child.attr)
                     elif isinstance(child, ast.Constant) and isinstance(child.value, str):
@@ -209,10 +302,18 @@ def _analyse(path: str, text: str, stopped) -> tuple[list[_Symbol], set[str], bo
                         symbol.fields.add(child.id)
                     todo.extend(ast.iter_child_nodes(child))
                 symbol.calls.difference_update(IGNORED_CALLS)
+                symbol.returned_attrs, limited = _returned_attrs(
+                    returns, bindings, None if symbol.state_rebound else instance, stopped)
+                symbol.state_limited |= limited
+                if symbol.state_rebound:
+                    symbol.writes.clear()
+                    symbol.dynamic_writes.clear()
                 symbols.append(symbol)
-            pending.extend((child, name + ".") for child in reversed(node.body))
+            # Nested functions are not instance methods of the lexical class.
+            child_owner = (name, node.lineno) if isinstance(node, ast.ClassDef) else None
+            pending.extend((child, name + ".", child_owner) for child in reversed(node.body))
         elif isinstance(node, (ast.If, ast.Try, ast.With)):
-            pending.extend((child, prefix) for child in reversed(list(ast.iter_child_nodes(node))))
+            pending.extend((child, prefix, owner) for child in reversed(list(ast.iter_child_nodes(node))))
     return symbols, imports, not stopped() and not pending
 
 
@@ -309,6 +410,11 @@ class _Reader:
             self.stats["parsed_files"] += int(parsed)
             if not parsed and not self.stopped():
                 self.omit("source_parse_incomplete", path)
+            for symbol in symbols:
+                if symbol.state_limited and not self.stopped():
+                    self.omit("state_analysis_limit", path, symbol.name)
+                if symbol.state_rebound and not self.stopped():
+                    self.omit("state_instance_rebound", path, symbol.name)
             doc = _Document(path, text, hashlib.sha256(data).hexdigest(), text.splitlines(keepends=True), symbols, imports, parsed)
             self.documents[path] = doc
             return doc
@@ -515,7 +621,7 @@ def review_source_context(candidate_root: Path, diff_text: str, hypotheses: list
                         role = "helper" if callee else "caller"
                         reason = "direct call to/from " + target.name
                     elif depth == 0 and messages and shared:
-                        score, role, reason = 12 + min(3, len(shared)), "protocol_peer", "shared message and changed protocol field"
+                        score, role, reason = 24 + min(3, len(shared)), "protocol_peer", "shared message and changed protocol field"
                     elif depth == 0 and shared and not same_file:
                         score, role, reason = 3 + min(3, len(shared)), "field_consumer", "unchanged consumer of changed protocol field"
                     else:
@@ -531,6 +637,52 @@ def review_source_context(candidate_root: Path, diff_text: str, hypotheses: list
                     frontier.append(peer)
                 if len(frontier) >= MAX_LINKS:
                     break
+
+        # A reply body alone does not establish the meaning of a returned
+        # attribute. Its same-class writers distinguish sent, acknowledged and
+        # applied state. Index only real assignment targets, not matching names
+        # in another class or unrelated read-only consumers.
+        writers = {}
+        for symbol in symbols:
+            if symbol.owner is not None and symbol.writes:
+                writers.setdefault((symbol.path, symbol.owner), []).append(symbol)
+        producers = [(key, value) for key, value in candidates.items()
+                     if value[2] is not None and value[2].owner is not None and value[2].returned_attrs]
+        producers.sort(key=lambda item: (item[1][0], item[1][1], item[0]))
+        reader.stats.update(state_producers=min(len(producers), MAX_LINKS),
+                            state_producers_omitted=max(0, len(producers) - MAX_LINKS),
+                            state_fields_omitted=0, state_edges=0, state_edges_omitted=0)
+        if len(producers) > MAX_LINKS:
+            reader.omit("state_producer_limit")
+        for _, entry in producers[:MAX_LINKS]:
+            if stopped():
+                break
+            producer = entry[2]
+            fields = set(sorted(producer.returned_attrs)[:MAX_LINKS])
+            if len(producer.returned_attrs) > len(fields):
+                reader.stats["state_fields_omitted"] += len(producer.returned_attrs) - len(fields)
+                reader.omit("state_field_limit", producer.path, producer.name)
+            related = []
+            for writer in writers.get((producer.path, producer.owner), ()):
+                if stopped():
+                    break
+                shared = writer.writes.intersection(fields)
+                if not shared or writer.key == producer.key:
+                    continue
+                initializer = writer.short_name in {"__init__", "__new__"}
+                base = 16 if initializer else 22 if writer.dynamic_writes.intersection(fields) else 20
+                related.append((-base - min(3, len(shared)), writer.start, writer, initializer))
+            for negative_score, _, writer, initializer in sorted(related, key=lambda item: item[:2]):
+                if stopped():
+                    break
+                if reader.stats["state_edges"] >= MAX_LINKS:
+                    reader.stats["state_edges_omitted"] += 1
+                    reader.omit("state_edge_limit", writer.path, writer.name)
+                    continue
+                reader.stats["state_edges"] += 1
+                offer(writer, 2, -negative_score,
+                      "protocol_state_initializer" if initializer else "protocol_state_writer",
+                      "writes instance state returned by " + producer.name)
 
         output = {"blocks": [], "stats": dict(reader.stats), "omissions": [], "omitted_count": 0,
                   "truncated": False, "cancelled": bool(stopped())}

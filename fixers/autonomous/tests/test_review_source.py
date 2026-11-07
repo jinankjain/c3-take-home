@@ -111,6 +111,170 @@ def test_protocol_receiver_precedes_broad_helpers_when_packet_space_is_limited(t
     assert packet["truncated"] and len(json.dumps(packet, ensure_ascii=False)) <= 4600
 
 
+def test_reply_producer_and_runtime_writer_precede_competing_helpers(tmp_path):
+    sender = '''from .rpc import exposed
+class Monitor:
+    def __init__(self):
+        self.reported = 0
+
+    @exposed("reserve")
+    def offer(self):
+        return {"cut": self.reported}
+
+    async def pulse(self):
+        sent = self.reported
+        while True:
+            sent += 1
+            await self.send(sent)
+            self.reported = sent
+'''
+    helpers = "\n".join(f"    def helper_{i}(self):\n" + "        # unrelated helper context\n" * 8
+                         + "        return 1\n" for i in range(16))
+    before = ('class Broker:\n    def accept(self):\n        reply = self.rpc("reserve", {})\n'
+              + "".join(f"        self.helper_{i}()\n" for i in range(16))
+              + '        self.cut = min(self.seen, reply["cut"])\n\n' + helpers)
+    after = before.replace('min(self.seen, reply["cut"])', 'reply["cut"]')
+    write(tmp_path, "src/monitor.py", sender)
+    write(tmp_path, "src/broker.py", after)
+    packet = review_source_context(tmp_path, diff("src/broker.py", before, after), [], max_chars=6500)
+    producer = find(packet, "monitor.py", "Monitor.offer")
+    writer = find(packet, "monitor.py", "Monitor.pulse")
+    initial = find(packet, "monitor.py", "Monitor.__init__")
+    assert producer["complete"] and producer["role"] == "protocol_peer"
+    assert writer["complete"] and writer["role"] == "protocol_state_writer"
+    assert "await self.send(sent)\n            self.reported = sent" in writer["text"]
+    assert initial["complete"] and initial["role"] == "protocol_state_initializer"
+    assert packet["blocks"].index(producer) < packet["blocks"].index(writer) < packet["blocks"].index(initial)
+    assert find(packet, "broker.py", "Broker.accept")["complete"]
+    assert packet["truncated"] and len(json.dumps(packet, ensure_ascii=False)) <= 6500
+
+
+def test_state_writers_are_isolated_to_the_producers_exact_class(tmp_path):
+    before = '''class Monitor:
+    def offer(self):
+        return {"cut": 0}
+
+    def advance(self, receipt):
+        self.value = receipt
+
+class Other:
+    def advance(self, receipt):
+        self.value = receipt
+'''
+    after = before.replace('return {"cut": 0}', 'return {"cut": self.value}')
+    write(tmp_path, "src/state.py", after)
+    packet = review_source_context(tmp_path, diff("src/state.py", before, after), [])
+    assert find(packet, "state.py", "Monitor.advance")["role"] == "protocol_state_writer"
+    assert not any(row["symbol"] == "Other.advance" for row in packet["blocks"])
+
+
+def test_nested_static_and_rebound_instances_cannot_impersonate_class_writers(tmp_path):
+    before = '''import builtins
+class Monitor:
+    def offer(self):
+        return {"cut": 0}
+
+    def advance(self, receipt):
+        self.value = receipt
+
+    def nested(self):
+        def mutate(other):
+            other.value = 3
+        return mutate
+
+    @builtins.staticmethod
+    def static_mutate(other):
+        other.value = 3
+
+    def rebound(self, other):
+        self = other
+        self.value = 3
+'''
+    after = before.replace('return {"cut": 0}', 'return {"cut": self.value}')
+    write(tmp_path, "src/state.py", after)
+    packet = review_source_context(tmp_path, diff("src/state.py", before, after), [])
+    writers = [row["symbol"] for row in packet["blocks"] if row["role"] == "protocol_state_writer"]
+    assert writers == ["Monitor.advance"]
+    assert any(row["reason"] == "state_instance_rebound" for row in packet["omissions"])
+
+
+def test_returned_alias_and_indexed_state_use_the_declared_instance_parameter(tmp_path):
+    before = '''class Offsets:
+    def __init__(node):
+        node.cursors = {}
+
+    def reply(node, stream):
+        result = {"cut": 0}
+        return result
+
+    def advance(node, stream, received):
+        node.cursors[stream] = received
+'''
+    after = before.replace('{"cut": 0}', '{"cut": node.cursors[stream]}')
+    write(tmp_path, "src/offsets.py", after)
+    packet = review_source_context(tmp_path, diff("src/offsets.py", before, after), [])
+    assert find(packet, "offsets.py", "Offsets.reply")["complete"]
+    writer = find(packet, "offsets.py", "Offsets.advance")
+    assert writer["complete"] and writer["role"] == "protocol_state_writer"
+    assert 'node.cursors[stream] = received' in writer["text"]
+    assert find(packet, "offsets.py", "Offsets.__init__")["role"] == "protocol_state_initializer"
+
+
+def test_state_edge_limit_retains_runtime_writer_before_initializer(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_source, "MAX_LINKS", 1)
+    before = '''class Monitor:
+    def __init__(self):
+        self.value = 0
+
+    def offer(self):
+        return {"cut": 0}
+
+    def advance(self, receipt):
+        self.value = receipt
+'''
+    after = before.replace('return {"cut": 0}', 'return {"cut": self.value}')
+    write(tmp_path, "src/state.py", after)
+    packet = review_source_context(tmp_path, diff("src/state.py", before, after), [])
+    assert find(packet, "state.py", "Monitor.advance")["complete"]
+    assert packet["stats"]["state_edges"] == 1 and packet["stats"]["state_edges_omitted"] == 1
+    assert not any(row["symbol"] == "Monitor.__init__" for row in packet["blocks"])
+    assert any(row["reason"] == "state_edge_limit" for row in packet["omissions"])
+
+
+def test_cancellation_during_returned_state_analysis_stops_context_selection(tmp_path, monkeypatch):
+    before = "class Monitor:\n    def offer(self):\n        return 0\n"
+    after = before.replace("return 0", 'return {"cut": self.value}')
+    write(tmp_path, "src/state.py", after)
+    stop = threading.Event()
+    original = review_source._returned_attrs
+
+    def cancel(*args, **kwargs):
+        stop.set()
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(review_source, "_returned_attrs", cancel)
+    packet = review_source_context(tmp_path, diff("src/state.py", before, after), [], stop_event=stop)
+    assert packet["cancelled"] and not packet["blocks"]
+    assert packet["stats"]["files_read"] == 1
+
+
+def test_cyclic_return_aliases_and_staticmethod_targets_do_not_create_writers(tmp_path):
+    before = '''class Monitor:
+    def offer(self):
+        return 0
+
+    @staticmethod
+    def mutate(other):
+        other.value = 3
+'''
+    after = before.replace("return 0", "left = right\n        right = left\n        return {\"cut\": left}")
+    write(tmp_path, "src/state.py", after)
+    packet = review_source_context(tmp_path, diff("src/state.py", before, after), [])
+    assert find(packet, "state.py", "Monitor.offer")["complete"]
+    assert packet["stats"]["state_edges"] == 0
+    assert not any(row["role"] == "protocol_state_writer" for row in packet["blocks"])
+
+
 def test_oversized_hunk_numbers_are_declined_without_integer_parse_failure(tmp_path):
     write(tmp_path, "src/agent.py", "def send():\n    return 1\n")
     patch = "--- a/src/agent.py\n+++ b/src/agent.py\n@@ -1 +" + "9" * 5000 + " @@\n-x\n+y\n"
@@ -344,3 +508,56 @@ def test_case_python_is_parsed_without_execution(tmp_path):
 def test_invalid_output_budget_is_rejected(tmp_path, max_chars):
     with pytest.raises(ValueError, match="max_chars"):
         review_source_context(tmp_path, "", [], max_chars=max_chars)
+
+
+@pytest.mark.parametrize("delegated", [
+    "def delegate(node, peers):\n        for node in peers:\n            node.value = 7\n",
+    "async def delegate(node, peers):\n        async for node in peers:\n            node.value = 7\n",
+    "def delegate(node, peer):\n        if (node := peer):\n            node.value = 7\n",
+    "def delegate(node, resource):\n        with resource as node:\n            node.value = 7\n",
+    "async def delegate(node, resource):\n        async with resource as node:\n            node.value = 7\n",
+    "def delegate(node, error):\n        try:\n            raise error\n        except ValueError as node:\n            node.value = 7\n",
+    "def delegate(node, peer):\n        node, other = peer, None\n        node.value = 7\n",
+    "def delegate(node):\n        del node\n        node.value = 7\n",
+    "def delegate(node):\n        import peer as node\n        node.value = 7\n",
+    "def delegate(node):\n        from peers import node\n        node.value = 7\n",
+    "def delegate(node):\n        def node():\n            pass\n        node.value = 7\n",
+    "def delegate(node, peer):\n        match peer:\n            case node:\n                node.value = 7\n",
+])
+def test_parameter_binding_targets_cannot_label_peer_writes_as_instance_state(tmp_path, delegated):
+    before = '''class Monitor:
+    def offer(node):
+        return {"cut": 0}
+
+    def advance(node):
+        shadow = lambda node: (node := None)
+        node.value += 1
+
+    ''' + delegated
+    after = before.replace('return {"cut": 0}', 'return {"cut": node.value}')
+    write(tmp_path, "src/monitor.py", after)
+    result = review_source_context(tmp_path, diff("src/monitor.py", before, after), [])
+    writer = find(result, "monitor.py", "Monitor.advance")
+    assert writer["role"] == "protocol_state_writer" and writer["complete"]
+    assert not any(block["symbol"] == "Monitor.delegate" for block in result["blocks"])
+    assert any(row.get("symbol") == "Monitor.delegate" and row["reason"] == "state_instance_rebound"
+               for row in result["omissions"])
+
+
+def test_per_function_ast_limit_reports_incomplete_state_discovery(tmp_path, monkeypatch):
+    monkeypatch.setattr(review_source, "MAX_FILE_BYTES", 4096)
+    before = '''class Monitor:
+    def offer(node):
+        return {"cut": 0}
+
+    def advance(node, receipt):
+        node.value = receipt
+        ''' + "a;" * 1500 + "\n"
+    after = before.replace('return {"cut": 0}', 'return {"cut": node.value}')
+    assert len(after.encode()) < 4096
+    write(tmp_path, "src/monitor.py", after)
+    result = review_source_context(tmp_path, diff("src/monitor.py", before, after), [])
+    assert find(result, "monitor.py", "Monitor.offer")["complete"]
+    assert result["truncated"]
+    assert any(row.get("symbol") == "Monitor.advance" and row["reason"] == "state_analysis_limit"
+               for row in result["omissions"])
