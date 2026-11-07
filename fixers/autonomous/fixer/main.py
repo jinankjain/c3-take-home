@@ -208,6 +208,39 @@ def _review_reference_metadata(review: dict, *, chars: int = 800, count: int = 3
     return metadata
 
 
+def _ledger_regression_diagnostic(value, *, current, best, chars: int = 800,
+                                  count: int = 3) -> dict | None:
+    if (not isinstance(value, dict) or value.get("scope") != "diagnostic_only"
+            or value.get("source_hash") != current
+            or value.get("accepted_source_hash") != best
+            or value.get("status") not in {"completed", "skipped", "failed"}):
+        return None
+    result = {"scope": "diagnostic_only", "authorizes_promotion": False,
+              "source_hash": _ledger_scalar(current),
+              "accepted_source_hash": _ledger_scalar(best),
+              "status": value["status"],
+              "reason": _ledger_text(value.get("reason", ""), chars)}
+    primary = value.get("primary_pair")
+    if (isinstance(primary, dict) and primary.get("before_source_hash") == best
+            and primary.get("after_source_hash") == current):
+        result["primary_pair"] = {key: _ledger_scalar(primary.get(key)) for key in
+                                  ("pair_id", "before_run_id", "after_run_id",
+                                   "before_source_hash", "after_source_hash",
+                                   "before_status", "after_status")}
+        inputs = primary.get("input")
+        if isinstance(inputs, dict):
+            result["primary_pair"]["input"] = {key: _ledger_scalar(inputs.get(key))
+                                                for key in ("scenario_hash", "faults_hash", "seed")}
+    review = value.get("review")
+    if isinstance(review, dict):
+        # This is advice for a matrix rejection. An approval field must never
+        # turn the separate feedback into an acceptance verdict in the ledger.
+        result["review"] = {key: _ledger_strings(review.get(key), count=count, chars=chars)
+                            for key in ("issues", "missing_evidence", "limitations")}
+        result["review"].update(_review_reference_metadata(review, chars=chars, count=count))
+    return result
+
+
 def _minimal_prompt_status(status: dict) -> str:
     compact = {key: _ledger_scalar(status.get(key)) for key in
                ("source_hash", "accepted_source_hash", "unaccepted_changes", "seconds_remaining",
@@ -227,6 +260,11 @@ def _minimal_prompt_status(status: dict) -> str:
                 "missing_evidence": _ledger_strings(review.get("missing_evidence"), count=3, chars=200),
             }
             compact["last_validation"]["review"].update(_review_reference_metadata(review, chars=200, count=1))
+        diagnostic = _ledger_regression_diagnostic(
+            validation.get("regression_diagnostic"), current=status.get("source_hash"),
+            best=status.get("accepted_source_hash"), chars=200, count=1)
+        if diagnostic is not None:
+            compact["last_validation"]["regression_diagnostic"] = diagnostic
     compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
     compact["staged_repair"] = _ledger_staged_plan(status.get("staged_repair"), chars=400)
     compact["probe_construction"] = _ledger_probe_construction(status, chars=1800)
@@ -344,6 +382,11 @@ def prompt_status(controller: Controller) -> str:
                 latest["review"].update(_review_reference_metadata(review, chars=detail_chars))
                 if "skipped" in review:
                     latest["review"]["skipped"] = _ledger_text(review["skipped"], detail_chars)
+            diagnostic = _ledger_regression_diagnostic(
+                validation.get("regression_diagnostic"), current=current, best=best,
+                chars=detail_chars)
+            if diagnostic is not None:
+                latest["regression_diagnostic"] = diagnostic
             compact["last_validation"] = latest
         if pending_diff:
             compact["pending_diff"] = _ledger_text(pending_diff, detail_chars * 5)

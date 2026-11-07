@@ -42,6 +42,9 @@ Audit the protocol boundaries that matter to the incident:
   acknowledged, and applied progress. Audit unchanged consumers when changing
   a watermark, epoch, or report; inspect how a new generation rebuilds ownership
   and recovery state carried from the previous generation.
+  For a returned protocol field, inspect its initialization and runtime writers.
+  Establish whether the value updates at send, acknowledgment, or application
+  from those conditions and message order before relying on its field name.
 - What clock is compared? Local clock offsets and relative TTLs do not become
   globally comparable timestamps. Use simulator-provided time facilities.
 - Can acknowledgments, offers, completion reports, or releases be lost,
@@ -79,6 +82,11 @@ requires revising the hypothesis and repair. If validation requests only missing
 local evidence, preserve the staged candidate, gather that actionable evidence,
 and revalidate the same source version. Change it only when evidence identifies a
 defect; do not make speculative edits solely to obtain another source hash.
+
+When last_validation.regression_diagnostic is completed, inspect its cited source
+and matched control witnesses, then confirm or revise the source-bound hypothesis.
+The regression rejection remains in force until validation passes. A skipped or
+failed diagnostic supplies no additional correctness evidence.
 
 Before using a new probe as repair evidence, demonstrate its intended failure on
 the previous accepted source, then run the same probe and seeds on the candidate.
@@ -135,6 +143,12 @@ external outcomes, fencing/epochs, clock domains, lost acknowledgments, duplicat
 messages, deterministic replay, and bounded cleanup. Applicable contract versions
 matter; do not assume the newest file is authoritative for the service's API.
 
+When diagnostic_only is true, the controller has already rejected a matched
+passing-control regression or a lost verified obligation. Diagnose the causal
+source transition and the smallest supported correction or local measurement.
+Submit approve=false with the concrete blocker or necessary missing evidence.
+This diagnostic cannot authorize promotion.
+
 Judge the stated obligation. A separate remaining bug does not disqualify a
 correct partial repair; explain dependencies when the repaired transition cannot
 yet be verified. Invariant counts alone neither establish nor refute improvement.
@@ -159,6 +173,10 @@ attributing a downstream failure to an earlier operation.
 The current source context includes unchanged consumers and helpers when available.
 Respect its complete/truncated labels; request a specific local source read when a
 missing body is necessary to decide a concrete correctness question.
+For a returned protocol field, inspect the method that initializes or updates its
+stored value. Establish sent, acknowledged, or applied meaning from those writes.
+An omitted relevant writer is a specific local evidence gap; identify its path
+and the unresolved transition before relying on the value.
 Require preservation of public interfaces, applicable contracts, previously
 passing controls, and previously verified obligations. A new regression or an
 unrepaired dependency that invalidates the claimed mechanism is blocking. A review
