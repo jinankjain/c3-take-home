@@ -540,6 +540,8 @@ def test_repair_loop_continues_past_32_turns_with_resources(controller, capsys):
         def messages(self, system, messages, tools, **kwargs):
             self.turns += 1
             assert_native_pairs(messages)
+            if kwargs.get("tool_choice") == {"type": "tool", "name": "compose_probe"}:
+                return probe_reply()
             if self.turns > 34:
                 return ModelReply([{"type": "text", "text": "No further supported diagnosis."}], "end_turn", {}, 0, 3)
             return ModelReply([{"type": "tool_use", "id": str(self.turns), "name": "status", "input": {}}],
@@ -577,6 +579,8 @@ def test_stalled_reads_force_one_durable_hypothesis_that_survives_compaction(con
         def messages(self, system, messages, tools, **kwargs):
             self.turns += 1
             assert_native_pairs(messages)
+            if kwargs.get("tool_choice") == {"type": "tool", "name": "compose_probe"}:
+                return probe_reply()
             if kwargs.get("tool_choice"):
                 self.forced += 1
                 assert kwargs["tool_choice"] == {"type": "tool", "name": "record_hypothesis"}
@@ -735,6 +739,147 @@ def probe_reply(number=1, **arguments):
     args.update(arguments)
     return ModelReply([{"type": "tool_use", "id": "probe-" + str(number),
                         "name": "compose_probe", "input": args}], "tool_use", {}, 0, 3)
+
+
+def accepted_probe_source(controller, partial=False):
+    from fixer.runtime import Deadline
+    from controller_support import repair_ownership
+
+    controller.deadline = controller.runner.deadline = Deadline(time.time() + 360)
+    if partial:
+        repair_ownership(controller)
+        assert controller.validate(plan())["accepted"]
+    controller.record_hypothesis({"id": "current-diagnosis", "obligation": "Recover the accepted operation identity.",
+                                  "mechanism": "The current suspicion still needs a discriminating runtime experiment.",
+                                  "evidence": ["src/service.py:1"], "status": "open"})
+    assert controller.sources.candidate_hash == controller.sources.best_hash
+    return controller.sources.best_hash
+
+
+@pytest.mark.parametrize("partial", [False, True], ids=["original", "postpartial"])
+def test_accepted_stall_gets_one_native_single_observation_and_updates_durable_finding(
+        controller, monkeypatch, capsys, partial):
+    from fixer.main import MAX_CONTEXT_CHARS
+    from fixer.model import ModelClient
+    from fixer.tools import ToolDispatcher
+
+    current = accepted_probe_source(controller, partial)
+    before_accepted = list(controller.accepted)
+    before_validation = controller.status()["last_validation"]
+    if not partial:
+        controller.hypotheses.clear()  # First preserve a finding; diagnose only after six more reads.
+    initial_fact = "Current incident facts; accepted source=" + current + "\n"
+    controller.initial_context = initial_fact + "i" * 90000
+    original_execute = ToolDispatcher.execute
+
+    def execute(self, name, args):
+        if name == "read_file":
+            return {"ok": True, "result": {"source_hash": current, "content": "current source excerpt " + "r" * 31000}}
+        return original_execute(self, name, args)
+
+    monkeypatch.setattr(ToolDispatcher, "execute", execute)
+    client = ModelClient(controller.runner, controller.deadline, 3, env={
+        "ANTHROPIC_API_KEY": "offline-test-key", "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+        "FIXER_THINKING_TOKENS": "4096"})
+    wire = []
+
+    def http(method, url, body=None, **kwargs):
+        if method == "GET":
+            return {"status": 404, "body": {}}
+        wire.append(body)
+        assert body["tool_choice"] == {"type": "tool", "name": "compose_probe"}
+        assert [tool["name"] for tool in body["tools"]] == ["compose_probe"]
+        assert body["max_tokens"] == 2048 and "thinking" not in body
+        context = json.dumps(body["messages"], ensure_ascii=False)
+        assert "# Single-source diagnostic" in context and "falsified claims" in context
+        assert current in context and "Current findings" in context
+        checks = ["RECOVERY"] if partial else ["OWNERSHIP"]
+        return {"status": 200, "complete": True, "body": {"type": "message", "role": "assistant",
+                "content": probe_reply(overrides={"checks": checks}).content, "stop_reason": "tool_use",
+                "usage": {"input_tokens": 100, "output_tokens": 50}}}
+
+    monkeypatch.setattr(client, "_http", http)
+    measured = []
+    real_replay = controller.replay
+
+    def replay(source, scenario, seed, **kwargs):
+        measured.append((source, scenario, seed, kwargs["reserve"]))
+        return real_replay(source, scenario, seed, **kwargs)
+
+    monkeypatch.setattr(controller, "replay", replay)
+    monkeypatch.setattr(controller, "validate", lambda *a, **k: pytest.fail("single diagnostic automatically validated source"))
+
+    class SingleModel(Reviewer):
+        turns = 0
+        remembered = 0
+        forced = 0
+        updated = False
+        final_context = ""
+        updated_mechanism = "The diagnostic falsifies the earlier identity guess; the measured obligation still fails."
+
+        def messages(self, system, messages, tools, **kwargs):
+            assert not is_review(tools)
+            assert_native_pairs(messages)
+            self.turns += 1
+            choice = kwargs.get("tool_choice")
+            if choice == {"type": "tool", "name": "compose_probe"}:
+                self.forced += 1
+                assert self.turns == (7 if partial else 14)
+                assert kwargs["reserve"] >= controller.final_reserve + 30 + 5
+                return client.messages(system, messages, tools, **kwargs)
+            if choice == {"type": "tool", "name": "record_hypothesis"}:
+                self.remembered += 1
+                assert self.turns == 7 and not partial
+                arguments = {"id": "current-diagnosis", "obligation": "Preserve one accepted operation identity.",
+                             "mechanism": "The current identity guess is uncertain until a discriminating experiment.",
+                             "evidence": ["src/service.py:1"], "status": "open"}
+                block = {"type": "tool_use", "id": "remember", "name": "record_hypothesis", "input": arguments}
+            elif self.forced and not self.updated:
+                observed = controller._last_probe_intervention
+                assert observed["complete"] and observed["repair_comparison"] is False
+                context = json.dumps(messages, ensure_ascii=False)
+                assert observed["observation"]["run_id"] in context
+                self.updated = True
+                block = {"type": "tool_use", "id": "update-finding", "name": "record_hypothesis", "input": {
+                    "id": "current-diagnosis", "obligation": "Accepted operations preserve durable identity.",
+                    "mechanism": self.updated_mechanism, "evidence": [
+                        observed["observation"]["run_id"] + " source_hash=" + current], "status": "open"}}
+            elif self.turns >= 25:
+                self.final_context = json.dumps(messages, ensure_ascii=False)
+                raise ModelError("script complete", code="script_complete")
+            else:
+                block = {"type": "tool_use", "id": "read-" + str(self.turns), "name": "read_file",
+                         "input": {"path": "src/service.py"}}
+            return ModelReply([block], "tool_use", {}, 0, 3)
+
+    model = SingleModel()
+    repair_loop(controller, model)
+    assert model.forced == len(wire) == 1 and model.remembered == (0 if partial else 1)
+    assert [row[0] for row in measured] == ["accepted"]
+    assert measured[0][1:] == ("probe:diagnostic_1", controller.config.seeds[0], controller.final_reserve + 30)
+    observation = controller._last_probe_intervention
+    assert observation["complete"] and observation["mode"] == "single_source" and observation["repair_comparison"] is False
+    assert observation["source_hash"] == observation["accepted_source_hash"] == current
+    assert "before" not in observation and "after" not in observation
+    assert observation["observation"]["source_hash"] == current and observation["observation"]["status"] == "invariant_failure"
+    assert observation["observation"]["scenario_hash"] == controller._experiment_input(
+        {"scenario": observation["probe"], "faults": None}, "accepted")[0]
+    assert controller.sources.candidate_hash == controller.sources.best_hash == source_hash(controller.sources.live / "src") == current
+    assert controller.accepted == before_accepted and controller.status()["last_validation"] == before_validation
+    assert controller.status()["known_failures"] and validate_pending_candidate(controller) is None
+    assert controller.hypotheses["current-diagnosis"]["mechanism"] == model.updated_mechanism
+    assert model.updated_mechanism in model.final_context
+    assert observation["observation"]["run_id"] in model.final_context and current in model.final_context
+    assert observation["configuration_hash"] in model.final_context
+    final_text = "\n".join(message["content"] if isinstance(message["content"], str) else
+                           "\n".join(block.get("text", block.get("content", "")) for block in message["content"])
+                           for message in json.loads(model.final_context))
+    assert '"repair_comparison": false' in final_text and initial_fact in final_text
+    assert len(model.final_context) <= MAX_CONTEXT_CHARS
+    events = log_events(capsys)
+    assert any(row["event"] == "context_compacted" for row in events)
+    stopped = [row for row in events if row["event"] == "repair_loop_stopped"][-1]
+    assert stopped["completed_single_diagnostics"] == 1 and stopped["completed_probe_pairs"] == 0
 
 
 class DiagnosticModel(Reviewer):
@@ -939,6 +1084,84 @@ def test_full_novelty_inventory_leaves_separate_fresh_probe_verification_budget(
     result = dispatcher.execute("compose_probe", probe_reply().content[0]["input"])
     pair = _measure_probe(controller, Reviewer(), dispatcher, result, fingerprints, reader, candidate, accepted, 5)
     assert pair["complete"] and reader.reads[0] == 32 and reader.fresh_reads[0] == 2
+
+
+@pytest.mark.parametrize("interruption", ["cancel_before", "budget_before", "deadline_before", "identity_before",
+                                           "cancel_after", "source_after", "bytes_after", "seed_after",
+                                           "identity_after", "incomplete_after"])
+def test_single_observation_binds_inputs_source_and_resources_without_a_second_replay(controller, monkeypatch, interruption):
+    from dataclasses import replace
+    from fixer.main import _measure_single_probe, _probe_fingerprints
+    from fixer.tools import ToolDispatcher
+
+    current = accepted_probe_source(controller)
+    dispatcher = ToolDispatcher(controller)
+    fingerprints, reader = _probe_fingerprints(dispatcher)
+    result = dispatcher.execute("compose_probe", probe_reply().content[0]["input"])
+    model = Reviewer()
+    if interruption == "identity_before":
+        result["result"]["scenario_hash"] = None
+    elif interruption == "cancel_before":
+        controller.deadline.stop_event.set()
+    elif interruption == "budget_before":
+        model.remaining_budget = 0
+    elif interruption == "deadline_before":
+        monkeypatch.setattr(controller.deadline, "_end", time.monotonic() + controller.final_reserve + 34)
+    replays = []
+    real_replay = controller.replay
+
+    def replay(source, *args, **kwargs):
+        replays.append(source)
+        run = real_replay(source, *args, **kwargs)
+        if interruption == "cancel_after":
+            controller.deadline.stop_event.set()
+        elif interruption == "source_after":
+            controller.sources.apply_edits(current, [{"path": "src/service.py", "old": "NORMAL_BROKEN = False",
+                                                     "new": "NORMAL_BROKEN = False  # external revision"}])
+        elif interruption == "bytes_after":
+            path = dispatcher._composition_path(result["result"]["probe"])
+            path.write_text(path.read_text() + "# changed after execution\n")
+        elif interruption == "seed_after":
+            return replace(run, seed=run.seed + 1)
+        elif interruption == "identity_after":
+            return replace(run, scenario_hash="0" * 64)
+        elif interruption == "incomplete_after":
+            return replace(run, status="timeout")
+        return run
+
+    monkeypatch.setattr(controller, "replay", replay)
+    observation = _measure_single_probe(controller, model, dispatcher, result, fingerprints, reader, current, 5)
+    assert not observation["complete"] and observation["mode"] == "single_source"
+    assert observation["repair_comparison"] is False and "before" not in observation and "after" not in observation
+    assert replays == ([] if interruption.endswith("before") else ["accepted"])
+    assert controller.sources.best_hash == source_hash(controller.sources.live / "src") == current and not controller.accepted
+    if replays:
+        compact = json.loads(prompt_status(controller))["probe_intervention"]
+        assert compact["observation"]["run_id"] == observation["observation"]["run_id"]
+        assert compact["observation"]["snapshot"] == "accepted" and not compact["complete"]
+
+
+@pytest.mark.parametrize("failure", ["budget", "incomplete", "unexpected"])
+def test_single_diagnostic_native_retries_are_bounded_and_cannot_validate_or_edit(controller, failure):
+    current = accepted_probe_source(controller)
+
+    def force(model, *_args):
+        if model.forced == 1:
+            if failure == "budget":
+                raise BudgetExhausted(.1, .09)
+            if failure == "incomplete":
+                raise ModelError("response interrupted", code="incomplete_response")
+            return ModelReply([{"type": "tool_use", "id": "unexpected-edit", "name": "apply_edits", "input": final_patch(controller)},
+                               {"type": "tool_use", "id": "unexpected-validate", "name": "validate", "input": plan()}],
+                              "tool_use", {}, 0, 3)
+        return probe_reply(model.forced)
+
+    model = DiagnosticModel(force)
+    repair_loop(controller, model)
+    assert model.forced == controller._probe_intervention_attempts[current] == 2
+    assert controller._last_probe_intervention["complete"] and controller._last_probe_intervention["mode"] == "single_source"
+    assert controller.sources.candidate_hash == controller.sources.best_hash == current and not controller.accepted
+    assert validate_pending_candidate(controller) is None
 
 
 def test_compaction_leaves_room_for_another_tool_turn_without_reset(controller):

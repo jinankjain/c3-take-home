@@ -134,15 +134,16 @@ def _ledger_probe_pair(value, *, chars: int = 400, current=None, best=None) -> d
     if not isinstance(value, dict):
         return None
     output = {key: _ledger_scalar(value[key]) for key in
-              ("scope", "source_hash", "accepted_source_hash", "probe", "probe_hash",
-               "configuration_hash", "seed", "complete", "estimated_pair_seconds", "stage") if key in value}
+              ("scope", "mode", "repair_comparison", "source_hash", "accepted_source_hash", "probe", "probe_hash",
+               "configuration_hash", "seed", "complete", "estimated_pair_seconds", "estimated_replay_seconds", "stage")
+              if key in value}
     # Source labels and run identities survive even the minimal ledger fallback.
     if "probe" in value:
         output["probe"] = _ledger_text(value["probe"], 70)
     output["reason"] = _ledger_text(value.get("reason", ""), chars)
     output["current_source_matches"] = value.get("source_hash") == current
     output["accepted_source_matches"] = value.get("accepted_source_hash") == best
-    for key, snapshot in (("before", "accepted"), ("after", "candidate")):
+    for key, snapshot in (("before", "accepted"), ("after", "candidate"), ("observation", "accepted")):
         row = value.get(key)
         if isinstance(row, dict):
             output[key] = _ledger_replays([row], snapshot=snapshot, limit=1, chars=max(80, chars))[0]
@@ -633,6 +634,54 @@ def _measure_probe(controller: Controller, model, dispatcher: ToolDispatcher, re
     return pair
 
 
+def _measure_single_probe(controller: Controller, model, dispatcher: ToolDispatcher, result: dict,
+                          fingerprints: set[str], reader: _ProbeConfigReader, source: str, slot: float) -> dict:
+    observation = {"scope": "local_single_source_diagnostic", "mode": "single_source", "repair_comparison": False,
+                   "source_hash": source, "accepted_source_hash": source, "complete": False,
+                   "stage": "composition", "estimated_replay_seconds": round(slot, 3)}
+    controller._last_probe_intervention = observation
+    try:
+        if not result.get("ok"):
+            raise ValueError(result.get("error", {}).get("message", "probe composition failed"))
+        probe = result["result"]
+        seed = controller.config.seeds[0]
+        observation.update(probe=probe["probe"], probe_hash=probe["probe_hash"], seed=seed)
+        path = dispatcher._composition_path(probe["probe"])
+        observation["configuration_hash"] = _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"])
+        if observation["configuration_hash"] in fingerprints:
+            raise ValueError("probe repeats an existing effective configuration; name/expect changes add no runtime evidence")
+
+        def ready(seconds: float) -> None:
+            if controller.sources.candidate_hash != source or controller.sources.best_hash != source:
+                raise ValueError("source snapshots changed before completing the single-source diagnostic")
+            if not _probe_resources(controller, model, seconds):
+                raise TimeLimitError("budget, cancellation or deadline prevents completing the single-source diagnostic with feedback")
+
+        # Simulator's input identity also binds effective faults. The raw
+        # advertised bytes are checked separately before and after replay;
+        # compose_probe has already inlined faults and computed this identity.
+        expected_input = (probe.get("scenario_hash"), None)
+        if not isinstance(expected_input[0], str) or len(expected_input[0]) != 64:
+            raise ValueError("single-source diagnostic input identity is unavailable")
+        ready(slot)
+        observation["stage"] = "accepted_replay"
+        run = controller.replay("accepted", probe["probe"], seed,
+                                reserve=controller.final_reserve + MIN_FEEDBACK_SECONDS)
+        observation["observation"] = _probe_run_row(run)
+        ready(0)
+        if (run.source_hash != source or (run.scenario_hash, run.faults_hash) != expected_input or run.seed != seed
+                or _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"]) != observation["configuration_hash"]):
+            raise ValueError("single-source diagnostic source or effective input provenance does not match")
+        if run.status not in {"pass", "invariant_failure", "unresolved"}:
+            raise ValueError("single-source diagnostic replay is incomplete or invalid")
+        observation.update(complete=True, stage="measured",
+                           reason="new local observation of accepted source only; no repair comparison, validation or promotion")
+    except (TimeLimitError, ModelError, ValueError, OSError, RuntimeError, KeyError, TypeError) as error:
+        observation["reason"] = _ledger_text(str(error), 800)
+    emit("progress_single_probe", **_ledger_probe_pair(observation, current=source, best=source))
+    return observation
+
+
 def repair_loop(controller: Controller, model: ModelClient) -> None:
     controller.model = model
     validated_hashes = getattr(controller, "_validated_candidate_hashes", set())
@@ -652,9 +701,11 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
     forced_hypothesis_attempts = 0
     probe_attempts = getattr(controller, "_probe_intervention_attempts", {})
     completed_probes = getattr(controller, "_completed_probe_interventions", set())
+    completed_single_probes = getattr(controller, "_completed_single_probe_interventions", set())
     declined_probes = getattr(controller, "_declined_probe_interventions", set())
     controller._probe_intervention_attempts = probe_attempts
     controller._completed_probe_interventions = completed_probes
+    controller._completed_single_probe_interventions = completed_single_probes
     controller._declined_probe_interventions = declined_probes
     proactive_validations = 0
     remaining_budget = getattr(model, "remaining_budget", None)
@@ -667,7 +718,8 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
              model_spent_usd=_ledger_scalar(getattr(model, "spent_usd", 0)),
              forced_hypotheses=len(forced_hypothesis_hashes), forced_hypothesis_attempts=forced_hypothesis_attempts,
              proactive_validations=proactive_validations, forced_probe_attempts=sum(probe_attempts.values()),
-             completed_probe_pairs=len(completed_probes))
+             completed_probe_pairs=len(completed_probes - completed_single_probes),
+             completed_single_diagnostics=len(completed_single_probes))
 
     def accepted_progress() -> None:
         nonlocal completion_attempts, observed_accepted
@@ -692,6 +744,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             information_turns = 0
         forced_hypothesis = False
         forced_probe = False
+        single_probe = False
         forced_instruction = ""
         probe_fingerprints: set[str] = set()
         probe_reads = [0]
@@ -739,6 +792,40 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                     declined_probes.add(current)
                     _append_feedback(messages, "# Diagnostic intervention declined\n" + _ledger_text(str(error), 800))
                     emit("progress_probe_declined", source_hash=current, reason=_ledger_text(str(error), 800))
+            elif (current == probe_best and _durable_hypothesis(status, current)
+                    and any(isinstance(row, dict) and row.get("source_hash") == current
+                            for row in status.get("known_failures", []))
+                    and current not in completed_probes and current not in declined_probes
+                    and probe_attempts.get(current, 0) < MAX_PROBE_ATTEMPTS_PER_HASH
+                    and sum(probe_attempts.values()) < MAX_PROBE_ATTEMPTS
+                    and _probe_resources(controller, model, probe_slot)):
+                try:
+                    probe_fingerprints, probe_reads = _probe_fingerprints(dispatcher)
+                    forced_probe = single_probe = True
+                    findings = [{"id": _ledger_text(item.get("id", ""), 64),
+                                 "mechanism": _ledger_text(item.get("mechanism", ""), 600),
+                                 "evidence": _ledger_strings(item.get("evidence"), count=3, chars=250)}
+                                for item in _prompt_hypotheses(status, current)[:3]]
+                    forced_instruction = (
+                        "# Produce a measured diagnostic probe\n# Single-source diagnostic\n"
+                        "Accepted source " + current + " still has known failures and six additional information-only turns "
+                        "after a durable finding. Use exactly one compose_probe call with the documented schema to "
+                        "discriminate a supported hypothesis or falsify an uncertain claim. Choose a shipped/scratch base "
+                        "and one small runtime configuration change. Name/expect/embedded-seed changes alone add no evidence. "
+                        "The controller will replay this immutable input ONCE on accepted source only. "
+                        "This is a single-source observation with no repair comparison, validation or promotion. "
+                        "After receiving the observation, update the diagnostic hypothesis with run_id/source_hash evidence, "
+                        "including falsified claims and remaining uncertainty. Preserve verified repair facts.\n"
+                        "Current findings: " + json.dumps(findings, ensure_ascii=False)
+                        + "\nAccepted-source failures: " + json.dumps(_ledger_replays(
+                            status.get("known_failures"), snapshot="accepted", limit=3, chars=250, source_hash=current),
+                            ensure_ascii=False))
+                    emit("progress_intervention", kind="compose_probe", mode="single_source", source_hash=current,
+                         information_turns=information_turns, estimated_replay_seconds=round(probe_slot, 3))
+                except (TimeLimitError, ValueError, OSError, RuntimeError) as error:
+                    declined_probes.add(current)
+                    _append_feedback(messages, "# Single-source diagnostic intervention declined\n" + _ledger_text(str(error), 800))
+                    emit("progress_probe_declined", mode="single_source", source_hash=current, reason=_ledger_text(str(error), 800))
             elif (not _durable_hypothesis(status, current)
                     and current not in forced_hypothesis_hashes
                     and forced_hypothesis_attempts < MAX_HYPOTHESIS_INTERVENTIONS
@@ -761,7 +848,8 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                 stop("cancelled")
                 return
             kwargs = {"max_tokens": 2048 if forced_hypothesis or forced_probe else output_tokens,
-                      "reserve": controller.final_reserve + (MIN_FEEDBACK_SECONDS + probe_slot * 2 if forced_probe else 0)}
+                      "reserve": controller.final_reserve + (
+                          MIN_FEEDBACK_SECONDS + probe_slot * (1 if single_probe else 2) if forced_probe else 0)}
             definitions = TOOL_DEFINITIONS
             if forced_hypothesis:
                 kwargs["tool_choice"] = {"type": "tool", "name": "record_hypothesis"}
@@ -770,7 +858,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                 # cannot exceed the case intervention budget.
                 forced_hypothesis_attempts += 1
             elif forced_probe:
-                if not _probe_resources(controller, model, probe_slot * 2):
+                if not _probe_resources(controller, model, probe_slot * (1 if single_probe else 2)):
                     stop("diagnostic_resources")
                     return
                 kwargs["tool_choice"] = {"type": "tool", "name": "compose_probe"}
@@ -821,7 +909,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             if valid:
                 call = calls[0]
                 if (controller.sources.candidate_hash != current or controller.sources.best_hash != probe_best
-                        or not _probe_resources(controller, model, probe_slot * 2)):
+                        or not _probe_resources(controller, model, probe_slot * (1 if single_probe else 2))):
                     result = {"ok": False, "error": {"code": "diagnostic_resources",
                               "message": "source, budget, cancellation or deadline prevents composing a diagnostic"}}
                 else:
@@ -829,12 +917,20 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                 emit("tool", name="compose_probe", ok=result.get("ok"), source_hash=current)
                 results.append({"type": "tool_result", "tool_use_id": call["id"],
                                 "content": tool_text(result), "is_error": not result.get("ok", False)})
-                pair = _measure_probe(controller, model, dispatcher, result, probe_fingerprints,
-                                      probe_reads, current, probe_best, probe_slot)
+                pair = (_measure_single_probe(controller, model, dispatcher, result, probe_fingerprints,
+                                              probe_reads, current, probe_slot) if single_probe else
+                        _measure_probe(controller, model, dispatcher, result, probe_fingerprints,
+                                       probe_reads, current, probe_best, probe_slot))
                 if pair["complete"]:
                     completed_probes.add(current)
-                feedback = "# Measured local diagnostic pair\n" + tool_text(_ledger_probe_pair(
+                    if single_probe:
+                        completed_single_probes.add(current)
+                feedback = ("# Measured local single-source observation\n" if single_probe else
+                            "# Measured local diagnostic pair\n") + tool_text(_ledger_probe_pair(
                     pair, current=controller.sources.candidate_hash, best=controller.sources.best_hash))
+                if single_probe:
+                    feedback += ("\nUpdate the current diagnostic hypothesis with this run/source evidence and any falsified claims. "
+                                 "This observation does not compare repair versions or authorize source promotion.")
                 information_turns = 0 if pair["complete"] else INFORMATION_TURN_LIMIT
             else:
                 error = {"ok": False, "error": {"code": "unexpected_diagnostic_call",
