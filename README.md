@@ -90,7 +90,7 @@ python3 proxy/server.py &
 ./grade.sh --fixer fixers/examples/minimal-llm --cases practice/A2
 
 # 5. Before you submit: build your fixer as an image and grade the image, exactly as we will
-docker build --platform linux/amd64 -t my-fixer fixers/examples/minimal-llm
+docker build --platform linux/amd64 --provenance=false -t my-fixer fixers/examples/minimal-llm
 ./grade.sh --fixer my-fixer --cases practice/A2
 ```
 
