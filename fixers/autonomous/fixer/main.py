@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
+import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import signal
 
 from .controller import Controller
@@ -23,6 +26,10 @@ MAX_LEDGER_CHARS = 64_000
 INFORMATION_TURN_LIMIT = 6
 MAX_HYPOTHESIS_INTERVENTIONS = 4
 MAX_PROACTIVE_VALIDATIONS = 4
+MAX_PROBE_ATTEMPTS = 4
+MAX_PROBE_ATTEMPTS_PER_HASH = 2
+MAX_PROBE_INVENTORY_ENTRIES = 512
+MAX_PROBE_COMBINATIONS = 64
 MIN_FEEDBACK_SECONDS = 30
 INFORMATION_TOOLS = frozenset({"status", "list_files", "read_file", "search", "trace_slice"})
 
@@ -116,6 +123,39 @@ def _ledger_recommendations(value) -> list[dict]:
     return output
 
 
+def _ledger_control_coverage(value) -> dict:
+    fields = ("budget_s", "elapsed_s", "planned", "executed", "retained", "failed",
+              "executed_omitted", "planned_omitted", "errors", "budget_exhausted",
+              "cancelled", "discovery_truncated")
+    return {key: _ledger_scalar(value[key]) for key in fields if key in value} if isinstance(value, dict) else {}
+
+
+def _ledger_probe_pair(value, *, chars: int = 400, current=None, best=None) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    output = {key: _ledger_scalar(value[key]) for key in
+              ("scope", "source_hash", "accepted_source_hash", "probe", "probe_hash",
+               "configuration_hash", "seed", "complete", "estimated_pair_seconds", "stage") if key in value}
+    # Source labels and run identities survive even the minimal ledger fallback.
+    if "probe" in value:
+        output["probe"] = _ledger_text(value["probe"], 70)
+    output["reason"] = _ledger_text(value.get("reason", ""), chars)
+    output["current_source_matches"] = value.get("source_hash") == current
+    output["accepted_source_matches"] = value.get("accepted_source_hash") == best
+    for key, snapshot in (("before", "accepted"), ("after", "candidate")):
+        row = value.get(key)
+        if isinstance(row, dict):
+            output[key] = _ledger_replays([row], snapshot=snapshot, limit=1, chars=max(80, chars))[0]
+            output[key]["violation_count"] = _ledger_scalar(row.get("violation_count"))
+    return output
+
+
+def _status_for_prompt(controller: Controller) -> dict:
+    status = controller.status()
+    status["probe_intervention"] = getattr(controller, "_last_probe_intervention", None)
+    return status
+
+
 def _minimal_prompt_status(status: dict) -> str:
     compact = {key: _ledger_scalar(status.get(key)) for key in
                ("source_hash", "accepted_source_hash", "unaccepted_changes", "seconds_remaining",
@@ -134,11 +174,15 @@ def _minimal_prompt_status(status: dict) -> str:
                 "issues": _ledger_strings(review.get("issues"), count=3, chars=200),
                 "missing_evidence": _ledger_strings(review.get("missing_evidence"), count=3, chars=200),
             }
+    compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
+    compact["probe_intervention"] = _ledger_probe_pair(
+        status.get("probe_intervention"), chars=200,
+        current=status.get("source_hash"), best=status.get("accepted_source_hash"))
     return json.dumps(compact, ensure_ascii=False)
 
 
 def prompt_status(controller: Controller) -> str:
-    status = controller.status()
+    status = _status_for_prompt(controller)
     if controller.deadline.stop_event.is_set() or controller.deadline.remaining() <= 0:
         return _minimal_prompt_status(status)
     current = status.get("source_hash")
@@ -170,6 +214,9 @@ def prompt_status(controller: Controller) -> str:
         compact["experiment_recommendations"] = _ledger_recommendations(status.get("experiment_recommendations"))
         compact["experiment_metrics"] = {key: _ledger_scalar(value) for key, value in
                                          list(status.get("experiment_metrics", {}).items())[:4]}
+        compact["control_coverage"] = _ledger_control_coverage(status.get("control_coverage"))
+        compact["probe_intervention"] = _ledger_probe_pair(
+            status.get("probe_intervention"), chars=detail_chars, current=current, best=best)
         compact["hypotheses"] = [{
             "id": _ledger_text(item.get("id", ""), 64),
             "status": _ledger_text(item.get("status", ""), 20),
@@ -334,7 +381,7 @@ def compact_messages(controller: Controller, messages: list[dict], *, force: boo
 
     # The normal ledger is bounded before outer serialization. Keep a final
     # source/verdict fallback for unusual escaped metadata or changed limits.
-    ledger = "# Current repair ledger\n" + _minimal_prompt_status(controller.status())
+    ledger = "# Current repair ledger\n" + _minimal_prompt_status(_status_for_prompt(controller))
     initial_limit = 0
     result, final_size = compose(initial_limit)
     if final_size > MAX_CONTEXT_CHARS:
@@ -390,6 +437,194 @@ def _validate_stalled_candidate(controller: Controller, validated_hashes: set[st
     return result
 
 
+def _completed_rejection(status: dict, source: str) -> dict | None:
+    latest = status.get("last_validation")
+    if (isinstance(latest, dict) and latest.get("source_hash") == source
+            and latest.get("complete") is True and latest.get("accepted") is False):
+        return latest
+    return None
+
+
+def _probe_slot_seconds(controller: Controller) -> float:
+    measured = [item.get("worst_seconds") for item in getattr(controller, "_experiment_timings", {}).values()
+                if isinstance(item, dict) and item.get("count", 0) > 0]
+    measured = [value for value in measured if isinstance(value, (int, float))
+                and not isinstance(value, bool) and math.isfinite(value) and value > 0]
+    if not measured:
+        return 60.0
+    # New compositions may cost more than the existing traces. The estimate
+    # controls reservations, while replay's absolute 60s limit still applies.
+    return min(60.0, max(5.0, max(max(measured), controller.replay_seconds) * 2 + 2))
+
+
+def _probe_resources(controller: Controller, model, seconds: float) -> bool:
+    balance = getattr(model, "remaining_budget", controller.config.budget_usd)
+    return (not controller.deadline.stop_event.is_set()
+            and isinstance(balance, (int, float)) and not isinstance(balance, bool)
+            and math.isfinite(balance) and balance > 0
+            and controller.deadline.remaining() >= controller.final_reserve + MIN_FEEDBACK_SECONDS + seconds + 2)
+
+
+class _ProbeConfigReader(ToolDispatcher):
+    """Memoize protected input reads; refresh the newly created probe itself."""
+    def __init__(self, controller):
+        super().__init__(controller)
+        self.reads = [0]
+        self.fresh_reads = [0]
+        self.fresh_paths = set()
+        self.documents = {}
+
+    def _composition_document(self, path, reference, reads):
+        if path not in self.documents:
+            if path in self.fresh_paths and self.fresh_reads[0] >= 2:
+                raise ValueError("fresh probe verification exceeds its read limit")
+            budget = self.fresh_reads if path in self.fresh_paths else self.reads
+            self.documents[path] = super()._composition_document(path, reference, budget)
+        document, metadata = deepcopy(self.documents[path])
+        if any(key in document for key in ("include", "extends", "$include")):
+            raise ValueError("effective configuration includes are unsupported")
+        metadata["reference"] = reference
+        return document, metadata
+
+
+def _probe_fingerprint(reader: _ProbeConfigReader, path: Path, *, expected_hash=None, faults_path=None) -> str:
+    controller = reader.controller
+    if controller.deadline.stop_event.is_set():
+        raise TimeLimitError("cancelled before reading probe inputs")
+    if expected_hash is not None:
+        reader.documents.pop(path, None)
+        reader.fresh_paths.add(path)
+    document, metadata = reader._composition_document(path, path.name, reader.reads)
+    if expected_hash is not None and metadata["sha256"] != expected_hash:
+        raise ValueError("immutable probe bytes changed after composition")
+    if any(key in document for key in ("include", "extends", "$include")):
+        raise ValueError("effective configuration includes are unsupported")
+    if faults_path is not None:
+        profile, _ = reader._composition_document(faults_path, faults_path.name, reader.reads)
+        document["faults"] = reader._inline_composition_faults(
+            {"faults": profile.get("faults", profile)}, faults_path, reader.reads, [])["faults"]
+    document = reader._inline_composition_faults(document, path, reader.reads, [])
+    document.pop("name", None)
+    document.pop("expect", None)
+    # Both paired replays supply an explicit CLI seed; the document default
+    # cannot make a renamed experiment novel under that execution policy.
+    document.pop("seed", None)
+    if document.get("faults") in (None, {}):
+        document.pop("faults", None)
+    if controller.deadline.stop_event.is_set():
+        raise TimeLimitError("cancelled while reading probe inputs")
+    payload = json.dumps(document, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _probe_fingerprints(dispatcher: ToolDispatcher) -> tuple[set[str], _ProbeConfigReader]:
+    """Compare complete bounded inventories; decline instead of skipping inputs.
+
+    Compose's parser limits protected reads, including referenced faults, to
+    32 files of 64KiB. Two fresh probe verification reads have their own budget.
+    JSON structure is bounded and no service source is imported here.
+    """
+    controller = dispatcher.controller
+    pending = [controller.sources.candidate / "scenarios", dispatcher._probe_root()]
+    paths = []
+    entries_seen = 0
+    while pending:
+        if controller.deadline.stop_event.is_set() or controller.deadline.remaining() <= 0:
+            raise TimeLimitError("deadline prevents inspecting probe inventory")
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > MAX_PROBE_INVENTORY_ENTRIES:
+                    raise ValueError("probe novelty inventory exceeds its entry limit")
+                if entry.is_symlink():
+                    raise ValueError("probe novelty inventory contains a symlink")
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif Path(entry.name).suffix.lower() in {".yaml", ".yml", ".json"}:
+                    paths.append(Path(entry.path))
+                    if len(paths) > 32:
+                        raise ValueError("probe novelty inventory exceeds its file limit")
+    reader = _ProbeConfigReader(controller)
+    fingerprints = {_probe_fingerprint(reader, path) for path in sorted(paths)}
+    # Healthy controls and previous probes may have paired a scenario with an
+    # external override. Comparing their files independently misses that exact
+    # effective combination, even when the original experiment was retained.
+    experiments = [*controller.runs.values(), *getattr(controller, "_cache", {}).values()]
+    combinations = {(item.scenario, item.faults) for item in experiments if item.faults is not None}
+    combinations.update((item["scenario"], item["faults"]) for item in
+                        getattr(controller, "retained_experiments", {}).values() if item.get("faults") is not None)
+    if len(combinations) > MAX_PROBE_COMBINATIONS:
+        raise ValueError("probe novelty combinations exceed their limit")
+    for scenario, faults in sorted(combinations):
+        path, profile = reader._composition_path(scenario), reader._composition_path(faults)
+        fingerprints.add(_probe_fingerprint(reader, path, faults_path=profile))
+    return fingerprints, reader
+
+
+def _probe_run_row(result) -> dict:
+    return {
+        "run_id": _ledger_text(result.run_id, 64), "source_hash": _ledger_text(result.source_hash, 64),
+        "scenario": _ledger_text(result.scenario, 70), "scenario_hash": _ledger_text(result.scenario_hash, 64),
+        "seed": _ledger_scalar(result.seed), "status": _ledger_text(result.status, 32),
+        "violation_count": len(result.violations), "error": _ledger_text(result.error or "", 300),
+        "violations": [{"invariant": _ledger_text(row.get("invariant", "?"), 80),
+                        "detail": _ledger_text(row.get("detail", ""), 200), "t": _ledger_scalar(row.get("t"))}
+                       for row in result.violations[:4] if isinstance(row, dict)],
+    }
+
+
+def _measure_probe(controller: Controller, model, dispatcher: ToolDispatcher, result: dict,
+                   fingerprints: set[str], reader: _ProbeConfigReader, source: str, best: str,
+                   slot: float) -> dict:
+    pair = {"scope": "local_diagnostic", "source_hash": source, "accepted_source_hash": best,
+            "complete": False, "stage": "composition", "estimated_pair_seconds": round(slot * 2, 3)}
+    controller._last_probe_intervention = pair
+    try:
+        if not result.get("ok"):
+            raise ValueError(result.get("error", {}).get("message", "probe composition failed"))
+        probe = result["result"]
+        pair.update(probe=probe["probe"], probe_hash=probe["probe_hash"], seed=controller.config.seeds[0])
+        path = dispatcher._composition_path(probe["probe"])
+        pair["configuration_hash"] = _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"])
+        if pair["configuration_hash"] in fingerprints:
+            raise ValueError("probe repeats an existing effective configuration; name/expect changes add no runtime evidence")
+
+        def ready(seconds: float) -> None:
+            if controller.sources.candidate_hash != source or controller.sources.best_hash != best:
+                raise ValueError("source snapshots changed before completing the diagnostic pair")
+            if not _probe_resources(controller, model, seconds):
+                raise TimeLimitError("budget, cancellation or deadline prevents completing the diagnostic pair with feedback")
+
+        ready(slot * 2)
+        pair["stage"] = "accepted_replay"
+        before = controller.replay("accepted", probe["probe"], controller.config.seeds[0],
+                                   reserve=controller.final_reserve + MIN_FEEDBACK_SECONDS + slot)
+        pair["before"] = _probe_run_row(before)
+        if (before.source_hash != best or before.scenario_hash is None
+                or before.status not in {"pass", "invariant_failure", "unresolved"}):
+            raise ValueError("accepted diagnostic replay is incomplete or has mismatched provenance")
+        # A slow first replay updates the conservative estimate. Keep the
+        # completed first result if time or resources prevent the second.
+        ready(_probe_slot_seconds(controller))
+        pair["stage"] = "candidate_replay"
+        after = controller.replay("candidate", probe["probe"], controller.config.seeds[0],
+                                  reserve=controller.final_reserve + MIN_FEEDBACK_SECONDS)
+        pair["after"] = _probe_run_row(after)
+        if (before.source_hash != best or after.source_hash != source
+                or before.scenario_hash is None or before.scenario_hash != after.scenario_hash
+                or before.faults_hash != after.faults_hash or before.seed != after.seed
+                or _probe_fingerprint(reader, path, expected_hash=probe["probe_hash"]) != pair["configuration_hash"]):
+            raise ValueError("diagnostic source or effective input provenance does not match")
+        if before.status not in {"pass", "invariant_failure", "unresolved"} or after.status not in {
+                "pass", "invariant_failure", "unresolved"}:
+            raise ValueError("diagnostic pair contains an incomplete or invalid replay")
+        pair.update(complete=True, stage="measured", reason="new local diagnostic evidence; prior validation rejection remains recorded")
+    except (TimeLimitError, ModelError, ValueError, OSError, RuntimeError, KeyError) as error:
+        pair["reason"] = _ledger_text(str(error), 800)
+    emit("progress_probe_pair", **_ledger_probe_pair(pair, current=source, best=best))
+    return pair
+
+
 def repair_loop(controller: Controller, model: ModelClient) -> None:
     controller.model = model
     validated_hashes = getattr(controller, "_validated_candidate_hashes", set())
@@ -407,6 +642,12 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
     observed_accepted = controller.sources.best_hash
     forced_hypothesis_hashes: set[str] = set()
     forced_hypothesis_attempts = 0
+    probe_attempts = getattr(controller, "_probe_intervention_attempts", {})
+    completed_probes = getattr(controller, "_completed_probe_interventions", set())
+    declined_probes = getattr(controller, "_declined_probe_interventions", set())
+    controller._probe_intervention_attempts = probe_attempts
+    controller._completed_probe_interventions = completed_probes
+    controller._declined_probe_interventions = declined_probes
     proactive_validations = 0
     remaining_budget = getattr(model, "remaining_budget", None)
 
@@ -417,7 +658,8 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
              final_reserve=controller.final_reserve, remaining_budget_usd=_ledger_scalar(balance),
              model_spent_usd=_ledger_scalar(getattr(model, "spent_usd", 0)),
              forced_hypotheses=len(forced_hypothesis_hashes), forced_hypothesis_attempts=forced_hypothesis_attempts,
-             proactive_validations=proactive_validations)
+             proactive_validations=proactive_validations, forced_probe_attempts=sum(probe_attempts.values()),
+             completed_probe_pairs=len(completed_probes))
 
     def accepted_progress() -> None:
         nonlocal completion_attempts, observed_accepted
@@ -441,10 +683,16 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             observed_source = current
             information_turns = 0
         forced_hypothesis = False
+        forced_probe = False
         forced_instruction = ""
+        probe_fingerprints: set[str] = set()
+        probe_reads = [0]
+        probe_slot = _probe_slot_seconds(controller)
+        probe_best = controller.sources.best_hash
         if information_turns >= INFORMATION_TURN_LIMIT:
             status = controller.status()
             seen = _validation_seen(status, current, validated_hashes)
+            rejection = _completed_rejection(status, current)
             if (current != controller.sources.best_hash and not seen
                     and proactive_validations < MAX_PROACTIVE_VALIDATIONS
                     and _can_validate_with_feedback(controller)):
@@ -455,6 +703,34 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
                 }) + "\n# Resource status\n" + prompt_status(controller))
                 information_turns = 0
                 observed_source = controller.sources.candidate_hash
+            elif (current != probe_best and rejection is not None and current not in completed_probes
+                    and current not in declined_probes
+                    and probe_attempts.get(current, 0) < MAX_PROBE_ATTEMPTS_PER_HASH
+                    and sum(probe_attempts.values()) < MAX_PROBE_ATTEMPTS
+                    and _probe_resources(controller, model, probe_slot * 2)):
+                try:
+                    probe_fingerprints, probe_reads = _probe_fingerprints(dispatcher)
+                    forced_probe = True
+                    gap = rejection.get("review") or {}
+                    forced_instruction = (
+                        "# Produce a measured diagnostic probe\n"
+                        "Source " + current + " has a completed rejection and six information-only turns. "
+                        "Use exactly one compose_probe call to test the recorded evidence gap using the documented schema. "
+                        "Choose a shipped/scratch base and one small discriminating configuration change. "
+                        "A renamed copy or an expect-only change is not a new experiment. "
+                        "The controller will replay identical immutable inputs on accepted source " + probe_best
+                        + " and this candidate and return measured evidence. No repair is accepted by this experiment. "
+                        "Recorded rejection: " + _ledger_text(rejection.get("reason", ""), 400)
+                        + "\nIssues/gaps: " + json.dumps({
+                            "issues": _ledger_strings(gap.get("issues"), count=3, chars=300),
+                            "missing_evidence": _ledger_strings(gap.get("missing_evidence"), count=3, chars=300),
+                        }, ensure_ascii=False))
+                    emit("progress_intervention", kind="compose_probe", source_hash=current,
+                         information_turns=information_turns, estimated_pair_seconds=round(probe_slot * 2, 3))
+                except (TimeLimitError, ValueError, OSError, RuntimeError) as error:
+                    declined_probes.add(current)
+                    _append_feedback(messages, "# Diagnostic intervention declined\n" + _ledger_text(str(error), 800))
+                    emit("progress_probe_declined", source_hash=current, reason=_ledger_text(str(error), 800))
             elif (not _durable_hypothesis(status, current)
                     and current not in forced_hypothesis_hashes
                     and forced_hypothesis_attempts < MAX_HYPOTHESIS_INTERVENTIONS
@@ -476,15 +752,23 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             if controller.deadline.stop_event.is_set():
                 stop("cancelled")
                 return
-            kwargs = {"max_tokens": 2048 if forced_hypothesis else output_tokens,
-                      "reserve": controller.final_reserve}
+            kwargs = {"max_tokens": 2048 if forced_hypothesis or forced_probe else output_tokens,
+                      "reserve": controller.final_reserve + (MIN_FEEDBACK_SECONDS + probe_slot * 2 if forced_probe else 0)}
+            definitions = TOOL_DEFINITIONS
             if forced_hypothesis:
                 kwargs["tool_choice"] = {"type": "tool", "name": "record_hypothesis"}
                 # A failed request leaves the finding pending for the existing
                 # bounded recovery. Count attempts independently so paid retries
                 # cannot exceed the case intervention budget.
                 forced_hypothesis_attempts += 1
-            reply = model.messages(SYSTEM, messages, TOOL_DEFINITIONS, **kwargs)
+            elif forced_probe:
+                if not _probe_resources(controller, model, probe_slot * 2):
+                    stop("diagnostic_resources")
+                    return
+                kwargs["tool_choice"] = {"type": "tool", "name": "compose_probe"}
+                definitions = [tool for tool in TOOL_DEFINITIONS if tool["name"] == "compose_probe"]
+                probe_attempts[current] = probe_attempts.get(current, 0) + 1
+            reply = model.messages(SYSTEM, messages, definitions, **kwargs)
         except BudgetExhausted as error:
             emit("model_budget_limit", error=str(error))
             if budget_recoveries >= 1:
@@ -501,7 +785,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
             emit("model_error", code=error.code, status=error.status, error=str(error))
             if error.code == "incomplete_response" and incomplete_recoveries < 2:
                 incomplete_recoveries += 1
-                if not forced_hypothesis:
+                if not forced_hypothesis and not forced_probe:
                     output_tokens = min(8192, output_tokens * 2)
                 continue
             stop("model_error", code=error.code)
@@ -512,7 +796,7 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
         remaining_budget = reply.remaining_usd
         emit("model_turn", turn=turn + 1, cost_usd=reply.cost_usd,
              remaining_budget_usd=reply.remaining_usd, stop_reason=reply.stop_reason,
-             forced_tool="record_hypothesis" if forced_hypothesis else None)
+             forced_tool="compose_probe" if forced_probe else "record_hypothesis" if forced_hypothesis else None)
         if controller.deadline.stop_event.is_set():
             stop("cancelled")
             return
@@ -521,6 +805,41 @@ def repair_loop(controller: Controller, model: ModelClient) -> None:
         for block in reply.content:
             if block["type"] == "text":
                 emit("agent_note", text=block["text"][:4000])
+        if forced_probe:
+            # A forced diagnostic cannot execute source edits, validation, or
+            # unrelated calls, even if the provider returns an unexpected block.
+            valid = len(calls) == 1 and calls[0]["name"] == "compose_probe"
+            results = []
+            if valid:
+                call = calls[0]
+                if (controller.sources.candidate_hash != current or controller.sources.best_hash != probe_best
+                        or not _probe_resources(controller, model, probe_slot * 2)):
+                    result = {"ok": False, "error": {"code": "diagnostic_resources",
+                              "message": "source, budget, cancellation or deadline prevents composing a diagnostic"}}
+                else:
+                    result = dispatcher.execute("compose_probe", call["input"])
+                emit("tool", name="compose_probe", ok=result.get("ok"), source_hash=current)
+                results.append({"type": "tool_result", "tool_use_id": call["id"],
+                                "content": tool_text(result), "is_error": not result.get("ok", False)})
+                pair = _measure_probe(controller, model, dispatcher, result, probe_fingerprints,
+                                      probe_reads, current, probe_best, probe_slot)
+                if pair["complete"]:
+                    completed_probes.add(current)
+                feedback = "# Measured local diagnostic pair\n" + tool_text(_ledger_probe_pair(
+                    pair, current=controller.sources.candidate_hash, best=controller.sources.best_hash))
+                information_turns = 0 if pair["complete"] else INFORMATION_TURN_LIMIT
+            else:
+                error = {"ok": False, "error": {"code": "unexpected_diagnostic_call",
+                         "message": "forced diagnostic requires exactly one compose_probe call; no calls were executed"}}
+                results = [{"type": "tool_result", "tool_use_id": call["id"],
+                            "content": tool_text(error), "is_error": True} for call in calls]
+                feedback = "# Diagnostic request rejected\n" + tool_text(error)
+                information_turns = INFORMATION_TURN_LIMIT
+                emit("progress_probe_declined", source_hash=current, reason="unexpected diagnostic calls")
+            results.append({"type": "text", "text": feedback + "\n# Resource status\n" + prompt_status(controller)})
+            messages.append({"role": "user", "content": results})
+            observed_source = controller.sources.candidate_hash
+            continue
         if calls:
             results = []
             for call in calls:

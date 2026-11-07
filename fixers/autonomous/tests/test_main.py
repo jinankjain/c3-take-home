@@ -647,6 +647,230 @@ def test_stalled_unchanged_rejection_is_never_automatically_retried(controller):
     assert model.review_calls == 1 and source_hash(controller.sources.live / "src") == original
 
 
+def rejected_probe_candidate(controller):
+    from fixer.runtime import Deadline
+
+    controller.deadline = controller.runner.deadline = Deadline(time.time() + 360)
+    controller.sources.apply_edits(**final_patch(controller))
+    controller.model = Reviewer(False)
+    assert not controller.validate(plan())["accepted"]
+    controller.record_hypothesis({"id": "recorded-but-unproven", "obligation": "One durable identity.",
+                                  "mechanism": "The source explanation still needs a discriminating experiment.",
+                                  "evidence": ["src/service.py:1"], "status": "proposed"})
+    return controller.sources.candidate_hash, controller.sources.best_hash
+
+
+def probe_reply(number=1, **arguments):
+    args = {"name": "diagnostic_" + str(number), "base": "public", "overrides": {"checks": ["OWNERSHIP"]}}
+    args.update(arguments)
+    return ModelReply([{"type": "tool_use", "id": "probe-" + str(number),
+                        "name": "compose_probe", "input": args}], "tool_use", {}, 0, 3)
+
+
+class DiagnosticModel(Reviewer):
+    def __init__(self, forced=None):
+        super().__init__(False)
+        self.turns = self.forced = 0
+        self.force_callback = forced
+        self.final_context = ""
+
+    def messages(self, system, messages, tools, **kwargs):
+        assert not is_review(tools), "diagnostic evidence automatically retried a rejected review"
+        assert_native_pairs(messages)
+        self.turns += 1
+        if kwargs.get("tool_choice"):
+            self.forced += 1
+            assert kwargs["tool_choice"] == {"type": "tool", "name": "compose_probe"}
+            assert [tool["name"] for tool in tools] == ["compose_probe"]
+            assert kwargs["max_tokens"] == 2048
+            assert "# Produce a measured diagnostic probe" in json.dumps(messages)
+            return self.force_callback(self, system, messages, tools, kwargs) if self.force_callback else probe_reply(self.forced)
+        if self.forced or self.turns > 8:
+            self.final_context = json.dumps(messages, ensure_ascii=False)
+            return ModelReply([{"type": "text", "text": "The rejected source has not changed."}], "end_turn", {}, 0, 3)
+        return ModelReply([{"type": "tool_use", "id": "read-" + str(self.turns), "name": "read_file",
+                            "input": {"path": "src/service.py"}}], "tool_use", {}, 0, 3)
+
+
+def test_rejected_stalled_source_gets_measured_pair_with_native_wire_and_compaction(controller, monkeypatch):
+    from fixer.main import MAX_CONTEXT_CHARS
+    from fixer.model import ModelClient
+
+    candidate, accepted = rejected_probe_candidate(controller)
+    rejection = controller.status()["last_validation"]
+    client = ModelClient(controller.runner, controller.deadline, 3, env={
+        "ANTHROPIC_API_KEY": "offline-test-key", "ANTHROPIC_BASE_URL": "http://127.0.0.1:1",
+        "FIXER_THINKING_TOKENS": "4096"})
+    wire = []
+
+    def http(method, url, body=None, **kwargs):
+        if method == "GET":
+            return {"status": 404, "body": {}}
+        wire.append(body)
+        assert body["max_tokens"] == 2048 and "thinking" not in body
+        assert body["tool_choice"] == {"type": "tool", "name": "compose_probe"}
+        assert [tool["name"] for tool in body["tools"]] == ["compose_probe"]
+        return {"status": 200, "complete": True, "body": {"type": "message", "role": "assistant",
+                "content": probe_reply().content, "stop_reason": "tool_use",
+                "usage": {"input_tokens": 100, "output_tokens": 50}}}
+
+    monkeypatch.setattr(client, "_http", http)
+    model = DiagnosticModel(lambda _m, system, messages, tools, kwargs: client.messages(system, messages, tools, **kwargs))
+    measured = []
+    real_replay = controller.replay
+
+    def replay(source, scenario, seed, **kwargs):
+        measured.append((source, scenario, seed, kwargs["reserve"]))
+        return real_replay(source, scenario, seed, **kwargs)
+
+    monkeypatch.setattr(controller, "replay", replay)
+    repair_loop(controller, model)
+    assert model.forced == len(wire) == 1
+    assert [row[0] for row in measured] == ["accepted", "candidate"]
+    assert measured[0][1:3] == measured[1][1:3] == ("probe:diagnostic_1", controller.config.seeds[0])
+    assert measured[0][3] > measured[1][3] == controller.final_reserve + 30
+    pair = controller._last_probe_intervention
+    assert pair["complete"] and pair["scope"] == "local_diagnostic"
+    assert pair["before"]["source_hash"] == accepted and pair["before"]["status"] == "invariant_failure"
+    assert pair["after"]["source_hash"] == candidate and pair["after"]["status"] == "pass"
+    assert pair["before"]["scenario_hash"] == pair["after"]["scenario_hash"]
+    assert controller.status()["last_validation"] == rejection
+    assert not controller.accepted and validate_pending_candidate(controller) is None
+    assert source_hash(controller.sources.live / "src") == accepted
+    messages = [{"role": "user", "content": controller.initial_context}]
+    for number in range(8):
+        messages += [{"role": "assistant", "content": [{"type": "tool_use", "id": str(number), "name": "status", "input": {}}]},
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": str(number), "content": "r" * 31000}]}]
+    compacted = compact_messages(controller, messages, force=True)
+    assert_native_pairs(compacted)
+    context = json.dumps(compacted, ensure_ascii=False)
+    assert len(context) <= MAX_CONTEXT_CHARS
+    assert pair["before"]["run_id"] in context and pair["after"]["run_id"] in context
+    assert candidate in context and accepted in context and rejection["review"]["issues"][0] in context
+    assert "probe:diagnostic_1" in context and "OWNERSHIP" in context
+    coverage = json.loads(prompt_status(controller))["control_coverage"]
+    assert coverage["executed"] == controller.control_coverage["executed"]
+    assert coverage["retained"] == controller.control_coverage["retained"]
+    assert "cancelled" in coverage and "discovery_truncated" in coverage
+
+
+@pytest.mark.parametrize("change", ["name", "expect", "seed"])
+def test_diagnostic_declines_metadata_only_clones_and_bounds_attempts(controller, monkeypatch, change):
+    candidate, accepted = rejected_probe_candidate(controller)
+    monkeypatch.setattr(controller, "replay", lambda *a, **k: pytest.fail("duplicate diagnostic was replayed"))
+
+    def force(model, *_args):
+        overrides = {} if change == "name" else {change: {"completed": 100} if change == "expect" else 123456}
+        return probe_reply(model.forced, overrides=overrides)
+
+    model = DiagnosticModel(force)
+    repair_loop(controller, model)
+    assert model.forced == controller._probe_intervention_attempts[candidate] == 2
+    assert not controller._last_probe_intervention["complete"]
+    assert "existing effective configuration" in controller._last_probe_intervention["reason"]
+    assert not controller.accepted and controller.sources.best_hash == accepted
+
+
+def test_novelty_includes_measured_fault_override_with_memoized_reads(controller):
+    from fixer.main import _measure_probe, _probe_fingerprints
+    from fixer.tools import ToolDispatcher
+
+    candidate, accepted = rejected_probe_candidate(controller)
+    for root in (controller.sources.best, controller.sources.candidate):
+        (root / "scenarios/drop.yaml").write_text("faults:\n  lose_reply: true\n")
+    # This combination is existing evidence, though neither file alone has
+    # the same effective input as the resulting composition.
+    for seed in range(1, 21):
+        controller.replay("accepted", "base", seed, "scenarios/drop.yaml")
+    dispatcher = ToolDispatcher(controller)
+    fingerprints, reader = _probe_fingerprints(dispatcher)
+    assert reader.reads[0] == 3  # public/base/drop, independent of replay count
+    result = dispatcher.execute("compose_probe", {"name": "same_override", "base": "base",
+                                "fault_profiles": ["drop"], "overrides": {"expect": {"completed": 999}}})
+    assert result["ok"]
+    pair = _measure_probe(controller, Reviewer(), dispatcher, result, fingerprints, reader, candidate, accepted, 5)
+    assert not pair["complete"] and "existing effective configuration" in pair["reason"]
+    assert "before" not in pair
+
+
+@pytest.mark.parametrize("failure", ["budget", "incomplete", "unexpected"])
+def test_forced_diagnostic_retries_remain_narrow_and_cannot_edit_or_validate(controller, failure):
+    candidate, accepted = rejected_probe_candidate(controller)
+
+    def force(model, *_args):
+        if model.forced == 1:
+            if failure == "budget":
+                raise BudgetExhausted(.1, .09)
+            if failure == "incomplete":
+                raise ModelError("response interrupted", code="incomplete_response")
+            return ModelReply([{"type": "tool_use", "id": "unexpected-edit", "name": "apply_edits",
+                                "input": {"base_hash": candidate, "edits": [{"path": "src/service.py",
+                                          "old": "NORMAL_BROKEN = False", "new": "NORMAL_BROKEN = True"}]}},
+                               {"type": "tool_use", "id": "unexpected-validation", "name": "validate", "input": plan()}],
+                              "tool_use", {}, 0, 3)
+        return probe_reply(model.forced)
+
+    model = DiagnosticModel(force)
+    repair_loop(controller, model)
+    assert model.forced == 2 and controller._last_probe_intervention["complete"]
+    assert controller.sources.candidate_hash == candidate and controller.sources.best_hash == accepted
+    assert controller._probe_intervention_attempts[candidate] == 2
+    assert not controller.accepted and validate_pending_candidate(controller) is None
+
+
+@pytest.mark.parametrize("interruption", ["cancelled", "budget", "source", "deadline"])
+def test_measured_pair_stops_between_snapshots_when_resources_or_source_change(controller, monkeypatch, interruption):
+    from fixer.main import _measure_probe, _probe_fingerprints
+    from fixer.runtime import Deadline
+    from fixer.tools import ToolDispatcher
+
+    candidate, accepted = rejected_probe_candidate(controller)
+    dispatcher = ToolDispatcher(controller)
+    fingerprints, reader = _probe_fingerprints(dispatcher)
+    result = dispatcher.execute("compose_probe", probe_reply().content[0]["input"])
+    model = Reviewer()
+    sources = []
+    real_replay = controller.replay
+
+    def replay(source, *args, **kwargs):
+        sources.append(source)
+        run = real_replay(source, *args, **kwargs)
+        if interruption == "cancelled":
+            controller.deadline.stop_event.set()
+        elif interruption == "budget":
+            model.remaining_budget = 0
+        elif interruption == "source":
+            controller.sources.apply_edits(candidate, [{"path": "src/service.py", "old": "NORMAL_BROKEN = False",
+                                                        "new": "NORMAL_BROKEN = False  # external revision"}])
+        else:
+            controller.deadline = controller.runner.deadline = Deadline(time.time() + controller.final_reserve + 29)
+        return run
+
+    monkeypatch.setattr(controller, "replay", replay)
+    pair = _measure_probe(controller, model, dispatcher, result, fingerprints, reader, candidate, accepted, 5)
+    assert sources == ["accepted"] and not pair["complete"] and "after" not in pair
+    assert pair["before"]["source_hash"] == accepted and pair["source_hash"] == candidate
+    assert controller.sources.best_hash == accepted and not controller.accepted
+    compact = json.loads(prompt_status(controller))["probe_intervention"]
+    assert compact["before"]["run_id"] == pair["before"]["run_id"] and not compact["complete"]
+
+
+def test_full_novelty_inventory_leaves_separate_fresh_probe_verification_budget(controller):
+    from fixer.main import _measure_probe, _probe_fingerprints
+    from fixer.tools import ToolDispatcher
+
+    candidate, accepted = rejected_probe_candidate(controller)
+    for number in range(30):
+        (controller.sources.candidate / "scenarios" / ("existing_" + str(number) + ".yaml")).write_text(
+            "name: existing\nchecks: [NORMAL]\n")
+    dispatcher = ToolDispatcher(controller)
+    fingerprints, reader = _probe_fingerprints(dispatcher)
+    assert reader.reads[0] == 32
+    result = dispatcher.execute("compose_probe", probe_reply().content[0]["input"])
+    pair = _measure_probe(controller, Reviewer(), dispatcher, result, fingerprints, reader, candidate, accepted, 5)
+    assert pair["complete"] and reader.reads[0] == 32 and reader.fresh_reads[0] == 2
+
+
 def test_compaction_leaves_room_for_another_tool_turn_without_reset(controller):
     from fixer.main import COMPACT_CONTEXT_CHARS, MAX_CONTEXT_CHARS
 
