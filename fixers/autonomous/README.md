@@ -6,9 +6,9 @@ A Python controller gives Claude Sonnet 4.6 local tools to investigate an incide
 
 1. Copy the case into original, accepted and candidate snapshots. Run the original public tests and supplied public simulator seeds. Discover healthy public scenarios and fault profiles, cover distinct input-derived holdouts before repeating supplied seeds, and retain passing controls within a bounded bootstrap phase.
 2. Read the incident, invariants and source inventory. Retrieve relevant service/platform documents from `C3_CORPUS`, starting at `INDEX.md` and prioritizing current versions.
-3. Let Sonnet inspect files and causal trace windows, record hypotheses, compose immutable fault scenarios, and edit only candidate `src/` files.
+3. Let Sonnet inspect files and causal trace windows, record hypotheses, compose immutable fault scenarios, and edit only candidate `src/` files. Capture the repair's intended scope against its exact before/after source hashes.
 4. Check candidates against public tests, public seeds, submitted probes, healthy controls and retained earlier experiments. Every scenario that established a repaired obligation remains mandatory, including scenarios that still fail another invariant. Add up to three extra seeds when measured replay costs fit the remaining time. Require reproduced progress and replay determinism.
-5. Review the patch with a separate Sonnet request. Promote accepted source, rerun tests and a replay in the actual workspace, and roll back failed installation verification. Continue investigating remaining failures.
+5. Review the patch with a separate Sonnet request using matched before/after inputs, complete changed functions and relevant unchanged protocol handlers. Promote accepted source, rerun tests and a replay in the actual workspace, and roll back failed installation verification. Continue investigating remaining failures.
 
 A full passing local matrix can be accepted if model review is unavailable. Partial repairs require model review. Public success is evidence for a repair; the grader determines whether hidden bugs are fixed.
 
@@ -17,6 +17,8 @@ A full passing local matrix can be accepted if model review is unavailable. Part
 | `main.py`, `controller.py`, `tools.py` | Model loop, hypotheses, probes, acceptance and final verification |
 | `retrieval.py`, `relevance.py` | Bounded file access, current-version ranking, focused excerpts and conservative Jev filtering |
 | `evidence.py`, `validation.py` | Trace summaries, replay/check results, source/scenario hashes and deterministic repeats |
+| `review.py`, `review_source.py` | Exact before/after pairs, typed review evidence, changed bodies and unchanged protocol peers |
+| `probe_guidance.py` | Bounded resolved configurations and actionable corrections for failed diagnostic construction |
 | `experiments.py` | Measured replay scheduling; required public and retained obligations cannot be omitted |
 | `controls.py` | Bounded public-input healthy controls, deterministic holdout seeds and coverage accounting |
 | `patches.py` | Isolated snapshots, exact edits, Python compilation, installation journals and rollback |
@@ -24,7 +26,7 @@ A full passing local matrix can be accepted if model review is unavailable. Part
 
 ## Verification status
 
-The combined fixer and grader suite has **492 passing tests**: 459 fixer checks and 33 grader checks, completed in 106.8 seconds. It covers invented services, local proxy responses, causal evidence, healthy controls, forced diagnostic probes, cached replay progress and reporting namespaces. Independent reviews found no remaining blocker. A baseline smoke run also completed on all six practice cases: public tests passed, simulator failures were detected, and service source stayed unchanged.
+The combined fixer and grader suite has **581 passing tests**: 548 fixer checks and 33 grader checks, completed in 127.03 seconds. It covers invented services, local proxy responses, causal evidence, healthy controls, forced diagnostic probes, cached replay progress, matched review inputs, repair intent, complete protocol context and reporting namespaces. Independent reviews found no remaining blocker. An earlier baseline smoke run completed on all six practice cases: public tests passed, simulator failures were detected, and service source stayed unchanged.
 
 The first frozen image (`29a2adb`) fixed **7/12 practice bugs**, after correcting a B1 JUnit namespace mismatch in the reporting harness. Original results are preserved under `results/autonomous-image-full-r1`; the B1 reevaluation and corrected summary are under its `reporting-correction/` directory. That suite spent $10.7682. A2 and B2 motivated the current context, progress and experiment improvements.
 
@@ -36,9 +38,11 @@ The third image, **`553364e`**, finished at **4/12 bugs for $32.4736**, with no 
 
 The fourth image, **`44e94ee`**, finished at **7/12 for $23.1984**, with every public/regression gate passing and no infrastructure errors or timeouts. B2 passed 2/3. B3's retained crash/profile holdout blocked the exact regressing candidate seen in earlier runs, preserving original source at 0/2. A2 exposed another progress defect: cached replay requests delayed validation until turn 79. The corrected loop counts those requests as information and recognizes fresh controller-owned runs as measurements. Results and audits remain at `results/autonomous-image-full-r4`.
 
-The final runtime is frozen at **`24e51ae`**, with verified matching module hashes in its `linux/amd64` image. It completed all six official cases at **6/12 bugs for $25.4619**, in 2,798.7 cumulative fixer seconds and 1,569.8 grading seconds. Every public-test and regression gate passed, with no infrastructure errors or timeouts. B2 repaired only bug 3, scoring **1/3**; B3 preserved original source at **0/2**. A2 also scored 0/2: the corrected loop triggered validation at turn 14, but model diagnosis, experiment comparisons and probe composition still limited repairs. This run did not improve score or spend over the fourth image. Results and independent audits are at `results/autonomous-image-full-r5`.
+The fifth frozen runtime, **`24e51ae`**, completed all six official cases at **6/12 bugs for $25.4619**, in 2,798.7 cumulative fixer seconds and 1,569.8 grading seconds. Every public-test and regression gate passed, with no infrastructure errors or timeouts. B2 repaired only bug 3, scoring **1/3**; B3 preserved original source at **0/2**. A2 also scored 0/2: the corrected loop triggered validation at turn 14, but model diagnosis, experiment comparisons and probe composition still limited repairs. This run did not improve score or spend over the fourth image. Results and independent audits are at `results/autonomous-image-full-r5`.
 
-Both labs completed against that exact image at **4/4 for $0.711097** in 187.443 cumulative fixer seconds, with all seed and public/private gates passing; results are at `results/autonomous-chained-labs-r4`. Earlier labs also passed 4/4 on `553364e` ($0.932173) and `44e94ee` ($0.746846), with their artifacts preserved. The final provider balance check records **$122.33 used and $27.67 remaining** from the $150 allowance, including earlier runs and smoke checks, at `results/artifacts/final-budget.json`.
+Both labs completed against that exact image at **4/4 for $0.711097** in 187.443 cumulative fixer seconds, with all seed and public/private gates passing; results are at `results/autonomous-chained-labs-r4`. Earlier labs also passed 4/4 on `553364e` ($0.932173) and `44e94ee` ($0.746846), with their artifacts preserved. The balance before the followup was **$122.33 used and $27.67 remaining** from the $150 allowance, at `results/artifacts/budget-before-targeted-r6.json`.
+
+The current runtime is frozen at **`92b15ee`**. All 17 module hashes match its `linux/amd64` image. It preserves repair intent during automatic validation, supplies exact paired review evidence and unchanged protocol peers, checks factual regression citations, and carries construction corrections into a second diagnostic attempt within the existing limits. The 581-test gate and image smoke/export checks passed. Exact-image grading of A2, B2 and B3 is running at `results/autonomous-targeted-r6`; a current-image practice score is pending.
 
 Real Jev relevance decisions were verified through the funded proxy: one relevant lease document was retained and an unrelated SQL document rejected, in 0.497 seconds for $0.000026544. This verifies the API integration; corpus searches still retain direct/current/referenced evidence and fall back to lexical results on uncertainty or failure.
 
@@ -106,15 +110,15 @@ The image uses Python 3.12.12 and installs pinned PyYAML/pytest dependencies at 
 docker image inspect c3-fixer-autonomous --format '{{.Os}}/{{.Architecture}} {{.Size}}'
 ```
 
-The frozen **`c3-fixer-autonomous:24e51ae`** image reports `linux/amd64`; its saved tarball is **50,550,784 bytes**, below the pack's 4 GB limit. The tarball and identity metadata are under `results/artifacts/c3-fixer-autonomous-24e51ae-linux-amd64.*`. The tarball SHA-256 is `6d13f8d33019dd25fdc8738d8db2e213732722e2b3e99ff1d06532a8f99063ea`.
+The frozen **`c3-fixer-autonomous:92b15ee`** image reports `linux/amd64`; its saved tarball is **50,569,728 bytes**, below the pack's 4 GB limit. The tarball and identity metadata are under `results/artifacts/c3-fixer-autonomous-92b15ee-linux-amd64.*`. The tarball SHA-256 is `9f8f0074fdce5d379ff56da89b4b9f524881e3bd60d4c605426cda94495a440f`.
 
 On another machine, copy the repository and frozen tarball, install the host Python dependencies above, start the proxy with the funded `.env`, then load and grade the exact image:
 
 ```sh
-docker load -i results/artifacts/c3-fixer-autonomous-24e51ae-linux-amd64.tar
+docker load -i results/artifacts/c3-fixer-autonomous-92b15ee-linux-amd64.tar
 PATH="$PWD/.venv/bin:$PATH" \
 C3_GRADER_PYTHON="$PWD/.venv/bin/python" \
-./grade.sh --fixer c3-fixer-autonomous:24e51ae --concurrency 2 --eval-workers 2 --keep
+./grade.sh --fixer c3-fixer-autonomous:92b15ee --concurrency 2 --eval-workers 2 --keep
 ```
 
 The grader's host socket transport was checked successfully on this Docker Desktop installation using a container with network access disabled.
@@ -125,13 +129,13 @@ The local handoff contains the tested image, its source directory and Dockerfile
 
 | Artifact | Path from the repository root |
 | --- | --- |
-| Frozen Linux image | `results/artifacts/c3-fixer-autonomous-24e51ae-linux-amd64.tar` |
+| Frozen Linux image | `results/artifacts/c3-fixer-autonomous-92b15ee-linux-amd64.tar` |
 | Source directory archive | `results/artifacts/c3-fixer-autonomous-source.tar.gz` |
 | Write-up | `fixers/autonomous/WRITEUP.md` |
 | Development chat logs | `results/artifacts/c3-build-visible-chat-logs.tar.gz` |
 | Identities, hashes and result references | `results/artifacts/submission-manifest.json` |
 
-The source archive includes the authored tests and chained fixtures for review; the Dockerfile copies only runtime files. Its final documentation commit may follow `24e51ae`; the manifest verifies that every runtime module still matches the graded image.
+The source archive includes the authored tests and chained fixtures for review; the Dockerfile copies only runtime files. Its documentation commit may follow the frozen runtime; the manifest verifies that every runtime module matches the image. The earlier source, logs, balance and handoff manifest are preserved under `results/artifacts/history-24e51ae`. Current source/log/manifest refresh follows completed grading.
 
 ## Configuration and limits
 
@@ -152,6 +156,10 @@ The source archive includes the authored tests and chained fixtures for review; 
 The controller runs at most two tool subprocesses concurrently and up to 128 repair turns within the case deadline and spend limit. Compaction targets 120,000 characters with an absolute 180,000-character bound, preserving source-bound findings and the latest complete native tool exchange. It shortens older incident context before dropping that exchange and may exceed the soft target to keep it within the hard bound. Six information-only turns can trigger a concise hypothesis or validation of an unchanged staged candidate. After a completed rejection, they can instead request one new composed probe and replay identical immutable inputs on accepted and candidate snapshots, preserving the rejection and final verification time. On unchanged accepted source with known failures and a durable finding, the intervention runs one accepted-source diagnostic; it is explicitly labelled as an observation with no repair comparison or automatic promotion. Results and source/run identity survive compaction. Attempts are bounded to two per source hash and four per case, with one completed diagnostic per hash. Model requests reserve their worst estimated spend and settle against returned usage; prompt caching is provided by the proxy. A rejected spend reservation can trigger one smaller-context/output retry.
 
 Forced diagnostic requests expose only `compose_probe`, use 2,048 output tokens and disable thinking. Novelty comparisons normalize labels, expectations and the overridden document seed, including already measured scenario/fault combinations. Inputs are limited to 32 protected files, 512 discovery entries and 64 combinations; oversized or unsupported configurations decline the intervention. Measured conservative replay slots range from five to 60 seconds, with 60 seconds as the unknown-cost fallback. A slow or invalid run remains labelled incomplete while preserving final verification and 30 seconds for feedback.
+
+Construction guidance includes up to two resolved base configurations within 8,000 characters. A failed attempt retains up to 4,000 characters of source-bound correction context, including exact conflicting paths, required arguments or incomplete replay status. Conflict responses collect bounded details before publishing a probe; overrides remain explicit. Correction requests share the existing two-per-source/four-per-case attempt limits and replay reserves.
+
+Edits can supply a bounded `repair_plan`; otherwise the controller captures current hypotheses. Automatic validation retains that intent only for the exact candidate and accepted-source basis. Review pairs use scenario hash, effective fault hash and seed together, with host-computed resolved, remaining and newly observed failures. Review source context is bounded to 24,000 characters with complete-body and omission labels. Native blockers distinguish regression, source defect and unverified repair. A false factual regression citation can receive one same-source correction; a legitimate source blocker remains blocking. Factual protocol errors cannot use the unavailable-review fallback.
 
 Replay requests that return existing cached observations count toward the information-turn limit. Genuine new executions register new controller-owned run IDs and reset the streak, including fresh execution of identical inputs. Tool logs report `fresh_replay`; requested filenames and response cache flags cannot establish progress.
 

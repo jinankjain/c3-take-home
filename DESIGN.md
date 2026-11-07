@@ -82,8 +82,8 @@ A separate review call can inspect a risky protocol change when resources allow.
 | `trace_slice(run, entities, event_types)` | Return relevant histories from a trace retained on disk. |
 | `replay(scenario, seed, faults)` | Run the simulator, check its trace, and return a compact evidence bundle. |
 | `run_tests(selection)` | Run original public tests against a staged candidate. |
-| `write_probe(name, scenario)` | Create a scenario in scratch using the case's schema. |
-| `apply_edits(base_hash, edits)` | Apply structured edits to staged `src/`; reject stale or ambiguous edits. |
+| `compose_probe(name, base, fault_profiles, probes, overrides)` | Compose immutable scenario/fault inputs using the case's schema and explicit conflict overrides. |
+| `apply_edits(base_hash, edits, repair_plan)` | Apply structured edits to staged `src/` and capture bounded repair intent; reject stale or ambiguous edits. |
 | `validate(candidate, plan)` | Run controller-owned gates and store their results. |
 
 Use subprocess argument lists, explicit working directories, timeouts, and process groups. Validate tool arguments and resolved paths locally, including symlink containment. Restrict source edits to staged `src/`. Read additional simulator implementation or case files when required to understand an unfamiliar interface.
@@ -189,6 +189,10 @@ Validate candidates in a separate case tree containing real copies of unchanged 
 
 Freeze a candidate while validation runs and attach every result to its source hash. Further edits create a new candidate; results from another source version cannot satisfy its gates.
 
+Capture the edit's intended mechanism and targeted reproductions against its before/after source hashes. Automatic validation must recover that same intent. Present independent review with exact before/after pairs keyed by scenario hash, effective fault hash and seed, plus host-computed resolved, remaining and newly observed failures. Include complete changed functions and relevant unchanged callers, receivers and helpers within bounded source context, with explicit omissions.
+
+Native blockers distinguish actual regression, source defect and unverified repair. Validate cited regression facts against matched passing controls and retained obligations. An invalid factual claim remains blocked and can receive one source-bound correction; legitimate source blockers retain their effect. This provides actionable feedback while preserving partial-repair review and mandatory regression gates.
+
 Run gates in increasing cost order:
 
 1. Parse changed Python files and check the diff's path boundaries.
@@ -282,6 +286,6 @@ Grade the exact final image on every practice case. Prepare the half-page write-
 
 This proposal is based on static review of [README.md](README.md), [RULES.md](RULES.md), the [minimal fixer](fixers/examples/minimal-llm/fix.py), [proxy behavior](proxy/server.py), the [corpus index](corpus/build/practice/INDEX.md), and public practice source, simulator interfaces, and current runbooks.
 
-The proposal has been implemented in [fixers/autonomous](fixers/autonomous/README.md), including source snapshots, native Sonnet tools, conservative Jev relevance decisions, immutable composed fault probes, causal trace windows, measured experiment selection, retained repair obligations, source-bound review, budget/deadline controls and recoverable promotion.
+The proposal has been implemented in [fixers/autonomous](fixers/autonomous/README.md), including source snapshots, native Sonnet tools, conservative Jev relevance decisions, immutable composed fault probes, causal trace windows, measured experiment selection, retained repair obligations, captured intent, exact paired review, complete protocol context, actionable probe correction, budget/deadline controls and recoverable promotion.
 
-The combined fixer/grader gate passes 492 tests. The first frozen Linux image fixed 7/12 practice bugs after a B1 reporting namespace correction; its original report and separate reevaluation are retained. Later images reached 6/12, 4/12 and 7/12, motivating causal-evidence, memory, healthy-control ordering and replay-progress safeguards. The final reviewed `24e51ae` Linux image completed all six practice cases at **6/12 for $25.4619**, with every public-test and regression gate passing and no infrastructure errors or timeouts. It completed both independent labs at **4/4**. The chained fixtures also pass a separate offline 0 → 1 → 2 repair proof across 20 seeds per bug, healthy controls and deterministic repeats. Score and spend did not improve over the preceding image. See the [engineering review](fixers/autonomous/REVIEW.md) and [chained scenario instructions](fixers/autonomous/labs/README.md) for evidence and reproduction.
+The current `92b15ee` runtime passes **581 combined fixer/grader tests** and exact Linux module/dependency checks. Its A2/B2/B3 grading is in progress. The previous `24e51ae` image completed all six practice cases at **6/12 for $25.4619**, with every public-test and regression gate passing, and both independent labs at **4/4**. Earlier scores were 7/12, 6/12, 4/12 and 7/12; those trials motivated the evidence, memory, control and review corrections. The chained fixtures separately prove offline 0 → 1 → 2 repairs across 20 seeds per bug. See the [engineering review](fixers/autonomous/REVIEW.md) and [chained scenario instructions](fixers/autonomous/labs/README.md) for measured evidence and reproduction.
