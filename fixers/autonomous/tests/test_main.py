@@ -63,6 +63,76 @@ def test_compaction_enforces_total_serialized_bound(controller):
         assert len(json.dumps(compacted, ensure_ascii=False)) <= MAX_CONTEXT_CHARS
 
 
+def test_compaction_shrinks_static_context_before_losing_latest_native_finding(controller):
+    from fixer.main import COMPACT_CONTEXT_CHARS, MAX_CONTEXT_CHARS
+
+    current = controller.sources.candidate_hash
+    orientation = "Initial current facts: durable state belongs to the service. Source=" + current + "\n"
+    controller.initial_context = orientation + "i" * 90000
+    messages = [{"role": "user", "content": controller.initial_context}]
+    for number in range(2):
+        messages += [{"role": "assistant", "content": [{"type": "tool_use", "id": "old-" + str(number),
+                                                       "name": "read_file", "input": {"path": "src/service.py"}}]},
+                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "old-" + str(number),
+                                                   "content": "old observation " + "o" * 30000}]}]
+    finding = "The earlier enqueue theory was falsified; recovery omitted the durable marker."
+    latest = [{"role": "assistant", "content": [{"type": "text", "text": finding}, *[
+                {"type": "tool_use", "id": "current-" + str(number), "name": "read_file",
+                 "input": {"path": "src/service.py"}} for number in range(2)]]},
+              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "current-" + str(number),
+               "content": "current file evidence " + "r" * 26000 + " evidence end " + str(number)} for number in range(2)]}]
+    messages.extend(latest)
+    assert len(json.dumps(messages, ensure_ascii=False)) > MAX_CONTEXT_CHARS
+    # Static orientation plus this latest pair exceeds the soft target, while
+    # the complete pair and current ledger comfortably fit the hard cap.
+    assert len(controller.initial_context) + len(json.dumps(latest)) > COMPACT_CONTEXT_CHARS
+    compacted = compact_messages(controller, messages)
+    assert_native_pairs(compacted)
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= COMPACT_CONTEXT_CHARS
+    assert compacted[0]["content"].startswith(orientation)
+    assert "initial context truncated" in compacted[0]["content"]
+    assert compacted[1] == latest[0]
+    results = [block for block in compacted[2]["content"] if block["type"] == "tool_result"]
+    assert results == latest[1]["content"]
+    context = json.dumps(compacted, ensure_ascii=False)
+    assert finding in context and current in context and "known_failures_source_hash" in context
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_compaction_keeps_latest_pair_above_soft_target_and_adapts_next_turn(controller, force):
+    from fixer.main import COMPACT_CONTEXT_CHARS, MAX_CONTEXT_CHARS
+
+    orientation = "Current contract and source identity: " + controller.sources.candidate_hash + "\n"
+    controller.initial_context = orientation + "i" * 90000
+    finding = "The latest measured facts replace the previous causal explanation."
+    latest = [{"role": "assistant", "content": [{"type": "text", "text": finding}, *[
+                {"type": "tool_use", "id": "latest-" + str(number), "name": "trace_slice",
+                 "input": {"run_id": "current-run", "entities": ["job"]}} for number in range(5)]]},
+              {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "latest-" + str(number),
+               "content": "complete current trace " + "r" * 26000 + " trace end " + str(number)} for number in range(5)]}]
+    messages = [{"role": "user", "content": controller.initial_context}, *latest]
+    assert len(json.dumps(latest)) > COMPACT_CONTEXT_CHARS
+    compacted = compact_messages(controller, messages, force=force)
+    assert_native_pairs(compacted)
+    size = len(json.dumps(compacted, ensure_ascii=False))
+    assert COMPACT_CONTEXT_CHARS < size <= MAX_CONTEXT_CHARS
+    assert compacted[0]["content"].startswith(orientation)
+    assert compacted[1] == latest[0]
+    assert [block for block in compacted[2]["content"] if block["type"] == "tool_result"] == latest[1]["content"]
+    next_pair = [{"role": "assistant", "content": [{"type": "text", "text": "The next tool confirms the updated finding."},
+                  {"type": "tool_use", "id": "next-current", "name": "read_file", "input": {"path": "src/service.py"}}]},
+                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "next-current",
+                  "content": "next current source " + "s" * 31900 + " next source end"}]}]
+    grown = compacted + next_pair
+    assert len(json.dumps(grown, ensure_ascii=False)) > MAX_CONTEXT_CHARS
+    adapted = compact_messages(controller, grown)
+    assert_native_pairs(adapted)
+    assert len(json.dumps(adapted, ensure_ascii=False)) <= MAX_CONTEXT_CHARS
+    assert adapted[0]["content"].startswith(orientation)
+    assert adapted[-2] == next_pair[0]
+    assert [block for block in adapted[-1]["content"] if block["type"] == "tool_result"] == next_pair[1]["content"]
+
+
 @pytest.mark.parametrize("full_repair", [True, False])
 def test_compaction_retains_pending_diagnosis_review_gap_and_source_bound_results(controller, full_repair):
     from fixer.main import MAX_CONTEXT_CHARS

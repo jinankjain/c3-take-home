@@ -318,7 +318,8 @@ def compact_messages(controller: Controller, messages: list[dict], *, force: boo
     if size <= MAX_CONTEXT_CHARS and not force:
         return expanded if extra_text else messages
     # Retain only complete assistant/user pairs, including every native tool
-    # result for a retained tool_use block. Initial context remains stable.
+    # result for a retained tool_use block. Static context can shrink to keep
+    # the latest finding and its complete native response together.
     pairs = []
     cursor = len(messages) - 1
     while cursor >= 1 and len(pairs) < (2 if force else 4):
@@ -353,31 +354,38 @@ def compact_messages(controller: Controller, messages: list[dict], *, force: boo
              initial_chars=initial_limit, cancelled=cancelled)
         return result
 
-    # Leave headroom for new tool results. The target is soft when the fixed
-    # context and source-bound ledger alone exceed it; preserve those facts.
-    # There are at most four pairs, so this adaptation cannot spin indefinitely.
+    # Drop older pairs for headroom, then shrink static orientation before
+    # considering the latest pair. Fresh reasoning must survive compaction.
     for _ in range(len(pairs) + 1):
         if stopped():
             cancelled = True
             pairs.clear()
             initial_limit = 0
         result, final_size = compose(initial_limit)
-        if final_size <= COMPACT_CONTEXT_CHARS or not pairs:
+        if final_size <= COMPACT_CONTEXT_CHARS or len(pairs) <= 1:
             break
         pairs.pop(0)
-    if final_size <= MAX_CONTEXT_CHARS:
+    if final_size <= COMPACT_CONTEXT_CHARS:
         return finish(result, final_size)
 
-    # JSON escaping can multiply initial-context size. Use finite prefix steps
-    # and the absolute bound rather than relying on a minimum-prefix loop.
-    for initial_limit in (64_000, 48_000, 32_000, 16_000, 8_000, 4_000, 1_000, 0):
-        initial_limit = min(initial_limit, len(controller.initial_context))
-        if stopped():
-            cancelled = True
-            initial_limit = 0
-        result, final_size = compose(initial_limit)
-        if final_size <= MAX_CONTEXT_CHARS:
-            return finish(result, final_size)
+    # The latest complete pair and source ledger may need more than the soft
+    # target. Preserve them whenever their minimum envelope fits the hard cap.
+    # Two bounded passes handle an oversized last pair and unusual escaping.
+    for _ in range(2):
+        _, minimum_size = compose(0)
+        target = COMPACT_CONTEXT_CHARS if minimum_size <= COMPACT_CONTEXT_CHARS else MAX_CONTEXT_CHARS
+        for initial_limit in (90_000, 64_000, 48_000, 32_000, 16_000, 8_000, 4_000, 1_000, 0):
+            initial_limit = min(initial_limit, len(controller.initial_context))
+            if stopped():
+                cancelled = True
+                pairs.clear()
+                initial_limit = 0
+            result, final_size = compose(initial_limit)
+            if final_size <= target:
+                return finish(result, final_size)
+        if not pairs:
+            break
+        pairs.clear()  # Only a pair that cannot fit the absolute cap is lost.
 
     # The normal ledger is bounded before outer serialization. Keep a final
     # source/verdict fallback for unusual escaped metadata or changed limits.
