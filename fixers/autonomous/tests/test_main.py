@@ -209,6 +209,25 @@ def test_compaction_retains_pending_diagnosis_review_gap_and_source_bound_result
         assert "OWNERSHIP_BROKEN = False" in ledger["pending_diff"]
 
 
+def test_compaction_retains_a_corrected_older_finding_after_more_current_source_findings(controller):
+    original_theory = "The operation identity is missing."
+    correction = "Identity evidence is present; the recovery transition omits pending work."
+    controller.record_hypothesis({"id": "active-recovery", "obligation": "Recover durable pending work.",
+                                  "mechanism": original_theory, "evidence": ["src/service.py:1"]})
+    for number in range(7):
+        controller.record_hypothesis({"id": "other-" + str(number), "obligation": "Other open obligation.",
+                                      "mechanism": "Investigate a different transition.", "evidence": ["src/service.py:2"]})
+    controller.record_hypothesis({"id": "active-recovery", "obligation": "Recover durable pending work.",
+                                  "mechanism": correction, "evidence": ["src/service.py:3"]})
+
+    ledger = json.loads(prompt_status(controller))
+    assert len(ledger["hypotheses"]) == 6
+    assert any(row["mechanism"] == correction for row in ledger["hypotheses"])
+    compacted = compact_messages(controller, [{"role": "user", "content": "Earlier uncertain finding."}], force=True)
+    compact_text = json.dumps(compacted)
+    assert correction in compact_text and original_theory not in compact_text
+
+
 def test_compaction_bounds_escaped_hypothesis_metadata_without_losing_source_identity(controller):
     from fixer.main import MAX_CONTEXT_CHARS, MAX_LEDGER_CHARS
 

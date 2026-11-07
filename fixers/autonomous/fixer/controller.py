@@ -638,6 +638,8 @@ class Controller:
             raise ValueError("hypothesis id must be a short identifier")
         if name not in self.hypotheses and len(self.hypotheses) >= 32:
             raise ValueError("hypothesis limit reached; update an existing hypothesis")
+        # Corrected findings must remain visible in the bounded recent ledger.
+        self.hypotheses.pop(name, None)
         self.hypotheses[name] = {**args, "source_hash": self.sources.candidate_hash}
         emit("hypothesis", **self.hypotheses[name])
         return self.hypotheses[name]
