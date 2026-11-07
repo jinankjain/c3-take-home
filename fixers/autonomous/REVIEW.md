@@ -2,9 +2,9 @@
 
 ## Scope and reviewed version
 
-Reviewed runtime revision **`92b15ee`**: source staging and promotion, process limits, native model messages, budget accounting, corpus retrieval, causal simulator evidence, healthy controls, experiment selection, diagnostic probes, cached replay progress, captured repair intent, paired review evidence, protocol source context, acceptance and image invocation. Independent source reviews were combined with invented services, local fake proxies and saved practice-run artifacts. Earlier scored images remain separately recorded below.
+Reviewed frozen runtime **`61528e08c958ea73006139364f953994dd986a1a`**: source staging and promotion, process limits, native model messages, budget accounting, corpus retrieval, causal simulator evidence, healthy controls, experiment selection, diagnostic probes, cached replay progress, captured repair intent, paired review evidence, protocol source/writer context, nonpromoting regression diagnosis, acceptance and image invocation. Independent source reviews were combined with invented services, local fake proxies and saved practice-run artifacts. Earlier scored images remain separately recorded below.
 
-The current combined gate passed **581 tests in 127.03 seconds** (548 fixer and 33 grader checks). Its `linux/amd64` image imported all 17 runtime modules, loaded pinned dependencies and matched the tested checkout's module hashes. The saved image is 50,569,728 bytes; identity and test evidence are at `results/artifacts/c3-fixer-autonomous-92b15ee-linux-amd64.json` and `results/artifacts/combined-tests-92b15ee.json`. A2/B2/B3 grading is running at `results/autonomous-targeted-r6`; its score is pending. The previous `24e51ae` image scored **6/12 for $25.4619** and **4/4 lab bugs for $0.711097**. Those evaluations and their independent audits remain preserved.
+The current combined gate passed **627 tests in 154.09 seconds** (594 fixer and 33 grader checks). Its `linux/amd64` image imported all 17 runtime modules, loaded pinned dependencies and matched the tested checkout's module hashes. The saved tarball is 50,575,872 bytes; identity and test evidence are at `results/artifacts/c3-fixer-autonomous-61528e0-linux-amd64.json` and `results/artifacts/combined-tests-61528e0.json`. The newest official R7 B2 run scored **0/3 for $9.012503**, restoring original source. There is no R7 six-case or lab score; B3 has not run and remains pending funding. R6 `92b15ee` completed four cases at **7/10 for $14.766536**. The last full six-case image, R5 `24e51ae`, scored **6/12 for $25.461865**, and its separate labs scored **4/4 for $0.711097**. These results are not aggregated across runtime versions.
 
 ## Principal findings and fixes
 
@@ -29,13 +29,15 @@ The current combined gate passed **581 tests in 127.03 seconds** (548 fixer and 
 | Same-seed experiments with different scenarios could be treated as before/after controls. | `65a67fd` joins by scenario hash, effective fault hash and seed, verifies source identities and retained obligations, and emits one paired table with host-computed resolved/remaining/new failures. Native regression claims require an actual matched passing-control regression or lost obligation. Factual protocol errors remain blocked and can receive at most one same-source correction; legitimate source blockers survive malformed extra citations. |
 | Diff excerpts omitted unchanged receivers needed to assess a protocol repair. | `a7b030f` supplies complete changed functions and bounded relevant callers, receivers and helpers, with exact paths, line spans, file hashes, completeness and omission labels. Anchored regular-file reads, cancellation and scan/AST/selection limits bound work. A saved B2 check includes the unchanged acknowledgement receiver within the 24,000-character packet. |
 | Fault composition exposed one opaque conflict at a time and lost the failed attempt's useful context. | `41d7ee9` reports bounded exact conflicting paths and value previews before publishing anything. `92b15ee` retains bounded resolved bases and source-bound correction details for a second explicit attempt within the existing caps. An actual-controller regression exercises conflict, explicit override and identical paired replays while preserving the previous review rejection. |
+| A returned protocol field could be reviewed without its runtime writer. | R7 source context follows bounded same-class producers, instance-field aliases, runtime writers and initialization. Receiver rebinding and uncertain ownership do not establish a writer claim; AST/read/graph limits disclose omissions. The saved R6 B2 review reconstruction now includes complete producer, runtime writer and initializer bodies within 23,460 serialized characters. Synthetic checks cover shadowing, destructuring, loops, deletion, nested scopes, analysis limits, cancellation and selection priority. This establishes context coverage, not a correct repair. |
+| A real passing-control regression ended validation before independent causal feedback. | R7 offers one diagnostic-only native consultation when exact source/input/checker certificates, trace hashes, time and request-plus-feedback funds permit it. The selected before/after traces share one primary pair; mixed protected-obligation loss cannot redirect its causal windows. An approving response, invalid evidence, cancellation or unavailable review cannot authorize promotion or replace the matrix rejection. Actual-controller checks exercise exact references, one-call caching, changed-source isolation, malformed/symlink traces, protected budgets and compaction. |
 
 ## Independent checks
 
-The combined count below describes the reviewed `92b15ee` checkout. Historical focused checks identify their own scopes and may overlap. The earlier R3 gate independently passed 453 tests in 100.91 seconds; the R5 gate passed 492 in 106.8 seconds.
+The combined count below describes the frozen `61528e0` checkout. Historical focused checks identify their own scopes and may overlap. R3 passed 453 tests in 100.91 seconds, R5 passed 492 in 106.8 seconds, and R6 passed 581 in 127.03 seconds.
 
-- **581 passing tests:** 548 fixer tests and 33 grader reporting tests, run together with `.venv/bin/python -m pytest -q fixers/autonomous/tests grader/tests`.
-- New followup regressions cover exact review pairing, typed blockers and bounded correction, complete protocol context, captured edit intent and stale-source isolation, probe correction and canonical evidence through compaction. Independent source reviews found no release blocker; paid current-image repair coverage is still being measured.
+- **627 passing tests:** 594 fixer tests and 33 grader reporting tests, run together with `.venv/bin/python -m pytest -q fixers/autonomous/tests grader/tests`.
+- R7 focused checks include **21 diagnostic-controller tests** and **47 source-context tests**, plus source-bound diagnostic-ledger regressions. Independent implementation reviews are complete. The exact image/export checks passed; the newest paid B2 result failed to accept a repair and does not demonstrate improved accuracy.
 - **87 relevance/retrieval tests** and **47 existing model tests** checked typed decisions, cache identity, protected evidence, shared charges, optional-route failures, cancellation and resource limits.
 - **35 native review tests** checked that parsing requires one native decision, candidate binding, strict types/fields, contradictory blockers and rejection of partial repairs.
 - **34 validation/experiment tests** checked effective names, mandatory partial obligations, immutable inputs, zero-cost cached results and insufficient-time rejection.
@@ -125,7 +127,7 @@ Commit `24e51ae` counts cached replay retrieval as information using controller-
 
 ## Fifth-image observations
 
-The completed `24e51ae` run fixed **6/12 bugs**, spending **$25.4619** over **2,798.7 cumulative fixer seconds** and **1,569.8 grading seconds**. All six fixers exited successfully; every public test and private regression gate passed, with no timeout or infrastructure error. This scored one fewer bug than R4 at higher spend. These individual stochastic runs do not establish a general accuracy, cost or latency improvement.
+The completed `24e51ae` run fixed **6/12 bugs**, spending **$25.461865** over **2,798.7 cumulative fixer seconds** and **1,569.8 grading seconds**. All six fixers exited successfully; every public test and private regression gate passed, with no timeout or infrastructure error. This scored one fewer bug than R4 at higher spend. These individual stochastic runs do not establish a general accuracy, cost or latency improvement.
 
 | Case | Bugs | Fixer seconds | Proxy spend | Public / private baseline |
 | --- | --- | --- | --- | --- |
@@ -154,6 +156,29 @@ R5 source review, the 492-test gate, exact-image imports/hash checks, export, gr
 
 Offline regressions establish controller and protocol behavior. The grader's private tests, 20-seed bug evaluations and reference-based goodput checks establish practice coverage; unseen-service performance remains a separate evaluation.
 
-## Sixth-image implementation checks
+## Sixth-image observations
 
-The frozen `92b15ee` runtime passed the complete 581-test gate and exact Linux module/dependency/export checks. Its followup targets the six unresolved R5 bugs across A2, B2 and B3; those cases contain seven bugs in total, including B2's earlier repair. The new proxy has a fresh state directory and a $27 cap within the remaining $27.666117606 provider allowance. These implementation checks establish workflow behavior; current-image accuracy and paid review/probe behavior require the running grader results.
+The `92b15ee` image completed the targeted A2/B2/B3 run and a separate A3 run: **7/10 bugs for $14.766536** across those four cases. Every public/regression gate passed; there were no infrastructure errors or timeouts. This is a four-case subset, not a full six-case result.
+
+| Case | Bugs | Fixer seconds | Proxy spend | Public / private baseline |
+| --- | --- | --- | --- | --- |
+| A2 | 2/2 | 426.562 | $3.599011 | Pass / pass |
+| A3 | 3/3 | 231.418 | $1.346103 | Pass / pass |
+| B2 | 2/3 | 481.197 | $3.819424 | Pass / pass |
+| B3 | 0/2 | 507.954 | $6.001998 | Pass / pass |
+
+**A2 and A3:** all repaired bugs passed 20/20 grading seeds. A2 promoted a reviewed partial repair and then a full repair, with matching native, installed, final and evaluated source hashes. Both reviews used 15 exact experiment pairs. It completed no constructed diagnostic or factual-reference correction. A3 also submitted source that passed all three bugs. Their success is measured on this version; it does not isolate the effects of individual runtime changes.
+
+**B2 and B3:** B2 repaired bugs 1 and 3 across all 20 seeds, while bug 2 remained 0/20 despite a full passing local matrix. A saved review-packet reconstruction identified an omitted runtime writer of a returned protocol field, motivating R7's generic writer-context expansion. B3 never promoted a repair: its candidate regressed an original-pass retained control and was rejected before native acceptance review. One constructed accepted/candidate probe pair later passed on both sources but did not clear that earlier regression. The model made no further repair before exhausting its case funds.
+
+Results are at `results/autonomous-targeted-r6` and `results/autonomous-retained-A3-r6`; independent A/B audits are under `results/artifacts/image-r6-audit-*.json`. The historical labs remain on their recorded older images and were not rerun on R6.
+
+## Seventh-image observations and remaining limits
+
+The frozen **`61528e0`** image completed only the official B2 trial: **0/3 for $9.012503** in **694.757 seconds**. All three bugs passed 0/20 grading seeds. Public and private baseline gates passed, without a timeout or infrastructure error, but no source repair was accepted; original source was restored and the official patch was empty. The newest measured trial therefore did not retain R6 B2's repair coverage. R7 has no all-six practice percentage or current-image lab result.
+
+A separate **free posthoc evaluation** of the preserved, unaccepted candidate scored **1/3**, with bug 3 passing 20/20 and bugs 1/2 passing 0/20. All 29 public and 40 private tests passed. Its source hash stayed `5d73da23dd74cc0990f8403191178eaadd93e15eb2d46a5aa91923e4eef0748d` throughout that evaluation. This evaluates staged source on the host after the fixer exited; it is not an autonomous image acceptance or official score. Evidence is at `results/offline-candidate-r7-B2/{eval,verification,command}.json`; official results remain at `results/autonomous-targeted-r7-B2`.
+
+R7's diagnostic consultation and producer/writer extraction are implemented, source-reviewed and covered by the 627-test gate. A read-only R6 B3 guard check found matching source/input identities and trace SHA certificates, 5.91 MB of selected traces below the 32 MiB cap, and adequate time/funds at the first rejection. It made no model request or new replay and cannot establish the usefulness of independent advice. Saved failed-tool logs omit some error details, limiting reconstruction; improved failure telemetry remains future work.
+
+The provider ledger at 09:16:37 UTC records **$146.112922194 used of $150**, leaving **$3.887077806**. The followup cap has **$3.220961** remaining. R7 B3's full $6 allocation cannot fit either balance, so that trial remains pending funding; no paid work was added. Generic handoff source/log/manifest files are refreshed after this documentation commit while preserving `history-24e51ae`; all 17 runtime modules must continue to match frozen `61528e0`. Further evaluation should measure unfamiliar contracts and controlled variants without treating implementation tests, rejected-source grading or earlier-version successes as current accuracy.

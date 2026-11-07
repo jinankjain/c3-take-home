@@ -42,7 +42,9 @@ flowchart TD
     Tools --> Candidate[Staged source candidate]
     Candidate --> Validation[Tests, invariant checks, and determinism]
     Validation --> Ledger
-    Validation --> Promotion[Promote an accepted repair]
+    Validation -->|Gates pass| Promotion[Promote an accepted repair]
+    Validation -->|Passing-control regression| Diagnosis[Bounded independent diagnosis]
+    Diagnosis --> Ledger
     Promotion --> Live[Live workspace src]
     Promotion --> Evidence
 ```
@@ -70,7 +72,7 @@ candidate change
 validation evidence and remaining uncertainty
 ```
 
-A separate review call can inspect a risky protocol change when resources allow. Start with one agent and add runtime delegation only if practice measurements show a benefit. One edit owner keeps candidates consistent and avoids duplicated context costs.
+A separate native review call examines candidates before acceptance; partial repairs require a valid review. A first matched passing-control regression can also receive one diagnostic consultation when resources allow. Its advice returns to the same repair agent and cannot change the matrix rejection. One edit owner keeps candidates consistent and avoids duplicated context costs.
 
 ### Tool interface
 
@@ -189,9 +191,11 @@ Validate candidates in a separate case tree containing real copies of unchanged 
 
 Freeze a candidate while validation runs and attach every result to its source hash. Further edits create a new candidate; results from another source version cannot satisfy its gates.
 
-Capture the edit's intended mechanism and targeted reproductions against its before/after source hashes. Automatic validation must recover that same intent. Present independent review with exact before/after pairs keyed by scenario hash, effective fault hash and seed, plus host-computed resolved, remaining and newly observed failures. Include complete changed functions and relevant unchanged callers, receivers and helpers within bounded source context, with explicit omissions.
+Capture the edit's intended mechanism and targeted reproductions against its before/after source hashes. Automatic validation must recover that same intent. Present independent review with exact before/after pairs keyed by scenario hash, effective fault hash and seed, plus host-computed resolved, remaining and newly observed failures. Include complete changed functions and relevant unchanged callers, receivers and helpers within bounded source context, with explicit omissions. For returned instance fields, include same-class producers, runtime writers and initialization bodies when the bounded static analysis can establish their relationship. Rebound or uncertain receivers cannot establish an instance-writer claim.
 
 Native blockers distinguish actual regression, source defect and unverified repair. Validate cited regression facts against matched passing controls and retained obligations. An invalid factual claim remains blocked and can receive one source-bound correction; legitimate source blockers retain their effect. This provides actionable feedback while preserving partial-repair review and mandatory regression gates.
+
+The first valid passing-control regression can receive a separate `regression_diagnostic`. Validate registered source/input/checker certificates and rehash the selected before/after traces, reading at most 32 MiB. Its native request uses the same captured intent, paired facts and source context, with causal excerpts focused on that exact regressing pair. The result is `diagnostic_only`, reports `completed`, `skipped` or `failed`, and never authorizes promotion. Native approval, unavailable review and malformed evidence leave the regression rejection intact. Cache advice only for identical source and experiment identities; a different candidate receives an explicit skipped record rather than advice from an older source.
 
 Run gates in increasing cost order:
 
@@ -231,6 +235,8 @@ Start with an adaptive schedule rather than fixed iteration counts:
 | Final validation, rollback allowance, cleanup | Reserve 90–120 seconds, increased for slow tests |
 
 Stop launching an operation when its measured duration plus finalization reserve cannot fit. Exit early when the validation plan is complete and no supported hypothesis remains. Keep roughly 20% of the model budget available for late corrective work until finalization begins.
+
+An optional regression diagnosis must leave time for final verification, a later correction/validation and 30 seconds of primary-agent feedback. Include installation allowance once in the protected final reserve. Reserve its native request's estimated spend plus at least the greater of $0.25 or that same estimate for the primary agent. Unavailable estimates, invalid provenance or cancellation skip the consultation explicitly. A completed consultation is model advice, not a new simulator measurement.
 
 Use the Anthropic Messages API through `ANTHROPIC_BASE_URL`, pin Sonnet to the allowed model, and use `JEV_DECISIONS_URL` for Jev. Local custom tools fit the proxy rules. Validate returned tool arguments rather than depending on unsupported response-format fields.
 
@@ -286,6 +292,8 @@ Grade the exact final image on every practice case. Prepare the half-page write-
 
 This proposal is based on static review of [README.md](README.md), [RULES.md](RULES.md), the [minimal fixer](fixers/examples/minimal-llm/fix.py), [proxy behavior](proxy/server.py), the [corpus index](corpus/build/practice/INDEX.md), and public practice source, simulator interfaces, and current runbooks.
 
-The proposal has been implemented in [fixers/autonomous](fixers/autonomous/README.md), including source snapshots, native Sonnet tools, conservative Jev relevance decisions, immutable composed fault probes, causal trace windows, measured experiment selection, retained repair obligations, captured intent, exact paired review, complete protocol context, actionable probe correction, budget/deadline controls and recoverable promotion.
+The proposal has been implemented in [fixers/autonomous](fixers/autonomous/README.md), including source snapshots, native Sonnet tools, conservative Jev relevance decisions, immutable composed fault probes, causal trace windows, measured experiment selection, retained repair obligations, captured intent, exact paired review, bounded protocol producers and state writers, diagnostic-only feedback after a passing-control regression, actionable probe correction, budget/deadline controls and recoverable promotion.
 
-The current `92b15ee` runtime passes **581 combined fixer/grader tests** and exact Linux module/dependency checks. Its A2/B2/B3 grading is in progress. The previous `24e51ae` image completed all six practice cases at **6/12 for $25.4619**, with every public-test and regression gate passing, and both independent labs at **4/4**. Earlier scores were 7/12, 6/12, 4/12 and 7/12; those trials motivated the evidence, memory, control and review corrections. The chained fixtures separately prove offline 0 → 1 → 2 repairs across 20 seeds per bug. See the [engineering review](fixers/autonomous/REVIEW.md) and [chained scenario instructions](fixers/autonomous/labs/README.md) for measured evidence and reproduction.
+The frozen **`61528e0`** runtime passes **627 combined tests** (594 fixer and 33 grader checks) in 154.09 seconds; all 17 runtime modules match its exact `linux/amd64` image. Its newest official B2 run scored **0/3 for $9.012503**, taking 694.757 seconds and restoring original source. Public and private regression gates passed. R7 B3 has not run: its full $6 allocation cannot fit the remaining provider balance of $3.887077806 or the followup cap balance of $3.220961. There is no R7 six-case or lab score, and these implementation changes have not demonstrated improved accuracy.
+
+The previous **`92b15ee`** image completed four cases: A2 2/2, A3 3/3, B2 2/3 and B3 0/2, totaling **7/10 for $14.766536** with every baseline gate passing. That subset is not a six-case score. The last complete six-case run, **`24e51ae`**, scored **6/12 for $25.461865** and passed all baseline gates; its separate labs scored **4/4**. Those lab results do not apply to the newest image. A free posthoc evaluation of the unaccepted R7 B2 candidate scored **1/3**, separately from the autonomous official 0/3 result. See the [engineering review](fixers/autonomous/REVIEW.md) for exact versions, observations and limitations, and the [chained scenario instructions](fixers/autonomous/labs/README.md) for the independent offline 0 → 1 → 2 proof across 20 seeds per bug.
