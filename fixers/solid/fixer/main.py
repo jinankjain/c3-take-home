@@ -22,6 +22,8 @@ from .tools import Tools
 BASE_EXTRA_SEEDS = 15          # seeds beyond the public ones in baseline and checkpoints
 VERIFY_SEEDS = list(range(2000, 2015))
 MAX_VERIFY_ROUNDS = 2
+REVIEW_MAX_TURNS = 6           # the coverage review is a sanity pass, not a second investigation
+REVIEW_MAX_S = 150
 BUDGET_STOP_FRACTION = 0.85
 COVERAGE_REVIEW = (
     "Before finishing, check ticket coverage. For EACH item or symptom in SYMPTOM.md, name the run "
@@ -31,7 +33,9 @@ COVERAGE_REVIEW = (
     "block that counts it (rpc_requests_max for an RPC, log_events_max for a log event), under the "
     "conditions the ticket describes, confirm it fails on the original "
     "code, fix until it passes, and checkpoint. If every item is already covered, reply with the "
-    "mapping and call done() again.")
+    "mapping and call done() again. Keep this short (at most a few turns): a run that fails on the "
+    "original code and passes now is enough, even if other bugs also made it fail; do not spend "
+    "turns isolating each check once the item's root cause is fixed.")
 FINAL_RESERVE_S = 20           # time kept back to restore src/ and exit
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 T0 = time.time()
@@ -231,8 +235,17 @@ def main() -> int:
                "symptom, until it fails on the original code. Then diagnose and fix everything. "
                + orch.status_line())
         verifies = 0
+        limits: dict = {}
         for _ in range(MAX_VERIFY_ROUNDS + 4):        # bounded: also re-entered for checkpoint/coverage
-            why = agent.run(msg)
+            why = agent.run(msg, **limits)
+            limits = {}
+            if why == "limit":                         # coverage review ran long: keep what is accepted
+                log("coverage review hit its cap; moving on to verification")
+                if orch.src_dirty() and orch.time_left() > orch.check_cost_s + FINAL_RESERVE_S:
+                    orch.checkpoint()
+                if orch.src_dirty():
+                    orch.restore_last_good()
+                why = "done"
             if why != "done" or orch.should_stop():
                 break
             if orch.src_dirty():
@@ -244,6 +257,7 @@ def main() -> int:
                 orch.coverage_reviewed = True
                 tools.done_summary = None
                 msg = (COVERAGE_REVIEW + "\n" + orch.status_line())
+                limits = {"max_turns": REVIEW_MAX_TURNS, "max_seconds": REVIEW_MAX_S}
                 continue
             if verifies == MAX_VERIFY_ROUNDS:
                 break

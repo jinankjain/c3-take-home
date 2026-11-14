@@ -25,12 +25,18 @@ class Agent:
         self.turns = 0
 
     # ------------------------------------------------------------------ public
-    def run(self, user_text: str) -> str:
+    def run(self, user_text: str, max_turns: int | None = None, max_seconds: float | None = None) -> str:
         """Run until done(), a stop condition, or the model stops calling tools.
-        Returns why it stopped: done | stopped | budget | error | idle."""
+        Returns why it stopped: done | stopped | budget | error | idle | limit (max_turns/max_seconds)."""
         self.messages.append({"role": "user", "content": [{"type": "text", "text": user_text}]})
         nudges = errors = 0
+        t_start, turns_start = time.time(), self.turns
         while True:
+            if (max_turns is not None and self.turns - turns_start >= max_turns) or (
+                    max_seconds is not None and time.time() - t_start >= max_seconds):
+                self.log(f"agent: phase limit reached ({self.turns - turns_start} turns, "
+                         f"{time.time() - t_start:.0f}s)")
+                return "limit"
             reason = self.orch.should_stop()
             if reason:
                 self.log(f"agent: stopping ({reason})")
