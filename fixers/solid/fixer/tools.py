@@ -23,7 +23,7 @@ SCHEMAS = [
          "path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}},
          "required": ["path"]}},
     {"name": "grep",
-     "description": "Regex search (extended grep). where: src | logs | corpus (service + platform docs) | "
+     "description": "Regex search (extended regex; use | for alternation). where: src | logs | corpus (service + platform docs) | "
                     "background (research papers, slow, rarely useful) | scenarios | sim. Max 60 hits.",
      "input_schema": {"type": "object", "properties": {
          "pattern": {"type": "string"}, "where": {"type": "string"},
@@ -43,7 +43,7 @@ SCHEMAS = [
          "scenario": {"type": "string"}, "seeds": {"type": "string"}, "faults": {"type": "string"}},
          "required": ["scenario", "seeds"]}},
     {"name": "trace_query",
-     "description": "Replay one seed with the CURRENT code and return matching lines from its node logs "
+     "description": "Replay one seed with the CURRENT code and return lines matching a Python regex (use | for alternation) from its node logs "
                     "(source: logs) or its trace.jsonl (source: trace). Use a key/job/op id as pattern.",
      "input_schema": {"type": "object", "properties": {
          "scenario": {"type": "string"}, "seed": {"type": "integer"}, "faults": {"type": "string"},
@@ -78,6 +78,12 @@ SCHEMAS = [
 
 def _clip(s: str, n: int = MAX_OUT) -> str:
     return s if len(s) <= n else s[: n // 2] + f"\n... [{len(s) - n} chars cut] ...\n" + s[-n // 2:]
+
+
+def normalize_pattern(pattern: str) -> str:
+    """Models often write grep BRE alternation (`a\\|b`); in extended/Python regex that is a literal
+    pipe and silently matches nothing. Treat it as alternation (a literal pipe is rare in these logs)."""
+    return pattern.replace("\\|", "|")
 
 
 def parse_seeds(spec: str, cap: int = 60) -> list[int]:
@@ -157,7 +163,7 @@ class Tools:
         cmd = ["grep", "-rnE", "-I", "--exclude-dir=__pycache__", "-m", "20"]
         if ignore_case:
             cmd.append("-i")
-        cmd += ["-e", pattern] + [str(r) for r in roots if r.exists()]
+        cmd += ["-e", normalize_pattern(pattern)] + [str(r) for r in roots if r.exists()]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if p.returncode == 2:
             return f"error: {p.stderr.strip()[:300]}"
@@ -223,7 +229,7 @@ class Tools:
             p = subprocess.run(cmd, cwd=self.ws, capture_output=True, text=True, timeout=300)
             if p.returncode != 0:
                 return f"replay failed: {(p.stderr or p.stdout)[-600:]}"
-        rx = re.compile(pattern)
+        rx = re.compile(normalize_pattern(pattern))
         files = [out / "trace.jsonl"] if source == "trace" else sorted((out / "logs").glob("*.log"))
         hits = []
         for f in files:
