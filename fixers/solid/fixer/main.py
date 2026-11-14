@@ -33,16 +33,19 @@ REVIEW_MAX_TURNS = 6           # the coverage review is a sanity pass, not a sec
 REVIEW_MAX_S = 150
 BUDGET_STOP_FRACTION = 0.85
 COVERAGE_REVIEW = (
-    "Before finishing, check ticket coverage. For EACH item or symptom in SYMPTOM.md, name the run "
-    "(scenario, plus fault file if any) that FAILED on the original code because of it and passes now. "
-    "A symptom that no invariant or expect check catches (e.g. 'X keeps happening', 'too many Y', "
-    "'Z gets cancelled') is not covered just because the runs are green: write_scenario with an expect "
-    "block that counts it (rpc_requests_max for an RPC, log_events_max for a log event), under the "
-    "conditions the ticket describes, confirm it fails on the original "
-    "code, fix until it passes, and checkpoint. If every item is already covered, reply with the "
-    "mapping and call done() again. Keep this short (at most a few turns): a run that fails on the "
-    "original code and passes now is enough, even if other bugs also made it fail; do not spend "
-    "turns isolating each check once the item's root cause is fixed.")
+    "Before finishing, check ticket coverage. Reply with one line per item or symptom in SYMPTOM.md: "
+    "item -> kind -> evidence.\n"
+    "- kind 'liveness/correctness' (stuck, never finishes, wrong or missing result, invariant "
+    "violation): evidence is a run that failed on the original code and passes now; it is fine if "
+    "other bugs also made that run fail.\n"
+    "- kind 'unwanted event' (something happens that should not: re-queued, cancelled, retried, "
+    "registered again, too many X): a run that failed for other reasons does NOT count. Evidence must "
+    "be a scenario under the conditions the ticket describes whose expect block counts that event "
+    "(rpc_requests_max for an RPC, log_events_max for a log event; usually max 0), that fails on the "
+    "original code and passes now. If you have none, write_scenario now, fix until it passes, and "
+    "checkpoint.\n"
+    "When every item has evidence, call done() again. Do not spend turns isolating checks for items "
+    "that already have evidence.")
 FINAL_RESERVE_S = 20           # time kept back to restore src/ and exit
 QUICK_CHECK_MIN_S = 45         # time needed for the short end-of-run check (tests + public seeds)
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
@@ -87,6 +90,7 @@ class Orchestrator:
         self._safety_state: str | None = None           # src/ state the safety checkpoint last saw
         self._dirty_since: float | None = None           # when src/ last got unchecked edits...
         self._dirty_turns = 0                            # ...and how many agent turns ago
+        self.open_bug: str | None = None                 # a scenario that reproduces and still fails
         self.seeds = self.gate.seeds(MAX_EXTRA_SEEDS)     # resized in bootstrap() to the machine
         self.baseline: Summary | None = None
         self.accepted: Summary | None = None
@@ -227,6 +231,13 @@ class Orchestrator:
             names.append(name)
         return names
 
+    def note_open_bug(self, name: str):
+        """An agent scenario reproduces on the original code and still fails on the current code:
+        there is real work left, so a phase cap (the coverage review) must not cut it off."""
+        if self.open_bug is None:
+            log(f"open bug found: scenario {name} fails on the original and the current code")
+        self.open_bug = name
+
     def probe_scenario(self, name: str, seeds: list[int]):
         """Run a freshly written scenario on the original code and on the current code."""
         shutil.copy(self.ws / "scenarios" / f"{name}.yaml", self.pristine / "scenarios" / f"{name}.yaml")
@@ -250,6 +261,10 @@ class Orchestrator:
             self.snapshot()
             self.accepted = v.summary
             self.accepted_count += 1
+            ob = v.summary.by_label().get(self.open_bug) if self.open_bug else None
+            if ob is not None and not ob.failed:
+                log(f"open bug {self.open_bug} now passes")
+                self.open_bug = None
             left = [r for r in v.summary.runs if r.failed]
             tail = ("\nStill failing; keep fixing:\n" + "\n".join(r.line() for r in left)) if left else \
                 "\nAll checked runs pass. Consider whether the ticket describes anything not yet covered."

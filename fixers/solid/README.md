@@ -16,8 +16,11 @@ budget and the last accepted `src/`. The model proposes edits; deterministic cod
 3. **Acceptance check** (`simgate.py`, on `checkpoint()`): compiles, public tests pass, deterministic
    replays, no run that was clean at baseline now fails, messages <= 2x baseline, and fewer failures
    than the last accepted state, including on the agent's own scenarios. Only accepted code is kept.
-4. **Coverage review and verification:** the first `done()` asks for an item-by-item coverage map; then
-   a sweep on unseen seeds sends the agent back if anything still fails.
+4. **Coverage review and verification:** the first `done()` asks for an item-by-item coverage map. An
+   "unwanted event" item (spurious cancel, re-queue, retry) needs a scenario that counts the event; a
+   run failing for other reasons doesn't count. The review is capped (6 turns / 150 s) unless it finds
+   a scenario that fails on both the original and the current code. Then a sweep on unseen seeds sends
+   the agent back if anything still fails.
 5. **Keeping partial progress:** when time runs short and `src/` holds unchecked edits, the orchestrator
    checkpoints them itself. At the end, unchecked edits get the full check if it fits, else a quick check
    (compile, public tests, determinism, public seeds better than the last accepted state), else they are
@@ -54,8 +57,9 @@ python fixers/solid/testdata/run_scripted.py A1 A1-fix            # scripted age
 ```
 
 Scripts in `testdata/scripts/` cover the happy path, bad edits, test-breaking patches, unchecked
-`done()`, budget exhaustion, model errors, broken scenarios, the coverage-review cap, the scenario
-workflow and the safety checkpoint (`A1-no-checkpoint`, run with `--deadline-s 140`).
+`done()`, budget exhaustion, model errors, broken scenarios, the coverage-review cap (and lifting it
+when the review turns up a scenario that still fails, `B2-review-open-bug`), the scenario workflow and
+the safety checkpoint (`A1-no-checkpoint`, run with `--deadline-s 140`).
 `test_end_of_run.py` checks the end-of-run quick check keeps a real partial fix and rolls back
 test-breaking or no-progress edits. `testdata/claude_p_shim.py` is a
 local stand-in upstream for the proxy backed by the `claude -p` CLI (testing only; slower and noisier

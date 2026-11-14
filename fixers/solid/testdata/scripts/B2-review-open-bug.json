@@ -1,0 +1,116 @@
+[
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/shardmr/worker.py",
+    "old": "        if await self._report(batch, results):\n            for runner in batch.runners:\n                if self.tasks.get(runner.tid) is runner:\n                    del self.tasks[runner.tid]",
+    "new": "        await self._report(batch, results)\n        for runner in batch.runners:\n            if self.tasks.get(runner.tid) is runner:\n                del self.tasks[runner.tid]"
+   }
+  }
+ ],
+ [
+  {
+   "name": "checkpoint",
+   "input": {}
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "bug 1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "write_scenario",
+   "input": {
+    "name": "jitter",
+    "base": "public",
+    "yaml": "faults: faults/reorder.yaml\nexpect:\n  rpc_requests_max:\n  - {src: worker-*, dst: gpu, method: cancel, max: 0}\n"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "1"
+   }
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "out of ideas"
+   }
+  }
+ ]
+]

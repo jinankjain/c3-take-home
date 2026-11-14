@@ -37,7 +37,9 @@ How to work:
    Encode the symptom itself, not generic liveness: an action the ticket says should not happen
    ("gets cancelled", "re-queued", "registers again") is usually an RPC (rpc_requests_max with
    src/dst/method; find the method name in src/) or a log event (log_events_max; the event names
-   seen in the evidence logs are listed below). Do this BEFORE editing code.
+   seen in the evidence logs are listed below). For such an 'unwanted event' item, a run that fails
+   for other reasons is not evidence: only a check that counts the event is. Do this BEFORE editing
+   code, for every item, not just the first.
    Use trace_query on a failing seed to follow the exact job/key through the logs.
 2. Diagnose: find the exact line that violates the documented behaviour. Cite the doc.
 3. Fix with edit, then run_sim again (several seeds, several fault files).

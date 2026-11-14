@@ -262,6 +262,8 @@ class Tools:
         doc["name"] = name
         (self.ws / "scenarios" / f"{name}.yaml").write_text(_yaml_dump(doc))
         orig, cur = self.orch.probe_scenario(name, self.gate.public_seeds[:3] + [1000, 1001])
+        if orig.failed and not orig.broken and cur.failed and not cur.broken:
+            self.orch.note_open_bug(name)          # reproduces and is still failing: real work left
         if orig.broken:
             why = orig.error or orig.examples.get("ERROR", "")
             return (f"wrote scenarios/{name}.yaml, but it is BROKEN: the simulator cannot run it, so it "

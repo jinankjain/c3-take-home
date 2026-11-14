@@ -32,8 +32,14 @@ class Agent:
         nudges = errors = 0
         t_start, turns_start = time.time(), self.turns
         while True:
-            if (max_turns is not None and self.turns - turns_start >= max_turns) or (
-                    max_seconds is not None and time.time() - t_start >= max_seconds):
+            capped = (max_turns is not None and self.turns - turns_start >= max_turns) or (
+                max_seconds is not None and time.time() - t_start >= max_seconds)
+            if capped and getattr(self.orch, "open_bug", None):
+                if max_turns is not None:            # a real uncovered bug turned up: keep working
+                    self.log(f"agent: phase cap lifted (open bug: {self.orch.open_bug})")
+                max_turns = max_seconds = None
+                capped = False
+            if capped:
                 self.log(f"agent: phase limit reached ({self.turns - turns_start} turns, "
                          f"{time.time() - t_start:.0f}s)")
                 return "limit"
