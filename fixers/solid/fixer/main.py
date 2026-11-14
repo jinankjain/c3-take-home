@@ -26,6 +26,8 @@ TARGET_SWEEP_S = 40.0
 VERIFY_SEED_BASE = 2000        # verification uses as many unseen seeds as a checkpoint sweep
 STOP_CLEAN_S = 45              # stop new turns this close to the end when everything is accepted
 STOP_DIRTY_S = 80              # ... or with unchecked edits (time for the quick check)
+EARLY_SAVE_TURNS = 3           # unchecked edits this many turns old (or this old in seconds) get a
+EARLY_SAVE_S = 150             # quick check, and a full checkpoint if it shows progress
 MAX_VERIFY_ROUNDS = 2
 REVIEW_MAX_TURNS = 6           # the coverage review is a sanity pass, not a second investigation
 REVIEW_MAX_S = 150
@@ -83,6 +85,8 @@ class Orchestrator:
         self.scenario_hash: dict[str, bytes] = {}      # agent scenario -> content it was baselined with
         self.coverage_reviewed = False
         self._safety_state: str | None = None           # src/ state the safety checkpoint last saw
+        self._dirty_since: float | None = None           # when src/ last got unchecked edits...
+        self._dirty_turns = 0                            # ...and how many agent turns ago
         self.seeds = self.gate.seeds(MAX_EXTRA_SEEDS)     # resized in bootstrap() to the machine
         self.baseline: Summary | None = None
         self.accepted: Summary | None = None
@@ -144,17 +148,36 @@ class Orchestrator:
         partial fix is kept even if the agent never gets back to checkpoint(). Returns a note for
         the agent, or None."""
         if not self.src_dirty():
+            self._dirty_since, self._dirty_turns = None, 0
             return None
+        if self._dirty_since is None:
+            self._dirty_since = time.time()
+        self._dirty_turns += 1
         left = self.time_left()
-        if left > 2 * self.check_cost_s + FINAL_RESERVE_S + 30:
-            return None
         state = self.src_hash()
         if state == self._safety_state or left < self.check_cost_s + FINAL_RESERVE_S:
-            return None                                  # already checked this exact state / no time
+            return None                                  # already tried this exact state / no time
+        late = left <= 2 * self.check_cost_s + FINAL_RESERVE_S + 30
+        stale = (self._dirty_turns > EARLY_SAVE_TURNS
+                 or time.time() - self._dirty_since >= EARLY_SAVE_S)
+        if not (late or stale):
+            return None
         self._safety_state = state
+        if not late:
+            # Early: only spend a full check if a quick one shows the edits are progress.
+            baselined = [n for n in self.scenario_hash if n in {r.label for r in self.baseline.runs}]
+            q = quick_check(self.gate, self.baseline, self.accepted, baselined)
+            log(f"early save: unchecked edits for {self._dirty_turns - 1} turns; quick check "
+                f"{'shows progress' if q.ok else 'no progress'}: " + "; ".join(q.reasons)[:300])
+            if not q.ok:
+                return None
         log(f"safety checkpoint: {left:.0f}s left and src/ has unchecked edits")
-        return ("[orchestrator] Time is getting short, so I ran checkpoint() on your current edits to "
-                "keep any progress:\n" + self.checkpoint())
+        res = self.checkpoint()
+        if not self.src_dirty():
+            self._dirty_since, self._dirty_turns = None, 0
+        why = "Time is getting short" if late else "Your edits had gone unchecked for a while"
+        return (f"[orchestrator] {why}, so I ran checkpoint() on your current edits to keep any "
+                f"progress:\n" + res)
 
     def save_or_restore(self, why: str):
         """End of a phase with unchecked edits: keep them if a check passes, else restore."""
