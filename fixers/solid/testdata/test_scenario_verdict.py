@@ -48,3 +48,20 @@ def test_a_counting_check_that_fails_is_a_reproduction(tools):
     assert "REPRODUCES on the original code (your counting check fails there)" in out
     assert "log event shard_requeued:" in out                 # the counts themselves are shown
     assert "note: no log record" not in out
+
+
+def test_unfamiliar_checker_wording_falls_back_to_the_old_verdict(tools):
+    """A hidden case's simulator might word failures differently: then never claim 'NOT on your
+    counting check', just report any failure on the original code as before."""
+    saved = tools.judge_counts
+    tools.judge_counts = False
+    try:
+        out = tools.t_write_scenario("sym2_net2", "faults: faults/network.yaml\nexpect:\n  log_events_max:\n"
+                                     "    missing_from_heartbeat: 0\n", base="public")
+    finally:
+        tools.judge_counts = saved
+    assert "REPRODUCES on the original code" in out and "NOT on your counting check" not in out
+
+
+def test_practice_checker_wording_is_recognised(tools):
+    assert tools.judge_counts

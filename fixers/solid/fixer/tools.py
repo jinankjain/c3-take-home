@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 from .context import log_event_counts
-from .simgate import COUNT_KEYS, PY
+from .simgate import COUNT_KEYS, COUNT_PREFIXES, PY
 
 MAX_OUT = 12_000
 
@@ -106,6 +106,11 @@ class Tools:
         self.src = (self.ws / "src").resolve()
         self.done_summary: str | None = None
         self._replays = Path(tempfile.mkdtemp(prefix="c3replays-"))
+        # Failed counting checks are recognised by the simulator's wording; only judge them if this
+        # case's checker words them that way (otherwise fall back to "any failure reproduces").
+        chk = self.ws / "sim" / "c3sim" / "check.py"
+        src = chk.read_text(errors="replace") if chk.exists() else ""
+        self.judge_counts = all(p.strip() in src for p in COUNT_PREFIXES)
 
     # ------------------------------------------------------------------ helpers
     def _resolve(self, path: str) -> Path:
@@ -254,7 +259,7 @@ class Tools:
         if not isinstance(doc, dict):
             return "error: the YAML must be a mapping"
         own_expect = doc.get("expect") if isinstance(doc.get("expect"), dict) else {}
-        counting = [k for k in own_expect if k in COUNT_KEYS]
+        counting = [k for k in own_expect if k in COUNT_KEYS] if self.judge_counts else []
         if base:
             bp = self.ws / "scenarios" / f"{base}.yaml"
             if not bp.exists():
@@ -288,7 +293,7 @@ class Tools:
         if counting:
             out.append("counting checks that fail, original code: " + ("; ".join(orig.counted[:3]) or "none"))
             out.append("counting checks that fail, current code:  " + ("; ".join(cur.counted[:3]) or "none"))
-        out += self._unknown_events(own_expect.get("log_events_max"))
+        out += self._unknown_events(own_expect.get("log_events_max") if self.judge_counts else None)
         return "\n".join(out)
 
     def _unknown_events(self, counts) -> list[str]:
