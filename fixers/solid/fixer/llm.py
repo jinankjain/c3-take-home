@@ -33,9 +33,9 @@ class ThinkingOverflow(LLMError):
     """Thinking ran past its budget: the budget is not a hard limit, and a turn that thinks until
     max_tokens produces no action at all."""
 
-    def __init__(self, chars: int):
-        super().__init__(f"thinking passed its budget ({chars} chars)")
-        self.chars = chars
+    def __init__(self, chars: int, seconds: float = 0.0):
+        super().__init__(f"thinking passed its budget ({seconds:.0f}s, {chars} chars streamed)")
+        self.chars, self.seconds = chars, seconds
 
 
 OVERTHINK_NUDGE = ("[orchestrator] Your previous attempt at this reply spent its whole budget thinking. "
@@ -45,15 +45,20 @@ OVERTHINK_NUDGE = ("[orchestrator] Your previous attempt at this reply spent its
 
 IDLE_TIMEOUT_S = 60.0        # no bytes at all for this long: the call is stuck
 STALL_TIMEOUT_S = 60.0       # bytes (pings) but no new content for this long: also stuck
+THINK_TIME_CAP_S = 75.0      # still only thinking this long after it began: over budget. The stream
+                             # carries a summary of the thinking, so its size can't be the measure.
 
 
-def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: float = 0) -> dict:
+def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: float = 0,
+                 thinking_cap_s: float = 0) -> dict:
     """Rebuild an Anthropic Messages response from its SSE stream (an iterable of byte lines).
 
     Keeps every content block intact, including thinking blocks and their signatures, which must
     be sent back unchanged on the next turn when thinking is on with tool use. With
     `thinking_cap_chars`, raises ThinkingOverflow as soon as the thinking passes that size. With
     `stall_s`, raises StreamStalled when no content event (pings do not count) arrives for that long.
+    With `thinking_cap_s`, raises ThinkingOverflow when the reply is still in its thinking block that
+    long after thinking began (checked on every event, pings included).
     """
     msg: dict = {}
     usage: dict = {}
@@ -61,6 +66,7 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
     stop_reason = None
     done = False
     thinking_chars = 0
+    thinking_since = None          # set while the reply is in a thinking block, cleared after it
     last_progress = time.time()
     for raw in lines:
         now = time.time()
@@ -68,6 +74,8 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
             raise LLMError("call exceeded its overall time limit while streaming")
         if stall_s and now - last_progress > stall_s:
             raise StreamStalled(f"no new content for {now - last_progress:.0f}s (only keep-alive pings)")
+        if thinking_cap_s and thinking_since is not None and now - thinking_since > thinking_cap_s:
+            raise ThinkingOverflow(thinking_chars, now - thinking_since)
         line = raw.strip()
         if not line.startswith(b"data:"):
             continue
@@ -84,6 +92,10 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
             usage.update(msg.get("usage") or {})
         elif t == "content_block_start":
             b = dict(ev.get("content_block") or {})
+            if b.get("type") in ("thinking", "redacted_thinking"):
+                thinking_since = thinking_since or now
+            else:
+                thinking_since = None             # text or a tool call started: thinking is over
             if b.get("type") == "tool_use":
                 b["input"], b["_json"] = {}, ""
             blocks[int(ev["index"])] = b
@@ -97,7 +109,7 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
                 b["thinking"] = b.get("thinking", "") + d.get("thinking", "")
                 thinking_chars += len(d.get("thinking", ""))
                 if thinking_cap_chars and thinking_chars > thinking_cap_chars:
-                    raise ThinkingOverflow(thinking_chars)
+                    raise ThinkingOverflow(thinking_chars, now - (thinking_since or now))
             elif dt == "signature_delta":
                 b["signature"] = b.get("signature", "") + d.get("signature", "")
             elif dt == "input_json_delta":
@@ -170,13 +182,15 @@ class ProxyLLM:
             try:
                 with urllib.request.urlopen(req, timeout=min(IDLE_TIMEOUT_S, left)) as r:
                     if "text/event-stream" in (r.headers.get("Content-Type") or ""):
-                        resp = parse_stream(r, deadline, think_cap, STALL_TIMEOUT_S)
+                        resp = parse_stream(r, deadline, think_cap, STALL_TIMEOUT_S,
+                                            THINK_TIME_CAP_S if think_cap else 0)
                     else:                                    # server ignored stream: plain JSON
                         resp = json.loads(r.read())
                 break
             except ThinkingOverflow as e:
                 # Charged anyway (the proxy bills what was generated); count it so the budget is right.
-                self.spent += (e.chars / 4) * PRICE["output"] / 1e6
+                # streamed thinking is a summary: estimate the real tokens from the time (~50 tok/s)
+                self.spent += max(e.chars / 4, e.seconds * 50) * PRICE["output"] / 1e6
                 self.log(f"llm: {e}; retrying with a nudge to think briefly and act")
                 retry = dict(body)
                 retry["messages"] = _with_nudge(body["messages"], OVERTHINK_NUDGE)

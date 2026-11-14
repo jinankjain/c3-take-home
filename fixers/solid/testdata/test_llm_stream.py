@@ -212,3 +212,43 @@ def test_stream_with_only_pings_is_treated_as_stalled(monkeypatch):
         llm.create(system="s", messages=[], tools=[], max_tokens=10, timeout=30)
     assert time.time() - t0 < 3.0                                   # 2 tries x ~0.7 s, not 8 s or 30 s
     srv.shutdown()
+
+
+def test_long_thinking_is_cut_by_time_even_if_the_streamed_summary_is_small(monkeypatch):
+    """Claude 4 models stream a summary of their thinking: a runaway turn sends few characters, so the
+    cut must also work by time."""
+    def slow_small_thinking(h):
+        _write(h, sse(START, {"type": "content_block_start", "index": 0,
+                              "content_block": {"type": "thinking", "thinking": ""}}))
+        for _ in range(20):                                         # 4 s of tiny summary deltas
+            _write(h, sse({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": "."}}))
+            REAL_SLEEP(0.2)
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                (slow_small_thinking if len(seen) == 1 else lambda h: _write(h, full_stream()))(self)
+            except OSError:
+                pass                                                # client hung up: the cut working
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    llm = _client(monkeypatch, srv, idle=5)
+    monkeypatch.setattr(llm_mod, "THINK_TIME_CAP_S", 0.6)
+    t0 = time.time()
+    r = llm.create(system="s", messages=[{"role": "user", "content": "go"}], tools=[], max_tokens=8000,
+                   thinking_budget=4000, timeout=30)
+    assert time.time() - t0 < 2.5                                   # cut at ~0.6 s, not after 4 s
+    assert len(seen) == 2 and "think briefly" in json.dumps(seen[1]["messages"][-1]).lower()
+    assert r["stop_reason"] == "tool_use"
+    srv.shutdown()
