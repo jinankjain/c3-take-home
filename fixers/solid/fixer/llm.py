@@ -25,6 +25,10 @@ class RetryableStreamError(LLMError):
     """The stream broke off or the server reported overload mid-stream."""
 
 
+class StreamStalled(RetryableStreamError):
+    """The stream stayed open (pings) but no content arrived for too long."""
+
+
 class ThinkingOverflow(LLMError):
     """Thinking ran past its budget: the budget is not a hard limit, and a turn that thinks until
     max_tokens produces no action at all."""
@@ -40,14 +44,16 @@ OVERTHINK_NUDGE = ("[orchestrator] Your previous attempt at this reply spent its
 
 
 IDLE_TIMEOUT_S = 60.0        # no bytes at all for this long: the call is stuck
+STALL_TIMEOUT_S = 60.0       # bytes (pings) but no new content for this long: also stuck
 
 
-def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0) -> dict:
+def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: float = 0) -> dict:
     """Rebuild an Anthropic Messages response from its SSE stream (an iterable of byte lines).
 
     Keeps every content block intact, including thinking blocks and their signatures, which must
     be sent back unchanged on the next turn when thinking is on with tool use. With
-    `thinking_cap_chars`, raises ThinkingOverflow as soon as the thinking passes that size.
+    `thinking_cap_chars`, raises ThinkingOverflow as soon as the thinking passes that size. With
+    `stall_s`, raises StreamStalled when no content event (pings do not count) arrives for that long.
     """
     msg: dict = {}
     usage: dict = {}
@@ -55,9 +61,13 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0) -> dict:
     stop_reason = None
     done = False
     thinking_chars = 0
+    last_progress = time.time()
     for raw in lines:
-        if time.time() > deadline:
+        now = time.time()
+        if now > deadline:
             raise LLMError("call exceeded its overall time limit while streaming")
+        if stall_s and now - last_progress > stall_s:
+            raise StreamStalled(f"no new content for {now - last_progress:.0f}s (only keep-alive pings)")
         line = raw.strip()
         if not line.startswith(b"data:"):
             continue
@@ -66,6 +76,9 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0) -> dict:
         except json.JSONDecodeError:
             continue
         t = ev.get("type")
+        if t in ("message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                 "message_delta", "message_stop"):
+            last_progress = now
         if t == "message_start":
             msg = ev.get("message") or {}
             usage.update(msg.get("usage") or {})
@@ -157,7 +170,7 @@ class ProxyLLM:
             try:
                 with urllib.request.urlopen(req, timeout=min(IDLE_TIMEOUT_S, left)) as r:
                     if "text/event-stream" in (r.headers.get("Content-Type") or ""):
-                        resp = parse_stream(r, deadline, think_cap)
+                        resp = parse_stream(r, deadline, think_cap, STALL_TIMEOUT_S)
                     else:                                    # server ignored stream: plain JSON
                         resp = json.loads(r.read())
                 break
@@ -181,10 +194,10 @@ class ProxyLLM:
                     continue
                 raise LLMError(f"HTTP {e.code}: {msg}")
             except (urllib.error.URLError, TimeoutError, ConnectionError, RetryableStreamError) as e:
-                stalled = isinstance(e, TimeoutError) or "timed out" in str(e)
+                stalled = isinstance(e, (TimeoutError, StreamStalled)) or "timed out" in str(e)
                 # A stalled call is retried once: repeating a stuck call can eat the whole case.
                 if attempt < (1 if stalled else 3):
-                    self.log(f"llm: {'stalled (no data for %.0fs)' % IDLE_TIMEOUT_S if stalled else e}, "
+                    self.log(f"llm: {('stalled: %s' % e) if stalled else e}, "
                              f"retrying in {delay:.0f}s")
                     time.sleep(delay)
                     delay *= 2

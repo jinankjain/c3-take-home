@@ -103,6 +103,7 @@ def _server(behaviour):
 def _client(monkeypatch, srv, idle):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{srv.server_address[1]}")
     monkeypatch.setattr(llm_mod, "IDLE_TIMEOUT_S", idle)
+    monkeypatch.setattr(llm_mod, "STALL_TIMEOUT_S", idle)
     monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)      # skip retry backoff
     return llm_mod.ProxyLLM(log=lambda m: None)
 
@@ -125,10 +126,13 @@ def test_stalled_stream_hits_idle_timeout(monkeypatch):
 
 def test_slow_but_progressing_stream_succeeds(monkeypatch):
     def slow(h):
-        for _ in range(8):                                          # 1.6 s of progress > idle 0.5 s
-            _write(h, sse({"type": "ping"}))
+        lines = full_stream()
+        _write(h, lines[:12])                                       # message_start, ping, thinking start
+        for _ in range(8):                                          # 1.6 s of real progress > idle 0.5 s
+            _write(h, sse({"type": "content_block_delta", "index": 0,
+                           "delta": {"type": "thinking_delta", "thinking": "."}}))
             REAL_SLEEP(0.2)
-        _write(h, full_stream())
+        _write(h, lines[12:])
     srv = _server(slow)
     llm = _client(monkeypatch, srv, idle=0.5)
     t0 = time.time()
@@ -191,4 +195,20 @@ def test_retry_is_never_cut_a_second_time(monkeypatch):
     r = llm.create(system="s", messages=[{"role": "user", "content": "go"}], tools=[], max_tokens=8000,
                    thinking_budget=4000, timeout=30)
     assert len(seen) == 2 and r["stop_reason"] == "tool_use"
+    srv.shutdown()
+
+
+
+def test_stream_with_only_pings_is_treated_as_stalled(monkeypatch):
+    def pings_forever(h):
+        _write(h, sse(START))
+        for _ in range(40):                                         # 8 s of keep-alive, no content
+            _write(h, sse({"type": "ping"}))
+            REAL_SLEEP(0.2)
+    srv = _server(pings_forever)
+    llm = _client(monkeypatch, srv, idle=0.5)
+    t0 = time.time()
+    with pytest.raises(LLMError, match="no new content"):
+        llm.create(system="s", messages=[], tools=[], max_tokens=10, timeout=30)
+    assert time.time() - t0 < 3.0                                   # 2 tries x ~0.7 s, not 8 s or 30 s
     srv.shutdown()
