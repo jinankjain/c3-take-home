@@ -262,11 +262,15 @@ class Tools:
         doc["name"] = name
         (self.ws / "scenarios" / f"{name}.yaml").write_text(_yaml_dump(doc))
         orig, cur = self.orch.probe_scenario(name, self.gate.public_seeds[:3] + [1000, 1001])
-        verdict = ("REPRODUCES on the original code" if orig.failed and not orig.error else
-                   "does NOT reproduce anything on the original code (adjust faults/expect)"
-                   if not orig.error else "could not run")
+        if orig.broken:
+            why = orig.error or orig.examples.get("ERROR", "")
+            return (f"wrote scenarios/{name}.yaml, but it is BROKEN: the simulator cannot run it, so it "
+                    f"proves nothing and is left out of checkpoints until fixed. Error: {why[:400]}\n"
+                    f"(Paths inside a scenario are relative to scenarios/, e.g. faults: faults/x.yaml.)")
+        verdict = ("REPRODUCES on the original code" if orig.failed else
+                   "does NOT reproduce anything on the original code (adjust faults/expect)")
         out = [f"wrote scenarios/{name}.yaml; it {verdict}.",
-               "original code: " + (orig.error[:300] if orig.error else orig.line()),
+               "original code: " + orig.line(),
                "current code:  " + (cur.error[:300] if cur.error else cur.line())]
         out += [f"  {inv} e.g.: {ex}" for inv, ex in list(orig.examples.items())[:3]]
         return "\n".join(out)

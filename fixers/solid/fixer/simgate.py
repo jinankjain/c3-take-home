@@ -35,6 +35,13 @@ class RunResult:
             c.update(invs)
         return c
 
+    @property
+    def broken(self) -> bool:
+        """The scenario itself could not run (e.g. a bad fault path): every seed failed with
+        nothing but a simulator ERROR. Service bugs show up as invariant/expect failures instead."""
+        return bool(self.error) or (bool(self.seeds) and len(self.failed) == len(self.seeds)
+                                    and all(set(v) == {"ERROR"} for v in self.failed.values()))
+
     def line(self) -> str:
         if self.error:
             return f"{self.label:<34} SWEEP ERROR: {self.error[:200]}"

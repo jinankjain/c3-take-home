@@ -1,0 +1,44 @@
+[
+ [
+  {
+   "name": "write_scenario",
+   "input": {
+    "name": "precancel_restart",
+    "base": "public",
+    "yaml": "faults: scenarios/faults/router-restarts.yaml\n"
+   }
+  }
+ ],
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/jobrouter/store.py",
+    "old": "            if job is None or job[\"units\"] is None:\n                continue",
+    "new": "            if job is None:\n                continue"
+   }
+  }
+ ],
+ [
+  {
+   "name": "checkpoint",
+   "input": {}
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "fixed"
+   }
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "covered by public + router-restarts"
+   }
+  }
+ ]
+]

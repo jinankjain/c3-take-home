@@ -121,6 +121,8 @@ class Orchestrator:
                 continue
             name = p.stem
             content = p.read_bytes()
+            if self.scenario_hash.get(name) == content and name not in {r.label for r in self.baseline.runs}:
+                continue                                       # known broken, unchanged: still excluded
             if self.scenario_hash.get(name) != content:       # new, or rewritten by the agent
                 for summ in (self.baseline, self.accepted):
                     if summ is not None:
@@ -128,8 +130,8 @@ class Orchestrator:
                 self.scenario_hash[name] = content
                 shutil.copy(p, self.pristine / "scenarios" / p.name)
                 r = self.pristine_gate.sweep(name, self.seeds)
-                if r.error:
-                    log(f"agent scenario {name} does not run on the original code; ignored")
+                if r.broken:
+                    log(f"agent scenario {name} cannot run (broken scenario); left out of checkpoints")
                     continue
                 self.baseline.runs.append(r)
                 if self.accepted is not None:       # the accepted code was never run on it: assume
