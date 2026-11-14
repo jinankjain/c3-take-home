@@ -279,9 +279,11 @@ class Tools:
                     f"(Paths inside a scenario are relative to scenarios/, e.g. faults: faults/x.yaml.)")
         if counting and orig.failed and not orig.counted:
             verdict = (f"fails on the original code, but NOT on your counting check(s) ({', '.join(counting)}): "
-                       f"those pass on the original code, and it fails only on other checks. So it does not "
-                       f"show an unwanted-event symptom; for that, a counting check must fail on the original "
-                       f"code (right event or RPC name, the ticket's conditions, a tight max)")
+                       f"those pass on the original code, and it fails only on other checks. If the item is "
+                       f"liveness/correctness (stuck, wrong or missing result), that failure is enough evidence: "
+                       f"drop the counting check and move on. If the item is an unwanted event, this does not "
+                       f"show it: a counting check must fail on the original code (right event or RPC name, the "
+                       f"ticket's conditions, a tight max)")
         elif orig.failed:
             verdict = "REPRODUCES on the original code" + (" (your counting check fails there)" if counting else "")
         else:
