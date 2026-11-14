@@ -20,17 +20,18 @@ changes; deterministic code decides what is kept.
 5. **Robustness:** streamed model calls with separate idle and overall timeouts, bounded retries, and
    continuing after errors, so a single bad call can't end a case.
 
-**Results.** Under the real grading setup the Docker image fixed **12/12 practice bugs in a single
-run** (2,571 s of fixer time, $4.80, every case at 13–20% of its budget), and 33/36 across three runs.
-The one miss was a B2 run where the agent had fixed two bugs but was still working on the third when
-time ran short, and the fixer discarded the unchecked fix; that led to the safety checkpoint and quick
-check above.
+**Results.** Under the real grading setup, the final Docker image fixed **12/12 practice bugs in one
+run** (2,333 s of fixer time, $4.13). B2, the hardest case, went 3/3 in all three runs on that image.
 The first full run scored 6/12, and every miss came from slow or stalled model calls; the timeout and
-retry changes fixed those. B2's bug-2 was the hardest: its symptom (spurious GPU cancels) breaks no
-invariant, so it only became fixable once the agent wrote a scenario that counted it. That scenario
-also caught the agent's first, wrong fix. Real runs exposed two tool bugs (grep-style `\|` patterns,
-and treating broken scenarios as reproductions), and the offline tests now cover both. The practice
-score is a guide only: the hidden codebases are new.
+retry changes fixed those. After that, B2 still missed one bug in about one run in three, for two
+reasons. Its bug-2 symptom (spurious re-queues) breaks no invariant, so the agent sometimes counted a
+run that failed for other reasons as evidence and stopped with a partial fix. The coverage review now
+requires a scenario that counts the event itself; in the final runs that scenario caught a half-fix
+that the public scenario had passed. Other times the agent ran out of time after a long thinking turn
+was cut and the retry redid the same analysis, so the retry now carries the cut reasoning over (retry times
+fell from 77–93 s to 29–77 s, median under 40 s). Real runs also exposed two tool bugs (grep-style `\|` patterns, and
+treating broken scenarios as reproductions), and the offline tests now cover both. The practice score
+is a guide only: the hidden codebases are new.
 
 **What I'd do next.**
 - Generate stress scenarios systematically by varying fault parameters around the ticket, rather than
@@ -39,4 +40,6 @@ score is a guide only: the hidden codebases are new.
 - Retrieve corpus documents on demand when service docs are too large to include.
 - Use Jev for cheap yes/no checks, such as "does this patch disable functionality?", to reduce the
   risk from private regression tests.
-- Trim long analysis turns, which occasionally hit the output limit.
+- Cut over-long thinking earlier without losing good long turns: each cutoff still costs about 75 s.
+- Accept the agent's common scenario mistakes (a `base:` key in the YAML, a `scenarios/` prefix on
+  fault paths) instead of rejecting them, saving one turn per case.
