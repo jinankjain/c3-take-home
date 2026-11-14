@@ -43,6 +43,8 @@ How to work:
 3. Fix with edit, then run_sim again (several seeds, several fault files).
 4. checkpoint() runs the acceptance check (tests, sweeps over all fault files and many seeds,
    determinism, message counts). Only checkpointed code is kept. If it is rejected, read why.
+   Checkpoint as soon as a fix makes failures go down; do not wait until every item is fixed.
+   An accepted checkpoint is kept even if time runs out while you work on the rest.
 5. When the check passes and nothing reproducible is left, call done().
 Be economical: time and model budget are limited. Prefer targeted reads over whole files once
 you know where to look. Several tool calls in one turn are fine when they are independent."""

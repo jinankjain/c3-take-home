@@ -41,6 +41,9 @@ class Agent:
             if reason:
                 self.log(f"agent: stopping ({reason})")
                 return "stopped"
+            note = self.orch.maybe_safety_checkpoint()
+            if note and self.messages[-1]["role"] == "user":
+                self.messages[-1]["content"].append({"type": "text", "text": note})
             self._trim()
             self._mark_cache()
             t0 = time.time()

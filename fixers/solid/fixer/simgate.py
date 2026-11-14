@@ -251,3 +251,41 @@ def _pairs(a: Summary, other: Summary) -> int:
 def _viol(a: Summary, other: Summary) -> int:
     labels = {r.label for r in other.runs}
     return sum(sum(r.kinds.values()) for r in a.runs if r.label in labels)
+
+
+def quick_check(gate: "Gate", baseline: Summary, ref: Summary | None = None) -> Verdict:
+    """A short check for when the full one no longer fits in the time left: compiles, public tests
+    pass (a broken test zeroes the case), replays are deterministic, and on the public scenario over
+    the public seeds no seed newly fails, nothing crashes, messages stay bounded, and fewer seeds fail
+    than in `ref` (the last accepted state; the original baseline if nothing was accepted yet)."""
+    errs = gate.compile_errors()
+    if errs:
+        return Verdict(False, [f"does not compile: {e}" for e in errs])
+    ok, tail = gate.run_tests()
+    if not ok:
+        return Verdict(False, ["public tests fail"], tests_tail=tail)
+    det_ok, det = gate.determinism(gate.public_seeds[:1])
+    if not det_ok:
+        return Verdict(False, [f"replays are not deterministic: {det}"])
+    base = baseline.by_label().get("public")
+    if base is None:
+        return Verdict(False, ["no public baseline to compare against"])
+    seeds = [s for s in gate.public_seeds if s in base.seeds]
+    cand = gate.sweep("public", seeds)
+    if cand.broken or "ERROR" in cand.kinds:
+        return Verdict(False, [f"public scenario errors: {cand.error or cand.examples.get('ERROR', '')}"])
+    newly = [s for s in seeds if s in cand.failed and s not in base.failed]
+    if newly:
+        return Verdict(False, [f"public now fails on seeds {newly} that passed before"])
+    for s in seeds:
+        if base.messages.get(s) and cand.messages.get(s, 0) > 2 * base.messages[s]:
+            return Verdict(False, [f"seed {s}: {cand.messages[s]} messages vs {base.messages[s]} at baseline"])
+    ref_run = (ref or baseline).by_label().get("public")
+    if ref_run is None or not set(seeds) <= set(ref_run.seeds):
+        ref_run = base
+    before = sum(1 for s in seeds if s in ref_run.failed)
+    after = len(cand.failed)
+    if after >= before:
+        return Verdict(False, [f"no progress on public: {after} failing seeds vs {before}"])
+    return Verdict(True, [f"quick check: public failing seeds {before} -> {after} on {len(seeds)} seeds"],
+                   Summary([cand]))

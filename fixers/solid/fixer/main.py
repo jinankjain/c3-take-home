@@ -5,6 +5,7 @@ rounds after done() -> finalize (src/ is always left at the last accepted state)
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import signal
@@ -16,7 +17,7 @@ from pathlib import Path
 from . import context
 from .agent import Agent
 from .llm import make_llm
-from .simgate import Gate, Summary
+from .simgate import Gate, Summary, quick_check
 from .tools import Tools
 
 BASE_EXTRA_SEEDS = 15          # seeds beyond the public ones in baseline and checkpoints
@@ -37,6 +38,7 @@ COVERAGE_REVIEW = (
     "original code and passes now is enough, even if other bugs also made it fail; do not spend "
     "turns isolating each check once the item's root cause is fixed.")
 FINAL_RESERVE_S = 20           # time kept back to restore src/ and exit
+QUICK_CHECK_MIN_S = 45         # time needed for the short end-of-run check (tests + public seeds)
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 T0 = time.time()
 
@@ -68,6 +70,7 @@ class Orchestrator:
         self.orig_scenarios = {p.name for p in (ws / "scenarios").glob("*.yaml")}
         self.scenario_hash: dict[str, bytes] = {}      # agent scenario -> content it was baselined with
         self.coverage_reviewed = False
+        self._safety_state: str | None = None           # src/ state the safety checkpoint last saw
         self.seeds = self.gate.seeds(BASE_EXTRA_SEEDS)
         self.baseline: Summary | None = None
         self.accepted: Summary | None = None
@@ -115,6 +118,48 @@ class Orchestrator:
         self.src.rename(old)
         staged.rename(self.src)
         shutil.rmtree(old, ignore_errors=True)
+
+    def src_hash(self) -> str:
+        h = hashlib.sha256()
+        for k, v in sorted(tree(self.src).items()):
+            h.update(k.encode() + b"\0" + v)
+        return h.hexdigest()
+
+    def maybe_safety_checkpoint(self) -> str | None:
+        """When time is getting short and src/ holds unchecked edits, check them now so that a
+        partial fix is kept even if the agent never gets back to checkpoint(). Returns a note for
+        the agent, or None."""
+        if not self.src_dirty():
+            return None
+        left = self.time_left()
+        if left > 2 * self.check_cost_s + FINAL_RESERVE_S + 30:
+            return None
+        state = self.src_hash()
+        if state == self._safety_state or left < self.check_cost_s + FINAL_RESERVE_S:
+            return None                                  # already checked this exact state / no time
+        self._safety_state = state
+        log(f"safety checkpoint: {left:.0f}s left and src/ has unchecked edits")
+        return ("[orchestrator] Time is getting short, so I ran checkpoint() on your current edits to "
+                "keep any progress:\n" + self.checkpoint())
+
+    def save_or_restore(self, why: str):
+        """End of a phase with unchecked edits: keep them if a check passes, else restore."""
+        if not self.src_dirty():
+            return
+        if self.time_left() > self.check_cost_s + FINAL_RESERVE_S:
+            log(f"{why}: src/ has unchecked edits; running the acceptance check")
+            self.checkpoint()
+        elif self.time_left() > QUICK_CHECK_MIN_S:
+            log(f"{why}: not enough time for the full check ({self.time_left():.0f}s left); running the quick check")
+            v = quick_check(self.gate, self.baseline, self.accepted)
+            log(f"{why}: quick check {'PASSED' if v.ok else 'FAILED'}: " + "; ".join(v.reasons)[:400])
+            if v.ok:
+                self.snapshot()
+                self.accepted = v.summary
+                self.accepted_count += 1
+        if self.src_dirty():
+            log(f"{why}: restoring the last accepted src/")
+            self.restore_last_good()
 
     # ------------------------------------------------------------------ agent scenarios
     def agent_scenarios(self) -> list[str]:
@@ -191,13 +236,7 @@ class Orchestrator:
         return self.gate.sweep_all(VERIFY_SEEDS, extra)
 
     def finalize(self, tools: Tools | None):
-        if self.src_dirty():
-            if self.time_left() > self.check_cost_s + FINAL_RESERVE_S:
-                log("finalize: src/ has unchecked edits; running the acceptance check")
-                self.checkpoint()
-            if self.src_dirty():
-                log("finalize: restoring the last accepted src/")
-                self.restore_last_good()
+        self.save_or_restore("finalize")
         if tools:
             tools.cleanup()
         for p in (self.ws / "scenarios").glob("*.yaml"):     # leave the workspace as we found it
@@ -241,10 +280,7 @@ def main() -> int:
             limits = {}
             if why == "limit":                         # coverage review ran long: keep what is accepted
                 log("coverage review hit its cap; moving on to verification")
-                if orch.src_dirty() and orch.time_left() > orch.check_cost_s + FINAL_RESERVE_S:
-                    orch.checkpoint()
-                if orch.src_dirty():
-                    orch.restore_last_good()
+                orch.save_or_restore("coverage review cap")
                 why = "done"
             if why != "done" or orch.should_stop():
                 break

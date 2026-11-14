@@ -17,7 +17,10 @@ budget and the last accepted `src/`. The model proposes edits; deterministic cod
    than the last accepted state, including on the agent's own scenarios. Only accepted code is kept.
 4. **Coverage review and verification:** the first `done()` asks for an item-by-item coverage map; then
    a sweep on unseen seeds sends the agent back if anything still fails.
-5. **Finalize:** unchecked edits are checked or reverted; SIGTERM restores the last accepted `src/`.
+5. **Keeping partial progress:** when time runs short and `src/` holds unchecked edits, the orchestrator
+   checkpoints them itself. At the end, unchecked edits get the full check if it fits, else a quick check
+   (compile, public tests, determinism, public seeds better than the last accepted state), else they are
+   reverted. SIGTERM restores the last accepted `src/`.
 
 | File | Role |
 | --- | --- |
@@ -49,6 +52,9 @@ python fixers/solid/testdata/run_scripted.py A1 A1-fix            # scripted age
 ```
 
 Scripts in `testdata/scripts/` cover the happy path, bad edits, test-breaking patches, unchecked
-`done()`, budget exhaustion, model errors and the scenario workflow. `testdata/claude_p_shim.py` is a
+`done()`, budget exhaustion, model errors, broken scenarios, the coverage-review cap, the scenario
+workflow and the safety checkpoint (`A1-no-checkpoint`, run with `--deadline-s 140`).
+`test_end_of_run.py` checks the end-of-run quick check keeps a real partial fix and rolls back
+test-breaking or no-progress edits. `testdata/claude_p_shim.py` is a
 local stand-in upstream for the proxy backed by the `claude -p` CLI (testing only; slower and noisier
 than the real API).
