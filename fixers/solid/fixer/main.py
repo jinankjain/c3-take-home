@@ -165,7 +165,8 @@ class Orchestrator:
             self.checkpoint()
         elif self.time_left() > QUICK_CHECK_MIN_S:
             log(f"{why}: not enough time for the full check ({self.time_left():.0f}s left); running the quick check")
-            v = quick_check(self.gate, self.baseline, self.accepted)
+            baselined = [n for n in self.scenario_hash if n in {r.label for r in self.baseline.runs}]
+            v = quick_check(self.gate, self.baseline, self.accepted, baselined)
             log(f"{why}: quick check {'PASSED' if v.ok else 'FAILED'}: " + "; ".join(v.reasons)[:400])
             if v.ok:
                 self.snapshot()

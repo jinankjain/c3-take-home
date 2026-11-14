@@ -91,3 +91,27 @@ def test_sweep_sizing():
     assert choose_extra_seeds(0.3, 12, 5) < MAX_EXTRA_SEEDS         # slow machine, many fault files
     assert choose_extra_seeds(5.0, 12, 5) == MIN_EXTRA_SEEDS        # very slow: floor
     assert choose_extra_seeds(0.3, 12, 5, ok=False) == MAX_EXTRA_SEEDS
+
+
+def test_quick_check_counts_progress_on_agent_scenarios(tmp_path_factory):
+    """Run-2 situation: public already passes in the accepted state, the agent's own scenario still
+    fails, and a late edit fixes it. The quick check must keep that edit."""
+    import copy
+    ws = tmp_path_factory.mktemp("case2") / "workspace"
+    shutil.copytree(PACK / "practice" / "A1", ws)
+    from fixer import main
+    from fixer.simgate import Summary
+    o = main.Orchestrator(ws, PACK / "corpus/build/practice")
+    o.bootstrap()
+    (ws / "scenarios" / "restarts.yaml").write_text(
+        (ws / "scenarios" / "public.yaml").read_text() + "\nfaults: faults/router-restarts.yaml\n")
+    assert o.agent_scenarios() == ["restarts"]                       # baselined on the original code
+    base = o.baseline.by_label()
+    assert base["restarts"].failed                                   # fails on the original code
+    public_clean = copy.deepcopy(base["public"]); public_clean.failed = {}
+    o.accepted = Summary([public_clean, base["restarts"]])           # public passes, scenario fails
+    edit(o, "jobrouter/store.py", FIX_OLD, FIX_NEW)                  # fixes the scenario's bug
+    no_time_for_full_check(o)
+    o.save_or_restore("test")
+    assert FIX_NEW in (o.src / "jobrouter/store.py").read_text()     # kept: progress on "restarts"
+    assert not o.src_dirty()

@@ -253,11 +253,14 @@ def _viol(a: Summary, other: Summary) -> int:
     return sum(sum(r.kinds.values()) for r in a.runs if r.label in labels)
 
 
-def quick_check(gate: "Gate", baseline: Summary, ref: Summary | None = None) -> Verdict:
+def quick_check(gate: "Gate", baseline: Summary, ref: Summary | None = None,
+                extra_scenarios: list[str] = ()) -> Verdict:
     """A short check for when the full one no longer fits in the time left: compiles, public tests
-    pass (a broken test zeroes the case), replays are deterministic, and on the public scenario over
-    the public seeds no seed newly fails, nothing crashes, messages stay bounded, and fewer seeds fail
-    than in `ref` (the last accepted state; the original baseline if nothing was accepted yet)."""
+    pass (a broken test zeroes the case), replays are deterministic, and on the public scenario plus
+    every baselined agent scenario (public seeds only) no seed newly fails, nothing crashes, messages
+    stay bounded, and fewer (run, seed) pairs fail than in `ref` (the last accepted state, or the
+    original baseline). Agent scenarios matter: once public passes, a later bug's progress may only
+    show there."""
     errs = gate.compile_errors()
     if errs:
         return Verdict(False, [f"does not compile: {e}" for e in errs])
@@ -267,25 +270,34 @@ def quick_check(gate: "Gate", baseline: Summary, ref: Summary | None = None) -> 
     det_ok, det = gate.determinism(gate.public_seeds[:1])
     if not det_ok:
         return Verdict(False, [f"replays are not deterministic: {det}"])
-    base = baseline.by_label().get("public")
-    if base is None:
+    base_runs = baseline.by_label()
+    ref_runs = (ref or baseline).by_label()
+    if "public" not in base_runs:
         return Verdict(False, ["no public baseline to compare against"])
-    seeds = [s for s in gate.public_seeds if s in base.seeds]
-    cand = gate.sweep("public", seeds)
-    if cand.broken or "ERROR" in cand.kinds:
-        return Verdict(False, [f"public scenario errors: {cand.error or cand.examples.get('ERROR', '')}"])
-    newly = [s for s in seeds if s in cand.failed and s not in base.failed]
-    if newly:
-        return Verdict(False, [f"public now fails on seeds {newly} that passed before"])
-    for s in seeds:
-        if base.messages.get(s) and cand.messages.get(s, 0) > 2 * base.messages[s]:
-            return Verdict(False, [f"seed {s}: {cand.messages[s]} messages vs {base.messages[s]} at baseline"])
-    ref_run = (ref or baseline).by_label().get("public")
-    if ref_run is None or not set(seeds) <= set(ref_run.seeds):
-        ref_run = base
-    before = sum(1 for s in seeds if s in ref_run.failed)
-    after = len(cand.failed)
+    labels = ["public"] + [n for n in extra_scenarios if n in base_runs and n != "public"]
+    before = after = 0
+    cands = []
+    for label in labels:
+        base = base_runs[label]
+        seeds = [s for s in gate.public_seeds if s in base.seeds]
+        cand = gate.sweep(label, seeds)
+        if cand.broken or "ERROR" in cand.kinds:
+            return Verdict(False, [f"{label}: errors: {cand.error or cand.examples.get('ERROR', '')}"])
+        newly = [s for s in seeds if s in cand.failed and s not in base.failed]
+        if newly:
+            return Verdict(False, [f"{label} now fails on seeds {newly} that passed before"])
+        for s in seeds:
+            if base.messages.get(s) and cand.messages.get(s, 0) > 2 * base.messages[s]:
+                return Verdict(False, [f"{label} seed {s}: {cand.messages[s]} messages vs "
+                                       f"{base.messages[s]} at baseline"])
+        r = ref_runs.get(label)
+        if r is None or not set(seeds) <= set(r.seeds):
+            r = base
+        before += sum(1 for s in seeds if s in r.failed)
+        after += len(cand.failed)
+        cands.append(cand)
     if after >= before:
-        return Verdict(False, [f"no progress on public: {after} failing seeds vs {before}"])
-    return Verdict(True, [f"quick check: public failing seeds {before} -> {after} on {len(seeds)} seeds"],
-                   Summary([cand]))
+        return Verdict(False, [f"no progress: {after} failing (run, seed) pairs vs {before} "
+                               f"on {', '.join(labels)}"])
+    return Verdict(True, [f"quick check: failing (run, seed) pairs {before} -> {after} on "
+                          f"{', '.join(labels)}"], Summary(cands))
