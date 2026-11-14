@@ -1,0 +1,50 @@
+"""write_scenario must not call a scenario a reproduction of an unwanted event when only other checks
+fail. B2 run (2/3): the agent counted `missing_from_heartbeat` (a field value, not an event, so the
+check could never fail), moved to a fault file that fails for other bugs, got "REPRODUCES", and
+stopped with bug 2 half-fixed.
+
+Runs the real orchestrator and tool on a copy of practice case B2 (about 60 s, no model):
+    python -m pytest -q fixers/solid/testdata/test_scenario_verdict.py
+"""
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
+PACK = HERE.parent.parent.parent
+sys.path.insert(0, str(HERE.parent))
+
+
+@pytest.fixture(scope="module")
+def tools(tmp_path_factory):
+    ws = tmp_path_factory.mktemp("b2") / "workspace"
+    shutil.copytree(PACK / "practice" / "B2", ws)
+    os.environ.update(C3_WORKSPACE=str(ws), C3_CORPUS=str(PACK / "corpus/build/practice"),
+                      C3_DEADLINE=str(int(time.time() + 3600)), C3_BUDGET_USD="9")
+    from fixer import main
+    main.log = lambda m: None
+    o = main.Orchestrator(ws, PACK / "corpus/build/practice")
+    o.bootstrap()
+    from fixer.tools import Tools
+    return Tools(ws, PACK / "corpus/build/practice", o.gate, o, log=lambda m: None)
+
+
+def test_failing_for_other_reasons_is_not_a_reproduction(tools):
+    out = tools.t_write_scenario("sym2_net", "faults: faults/network.yaml\nexpect:\n  log_events_max:\n"
+                                 "    missing_from_heartbeat: 0\n", base="public")
+    assert "REPRODUCES" not in out
+    assert "NOT on your counting check" in out
+    assert "no log record in logs/ has event=missing_from_heartbeat" in out
+    assert "event=task_finished" in out                       # points at where the value does occur
+
+
+def test_a_counting_check_that_fails_is_a_reproduction(tools):
+    out = tools.t_write_scenario("sym2_reorder", "faults: faults/reorder.yaml\nexpect:\n  log_events_max:\n"
+                                 "    shard_requeued: 0\n", base="public")
+    assert "REPRODUCES on the original code (your counting check fails there)" in out
+    assert "log event shard_requeued:" in out                 # the counts themselves are shown
+    assert "note: no log record" not in out

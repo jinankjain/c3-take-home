@@ -17,6 +17,12 @@ from pathlib import Path
 PY = sys.executable
 
 
+# expect checks that count unwanted events (sim/c3sim/check.py), and how their failures are worded
+COUNT_KEYS = ("log_events_max", "rpc_requests_max", "rpc_errors_max", "rpc_requests_per_group_max",
+              "messages_max")
+COUNT_PREFIXES = ("log event ", "rpc requests ", "rpc errors ", "messages sent ")
+
+
 @dataclass
 class RunResult:
     """One sweep: a scenario (optionally with a fault file) over a set of seeds."""
@@ -27,6 +33,7 @@ class RunResult:
     messages: dict[int, int] = field(default_factory=dict)       # seed -> msg_send count
     wall_s: float = 0.0
     error: str | None = None                                     # the sweep itself broke
+    counted: list[str] = field(default_factory=list)             # failed counting checks, "seed N: detail"
 
     @property
     def kinds(self) -> collections.Counter:
@@ -138,6 +145,9 @@ class Gate:
             for v in r.get("violations") or []:
                 invs.append(v["invariant"])
                 res.examples.setdefault(v["invariant"], str(v.get("detail", ""))[:200])
+                detail = str(v.get("detail", ""))
+                if v["invariant"] == "expect" and detail.startswith(COUNT_PREFIXES) and len(res.counted) < 10:
+                    res.counted.append(f"seed {seed}: {detail[:200]}")
             if r.get("error"):
                 invs.append("ERROR")
                 res.examples.setdefault("ERROR", str(r["error"])[:300])

@@ -21,13 +21,16 @@ changes; deterministic code decides what is kept.
    continuing after errors, so a single bad call can't end a case.
 
 **Results.** Under the real grading setup, the final Docker image fixed **12/12 practice bugs in one
-run** (2,333 s of fixer time, $4.13). B2, the hardest case, went 3/3 in all three runs on that image.
+run** (2,333 s of fixer time, $4.13). B2, the hardest case, went 3/3 in three of four runs on that image.
 The first full run scored 6/12, and every miss came from slow or stalled model calls; the timeout and
 retry changes fixed those. After that, B2 still missed one bug in about one run in three, for two
 reasons. Its bug-2 symptom (spurious re-queues) breaks no invariant, so the agent sometimes counted a
 run that failed for other reasons as evidence and stopped with a partial fix. The coverage review now
 requires a scenario that counts the event itself; in the final runs that scenario caught a half-fix
-that the public scenario had passed. Other times the agent ran out of time after a long thinking turn
+that the public scenario had passed. The fourth run's miss came from the scenario tool: the agent
+counted a field value as if it were a log event, so the check could never fail, and the tool called
+a scenario that failed for other bugs a reproduction. The tool now says whether the counting check
+itself fails on the original code, and flags names that are not log events. Other times the agent ran out of time after a long thinking turn
 was cut and the retry redid the same analysis, so the retry now carries the cut reasoning over (retry times
 fell from 77–93 s to 29–77 s, median under 40 s). Real runs also exposed two tool bugs (grep-style `\|` patterns, and
 treating broken scenarios as reproductions), and the offline tests now cover both. The practice score

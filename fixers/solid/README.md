@@ -60,7 +60,8 @@ Scripts in `testdata/scripts/` cover the happy path, bad edits, test-breaking pa
 `done()`, budget exhaustion, model errors, broken scenarios, the coverage-review cap (and lifting it
 when the review turns up a scenario that still fails, `B2-review-open-bug`), the scenario workflow and
 the safety checkpoint (`A1-no-checkpoint`, run with `--deadline-s 140`).
-`test_end_of_run.py` checks the end-of-run quick check keeps a real partial fix and rolls back
+`test_scenario_verdict.py` checks that a scenario failing only on other checks is not reported as
+reproducing an unwanted event. `test_end_of_run.py` checks the end-of-run quick check keeps a real partial fix and rolls back
 test-breaking or no-progress edits. `testdata/claude_p_shim.py` is a
 local stand-in upstream for the proxy backed by the `claude -p` CLI (testing only; slower and noisier
 than the real API).

@@ -11,7 +11,8 @@ from pathlib import Path
 
 import yaml
 
-from .simgate import PY
+from .context import log_event_counts
+from .simgate import COUNT_KEYS, PY
 
 MAX_OUT = 12_000
 
@@ -252,6 +253,8 @@ class Tools:
             return f"error: invalid YAML: {e}"
         if not isinstance(doc, dict):
             return "error: the YAML must be a mapping"
+        own_expect = doc.get("expect") if isinstance(doc.get("expect"), dict) else {}
+        counting = [k for k in own_expect if k in COUNT_KEYS]
         if base:
             bp = self.ws / "scenarios" / f"{base}.yaml"
             if not bp.exists():
@@ -269,13 +272,45 @@ class Tools:
             return (f"wrote scenarios/{name}.yaml, but it is BROKEN: the simulator cannot run it, so it "
                     f"proves nothing and is left out of checkpoints until fixed. Error: {why[:400]}\n"
                     f"(Paths inside a scenario are relative to scenarios/, e.g. faults: faults/x.yaml.)")
-        verdict = ("REPRODUCES on the original code" if orig.failed else
-                   "does NOT reproduce anything on the original code (adjust faults/expect)")
+        if counting and orig.failed and not orig.counted:
+            verdict = (f"fails on the original code, but NOT on your counting check(s) ({', '.join(counting)}): "
+                       f"those pass on the original code, and it fails only on other checks. So it does not "
+                       f"show an unwanted-event symptom; for that, a counting check must fail on the original "
+                       f"code (right event or RPC name, the ticket's conditions, a tight max)")
+        elif orig.failed:
+            verdict = "REPRODUCES on the original code" + (" (your counting check fails there)" if counting else "")
+        else:
+            verdict = "does NOT reproduce anything on the original code (adjust faults/expect)"
         out = [f"wrote scenarios/{name}.yaml; it {verdict}.",
                "original code: " + orig.line(),
                "current code:  " + (cur.error[:300] if cur.error else cur.line())]
         out += [f"  {inv} e.g.: {ex}" for inv, ex in list(orig.examples.items())[:3]]
+        if counting:
+            out.append("counting checks that fail, original code: " + ("; ".join(orig.counted[:3]) or "none"))
+            out.append("counting checks that fail, current code:  " + ("; ".join(cur.counted[:3]) or "none"))
+        out += self._unknown_events(own_expect.get("log_events_max"))
         return "\n".join(out)
+
+    def _unknown_events(self, counts) -> list[str]:
+        """log_events_max counts records by their `event` field. Warn about names that are not events
+        in the evidence logs, such as a field value (outcome=missing_from_heartbeat)."""
+        if not isinstance(counts, dict):
+            return []
+        known = dict(log_event_counts(self.ws / "logs", limit=10_000))
+        out = []
+        for ev in counts:
+            if ev in known:
+                continue
+            hint = ""
+            for f in sorted((self.ws / "logs").glob("*.log")):
+                m = re.search(rf"\bevent=(\S+)[^\n]*\b\w+={re.escape(str(ev))}\b", f.read_text(errors="replace"))
+                if m:
+                    hint = (f" It appears as a field value, e.g. in event={m.group(1)} records; count those "
+                            f"with an RPC check, or a log event logged only in that case.")
+                    break
+            out.append(f"note: no log record in logs/ has event={ev}, so log_events_max on it can only "
+                       f"pass (it counts the event field, not other fields).{hint}")
+        return out
 
     def t_run_tests(self) -> str:
         ok, tail = self.gate.run_tests()
