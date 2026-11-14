@@ -20,8 +20,12 @@ from .llm import make_llm
 from .simgate import Gate, Summary, quick_check
 from .tools import Tools
 
-BASE_EXTRA_SEEDS = 15          # seeds beyond the public ones in baseline and checkpoints
-VERIFY_SEEDS = list(range(2000, 2015))
+MAX_EXTRA_SEEDS = 15           # seeds beyond the public ones in baseline and checkpoints...
+MIN_EXTRA_SEEDS = 5            # ...sized so that one full sweep takes about TARGET_SWEEP_S
+TARGET_SWEEP_S = 40.0
+VERIFY_SEED_BASE = 2000        # verification uses as many unseen seeds as a checkpoint sweep
+STOP_CLEAN_S = 45              # stop new turns this close to the end when everything is accepted
+STOP_DIRTY_S = 80              # ... or with unchecked edits (time for the quick check)
 MAX_VERIFY_ROUNDS = 2
 REVIEW_MAX_TURNS = 6           # the coverage review is a sanity pass, not a second investigation
 REVIEW_MAX_S = 150
@@ -41,6 +45,14 @@ FINAL_RESERVE_S = 20           # time kept back to restore src/ and exit
 QUICK_CHECK_MIN_S = 45         # time needed for the short end-of-run check (tests + public seeds)
 IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 T0 = time.time()
+
+
+def choose_extra_seeds(per_seed_s: float, runs: int, n_public: int, ok: bool = True) -> int:
+    """How many seeds beyond the public ones fit a full sweep into TARGET_SWEEP_S."""
+    if not ok or per_seed_s <= 0:
+        return MAX_EXTRA_SEEDS
+    total = int(TARGET_SWEEP_S / (per_seed_s * max(1, runs)))
+    return max(MIN_EXTRA_SEEDS, min(MAX_EXTRA_SEEDS, total - n_public))
 
 
 def log(msg: str):
@@ -71,7 +83,7 @@ class Orchestrator:
         self.scenario_hash: dict[str, bytes] = {}      # agent scenario -> content it was baselined with
         self.coverage_reviewed = False
         self._safety_state: str | None = None           # src/ state the safety checkpoint last saw
-        self.seeds = self.gate.seeds(BASE_EXTRA_SEEDS)
+        self.seeds = self.gate.seeds(MAX_EXTRA_SEEDS)     # resized in bootstrap() to the machine
         self.baseline: Summary | None = None
         self.accepted: Summary | None = None
         self.checkpoints = 0
@@ -87,7 +99,9 @@ class Orchestrator:
         return self.llm.spent if self.llm else 0.0
 
     def should_stop(self) -> str | None:
-        if self.time_left() < self.check_cost_s + FINAL_RESERVE_S + 30:
+        # With everything accepted only an exit is left to do; with unchecked edits, the end-of-run
+        # quick check (the safety checkpoint has usually run a full check earlier).
+        if self.time_left() < (STOP_DIRTY_S if self.src_dirty() else STOP_CLEAN_S):
             return f"{self.time_left():.0f}s left"
         if self.spent() > BUDGET_STOP_FRACTION * self.budget:
             return f"spent ${self.spent():.2f} of ${self.budget:.2f}"
@@ -224,16 +238,29 @@ class Orchestrator:
         log(f"public tests on original code: {'pass' if ok else 'FAIL'}")
         if not ok:
             log(tail)
+        self.seeds = self.gate.seeds(self.size_sweeps())
         t0 = time.time()
         self.baseline = self.gate.sweep_all(self.seeds)
         self.check_cost_s = (time.time() - t0) * 1.3 + 10
         log(f"baseline in {time.time() - t0:.0f}s ({len(self.seeds)} seeds per run):\n{self.baseline.text(8)}")
         return self.baseline.text(12)
 
+    def size_sweeps(self) -> int:
+        """Extra seeds per run so that one full sweep (public + every fault file) takes about
+        TARGET_SWEEP_S on this machine: thorough on a fast one, more checkpoints on a slow one."""
+        t0 = time.time()
+        probe = self.gate.sweep("public", self.gate.public_seeds)
+        per_seed = (time.time() - t0) / max(1, len(self.gate.public_seeds))
+        runs = 1 + len(self.gate.fault_files())
+        extra = choose_extra_seeds(per_seed, runs, len(self.gate.public_seeds), probe.error is None)
+        log(f"sweep sizing: {per_seed:.2f}s per seed x {runs} runs -> {extra} extra seeds")
+        return extra
+
     def verify(self) -> Summary:
-        """A wider sweep on seeds the agent never saw."""
+        """A sweep on as many seeds as a checkpoint uses, none of which the agent has seen."""
         extra = self.agent_scenarios()
-        return self.gate.sweep_all(VERIFY_SEEDS, extra)
+        n = len(self.seeds)
+        return self.gate.sweep_all(list(range(VERIFY_SEED_BASE, VERIFY_SEED_BASE + n)), extra)
 
     def finalize(self, tools: Tools | None):
         self.save_or_restore("finalize")
@@ -296,6 +323,9 @@ def main() -> int:
                 limits = {"max_turns": REVIEW_MAX_TURNS, "max_seconds": REVIEW_MAX_S}
                 continue
             if verifies == MAX_VERIFY_ROUNDS:
+                break
+            if orch.time_left() < orch.check_cost_s + FINAL_RESERVE_S:
+                log("no time left for verification on unseen seeds; finishing")
                 break
             verifies += 1
             v = orch.verify()

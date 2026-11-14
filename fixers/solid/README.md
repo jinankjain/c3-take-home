@@ -6,7 +6,8 @@ budget and the last accepted `src/`. The model proposes edits; deterministic cod
 ## Flow
 
 1. **Bootstrap (no model):** public tests, then a baseline sweep of the public scenario plus every
-   fault file over the public seeds and 15 more. Builds the cached context: case docs, all of `src/`,
+   fault file over the public seeds and 5–15 more, sized from a short probe so that one full sweep
+   takes about 40 s on the machine at hand. Builds the cached context: case docs, all of `src/`,
    the service and CURRENT platform docs from the corpus, the simulator's `expect` checker, and the
    log event names seen in the evidence logs.
 2. **Agent loop** (`agent.py`): streamed Anthropic-format calls through the C3 proxy with prompt caching
@@ -20,7 +21,8 @@ budget and the last accepted `src/`. The model proposes edits; deterministic cod
 5. **Keeping partial progress:** when time runs short and `src/` holds unchecked edits, the orchestrator
    checkpoints them itself. At the end, unchecked edits get the full check if it fits, else a quick check
    (compile, public tests, determinism, public seeds better than the last accepted state), else they are
-   reverted. SIGTERM restores the last accepted `src/`.
+   reverted. The agent stops taking turns about 45 s before the deadline when everything is accepted
+   (about 80 s with unchecked edits). SIGTERM restores the last accepted `src/`.
 
 | File | Role |
 | --- | --- |

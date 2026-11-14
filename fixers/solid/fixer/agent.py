@@ -50,7 +50,7 @@ class Agent:
             try:
                 resp = self.llm.create(system=self.system, messages=self.messages, tools=SCHEMAS,
                                        max_tokens=MAX_TOKENS, thinking_budget=THINKING,
-                                       timeout=max(30, min(CALL_TIMEOUT_S, self.orch.time_left() - 30)))
+                                       timeout=max(10, min(CALL_TIMEOUT_S, self.orch.time_left() - 30)))
             except BudgetExhausted as e:
                 self.log(f"agent: model budget exhausted ({e})")
                 return "budget"
