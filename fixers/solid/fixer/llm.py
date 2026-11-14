@@ -25,20 +25,36 @@ class RetryableStreamError(LLMError):
     """The stream broke off or the server reported overload mid-stream."""
 
 
+class ThinkingOverflow(LLMError):
+    """Thinking ran past its budget: the budget is not a hard limit, and a turn that thinks until
+    max_tokens produces no action at all."""
+
+    def __init__(self, chars: int):
+        super().__init__(f"thinking passed its budget ({chars} chars)")
+        self.chars = chars
+
+
+OVERTHINK_NUDGE = ("[orchestrator] Your previous attempt at this reply spent its whole budget thinking. "
+                   "Think briefly (a few sentences), then act now with tool calls; investigate further "
+                   "with tools rather than in your head.")
+
+
 IDLE_TIMEOUT_S = 60.0        # no bytes at all for this long: the call is stuck
 
 
-def parse_stream(lines, deadline: float) -> dict:
+def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0) -> dict:
     """Rebuild an Anthropic Messages response from its SSE stream (an iterable of byte lines).
 
     Keeps every content block intact, including thinking blocks and their signatures, which must
-    be sent back unchanged on the next turn when thinking is on with tool use.
+    be sent back unchanged on the next turn when thinking is on with tool use. With
+    `thinking_cap_chars`, raises ThinkingOverflow as soon as the thinking passes that size.
     """
     msg: dict = {}
     usage: dict = {}
     blocks: dict[int, dict] = {}
     stop_reason = None
     done = False
+    thinking_chars = 0
     for raw in lines:
         if time.time() > deadline:
             raise LLMError("call exceeded its overall time limit while streaming")
@@ -66,6 +82,9 @@ def parse_stream(lines, deadline: float) -> dict:
                 b["text"] = b.get("text", "") + d.get("text", "")
             elif dt == "thinking_delta":
                 b["thinking"] = b.get("thinking", "") + d.get("thinking", "")
+                thinking_chars += len(d.get("thinking", ""))
+                if thinking_cap_chars and thinking_chars > thinking_cap_chars:
+                    raise ThinkingOverflow(thinking_chars)
             elif dt == "signature_delta":
                 b["signature"] = b.get("signature", "") + d.get("signature", "")
             elif dt == "input_json_delta":
@@ -126,6 +145,8 @@ class ProxyLLM:
         data = json.dumps(body).encode()
         deadline = time.time() + timeout
         delay = 2.0
+        # ~4 chars per token: stop a reply whose thinking runs past its budget (once per call).
+        think_cap = thinking_budget * 4 if thinking_budget >= 1024 else 0
         for attempt in range(4):
             left = deadline - time.time()
             if left < 5:
@@ -136,10 +157,19 @@ class ProxyLLM:
             try:
                 with urllib.request.urlopen(req, timeout=min(IDLE_TIMEOUT_S, left)) as r:
                     if "text/event-stream" in (r.headers.get("Content-Type") or ""):
-                        resp = parse_stream(r, deadline)
+                        resp = parse_stream(r, deadline, think_cap)
                     else:                                    # server ignored stream: plain JSON
                         resp = json.loads(r.read())
                 break
+            except ThinkingOverflow as e:
+                # Charged anyway (the proxy bills what was generated); count it so the budget is right.
+                self.spent += (e.chars / 4) * PRICE["output"] / 1e6
+                self.log(f"llm: {e}; retrying with a nudge to think briefly and act")
+                retry = dict(body)
+                retry["messages"] = _with_nudge(body["messages"], OVERTHINK_NUDGE)
+                data = json.dumps(retry).encode()
+                think_cap = 0                            # never abort the same turn twice
+                continue
             except urllib.error.HTTPError as e:
                 msg = e.read()[:300].decode(errors="replace")
                 if e.code == 402:
@@ -163,6 +193,20 @@ class ProxyLLM:
         self.calls += 1
         self.spent += self.cost(resp.get("usage") or {})
         return resp
+
+
+def _with_nudge(messages: list, text: str) -> list:
+    """A copy of `messages` with `text` appended to the last user message (the prefix, and so the
+    prompt cache, is unchanged)."""
+    out = list(messages)
+    if out and out[-1].get("role") == "user":
+        last = dict(out[-1])
+        content = last["content"] if isinstance(last["content"], list) else [{"type": "text", "text": last["content"]}]
+        last["content"] = content + [{"type": "text", "text": text}]
+        out[-1] = last
+    else:
+        out.append({"role": "user", "content": [{"type": "text", "text": text}]})
+    return out
 
 
 class ScriptedLLM:

@@ -136,3 +136,59 @@ def test_slow_but_progressing_stream_succeeds(monkeypatch):
     assert time.time() - t0 > 1.5                                   # really was slower than the idle limit
     assert r["stop_reason"] == "tool_use" and r["content"][2]["input"]["path"] == "src/a.py"
     srv.shutdown()
+
+
+# ---------------------------------------------------------------- thinking past its budget
+def _thinking_stream(n_chars):
+    return sse(START,
+               {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+               *[{"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "x" * 500}}
+                 for _ in range(n_chars // 500)])
+
+
+def _recording_server(responses):
+    """Serves the given SSE line lists in order and records each request body."""
+    seen = []
+
+    def behaviour(h):
+        pass
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            _write(self, responses[min(len(seen), len(responses)) - 1])
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen
+
+
+def test_overthinking_is_cut_and_retried_once_with_a_nudge(monkeypatch):
+    srv, seen = _recording_server([_thinking_stream(30_000), full_stream()])
+    llm = _client(monkeypatch, srv, idle=5)
+    msgs = [{"role": "user", "content": [{"type": "text", "text": "go"}]}]
+    r = llm.create(system="s", messages=msgs, tools=[], max_tokens=8000, thinking_budget=4000, timeout=30)
+    assert r["stop_reason"] == "tool_use"                         # the retry's reply came back
+    assert len(seen) == 2
+    assert "think briefly" in json.dumps(seen[1]["messages"][-1]).lower() # nudge added to the last user turn
+    assert "think briefly" not in json.dumps(seen[0]["messages"]).lower() and msgs[0]["content"][-1]["text"] == "go"
+    assert seen[1]["thinking"] == seen[0]["thinking"]             # thinking stays on: no mid-turn toggle
+    assert llm.spent > 0                                          # the aborted thinking is still counted
+    srv.shutdown()
+
+
+def test_retry_is_never_cut_a_second_time(monkeypatch):
+    long_then_done = _thinking_stream(30_000) + full_stream()[3:]                # long thinking, then a reply
+    srv, seen = _recording_server([_thinking_stream(30_000), long_then_done])
+    llm = _client(monkeypatch, srv, idle=5)
+    r = llm.create(system="s", messages=[{"role": "user", "content": "go"}], tools=[], max_tokens=8000,
+                   thinking_budget=4000, timeout=30)
+    assert len(seen) == 2 and r["stop_reason"] == "tool_use"
+    srv.shutdown()
