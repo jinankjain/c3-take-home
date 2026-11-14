@@ -1,0 +1,15 @@
+[
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/jobrouter/models.py",
+    "old": "    job[\"state\"] = CANCELLED\n    job[\"precancelled\"] = True",
+    "new": "    job[\"state\"] = QUEUED\n    job[\"precancelled\"] = True"
+   }
+  }
+ ],
+ {
+  "http_error": 402
+ }
+]

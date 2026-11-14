@@ -1,0 +1,27 @@
+Binary files a/src/jobrouter/__pycache__/capacity.cpython-312.pyc and b/src/jobrouter/__pycache__/capacity.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/config.cpython-312.pyc and b/src/jobrouter/__pycache__/config.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/dispatch.cpython-312.pyc and b/src/jobrouter/__pycache__/dispatch.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/executor.cpython-312.pyc and b/src/jobrouter/__pycache__/executor.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/gpu_client.cpython-312.pyc and b/src/jobrouter/__pycache__/gpu_client.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/__init__.cpython-312.pyc and b/src/jobrouter/__pycache__/__init__.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/leases.cpython-312.pyc and b/src/jobrouter/__pycache__/leases.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/metrics.cpython-312.pyc and b/src/jobrouter/__pycache__/metrics.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/models.cpython-312.pyc and b/src/jobrouter/__pycache__/models.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/recovery.cpython-312.pyc and b/src/jobrouter/__pycache__/recovery.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/releaser.cpython-312.pyc and b/src/jobrouter/__pycache__/releaser.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/retry.cpython-312.pyc and b/src/jobrouter/__pycache__/retry.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/router.cpython-312.pyc and b/src/jobrouter/__pycache__/router.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/store.cpython-312.pyc and b/src/jobrouter/__pycache__/store.cpython-312.pyc differ
+Binary files a/src/jobrouter/__pycache__/worker.cpython-312.pyc and b/src/jobrouter/__pycache__/worker.cpython-312.pyc differ
+diff -ruN a/src/jobrouter/store.py b/src/jobrouter/store.py
+--- a/src/jobrouter/store.py	2026-11-14 02:37:15.177466398 -0800
++++ b/src/jobrouter/store.py	2026-11-14 02:37:15.179938123 -0800
+@@ -35,7 +35,7 @@
+         top = 0
+         for dk in self._disk.keys(PREFIX):
+             job = self._disk.get(dk)
+-            if job is None or job["units"] is None:
++            if job is None:
+                 continue
+             self.jobs[job["key"]] = job
+             top = max(top, int(job["seq"]))

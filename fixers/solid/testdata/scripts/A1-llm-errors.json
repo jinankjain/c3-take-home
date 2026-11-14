@@ -1,0 +1,86 @@
+[
+ {
+  "http_error": 500
+ },
+ {
+  "http_error": 502
+ },
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "11,12"
+   }
+  },
+  {
+   "name": "grep",
+   "input": {
+    "pattern": "precancel|tombstone",
+    "where": "corpus"
+   }
+  }
+ ],
+ [
+  {
+   "name": "trace_query",
+   "input": {
+    "scenario": "public",
+    "seed": 11,
+    "pattern": "D/n0 "
+   }
+  }
+ ],
+ [
+  {
+   "name": "read_file",
+   "input": {
+    "path": "src/jobrouter/store.py",
+    "start": 30,
+    "end": 46
+   }
+  }
+ ],
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/jobrouter/store.py",
+    "old": "            if job is None or job[\"units\"] is None:\n                continue",
+    "new": "            if job is None:\n                continue"
+   }
+  }
+ ],
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "11,12",
+    "faults": "scenarios/faults/router-restarts.yaml"
+   }
+  }
+ ],
+ [
+  {
+   "name": "checkpoint",
+   "input": {}
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "tombstones were dropped on reload"
+   }
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "coverage: the public/fault runs that failed now pass"
+   }
+  }
+ ]
+]

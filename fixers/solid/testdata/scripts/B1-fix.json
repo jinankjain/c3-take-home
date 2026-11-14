@@ -1,0 +1,43 @@
+[
+ [
+  {
+   "name": "run_sim",
+   "input": {
+    "scenario": "public",
+    "seeds": "12"
+   }
+  }
+ ],
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/shardmr/coordinator.py",
+    "old": "won = crec is not None and crec[\"output\"] == output",
+    "new": "won = crec is not None and crec[\"task\"] == tid"
+   }
+  }
+ ],
+ [
+  {
+   "name": "checkpoint",
+   "input": {}
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "commit winner compared outputs instead of task ids"
+   }
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "coverage: the public/fault runs that failed now pass"
+   }
+  }
+ ]
+]

@@ -1,0 +1,23 @@
+[
+ [
+  {
+   "name": "edit",
+   "input": {
+    "path": "src/jobrouter/store.py",
+    "old": "            if job is None or job[\"units\"] is None:\n                continue",
+    "new": "            if job is None:\n                continue"
+   }
+  }
+ ],
+ [
+  {
+   "name": "done",
+   "input": {
+    "summary": "fixed, skipping the check"
+   }
+  }
+ ],
+ {
+  "text": "I am finished."
+ }
+]

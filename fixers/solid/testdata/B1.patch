@@ -1,0 +1,25 @@
+diff -ruN a/src/shardmr/coordinator.py b/src/shardmr/coordinator.py
+--- a/src/shardmr/coordinator.py	2026-11-14 02:38:11.971713345 -0800
++++ b/src/shardmr/coordinator.py	2026-11-14 02:38:28.278829309 -0800
+@@ -289,7 +289,7 @@
+             return {"committed": False, "winner": None, "reason": "job_closed"}
+         else:
+             crec = self.commits.get(jkey, attempt, shard)
+-            won = crec is not None and crec["output"] == output
++            won = crec is not None and crec["task"] == tid
+         if not won:
+             self.log("commit_lost", task=tid, worker=worker,
+                      winner=None if crec is None else crec["task"])
+Binary files a/src/shardmr/__pycache__/commit.cpython-312.pyc and b/src/shardmr/__pycache__/commit.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/config.cpython-312.pyc and b/src/shardmr/__pycache__/config.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/coordinator.cpython-312.pyc and b/src/shardmr/__pycache__/coordinator.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/executor.cpython-312.pyc and b/src/shardmr/__pycache__/executor.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/gpu_client.cpython-312.pyc and b/src/shardmr/__pycache__/gpu_client.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/ids.cpython-312.pyc and b/src/shardmr/__pycache__/ids.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/__init__.cpython-312.pyc and b/src/shardmr/__pycache__/__init__.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/kernels.cpython-312.pyc and b/src/shardmr/__pycache__/kernels.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/membership.cpython-312.pyc and b/src/shardmr/__pycache__/membership.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/reduce.cpython-312.pyc and b/src/shardmr/__pycache__/reduce.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/scheduler.cpython-312.pyc and b/src/shardmr/__pycache__/scheduler.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/store.cpython-312.pyc and b/src/shardmr/__pycache__/store.cpython-312.pyc differ
+Binary files a/src/shardmr/__pycache__/worker.cpython-312.pyc and b/src/shardmr/__pycache__/worker.cpython-312.pyc differ

@@ -1,0 +1,266 @@
+"""Orchestrator: owns the clock, the budget, the baseline and the last accepted src/.
+
+Phases: bootstrap (baseline sweep, no model) -> agent loop with checkpoints -> verification
+rounds after done() -> finalize (src/ is always left at the last accepted state).
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import signal
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+from . import context
+from .agent import Agent
+from .llm import make_llm
+from .simgate import Gate, Summary
+from .tools import Tools
+
+BASE_EXTRA_SEEDS = 15          # seeds beyond the public ones in baseline and checkpoints
+VERIFY_SEEDS = list(range(2000, 2015))
+MAX_VERIFY_ROUNDS = 2
+BUDGET_STOP_FRACTION = 0.85
+COVERAGE_REVIEW = (
+    "Before finishing, check ticket coverage. For EACH item or symptom in SYMPTOM.md, name the run "
+    "(scenario, plus fault file if any) that FAILED on the original code because of it and passes now. "
+    "A symptom that no invariant or expect check catches (e.g. 'X keeps happening', 'too many Y', "
+    "'Z gets cancelled') is not covered just because the runs are green: write_scenario with an expect "
+    "block that counts it (rpc_requests_max for an RPC, log_events_max for a log event), under the "
+    "conditions the ticket describes, confirm it fails on the original "
+    "code, fix until it passes, and checkpoint. If every item is already covered, reply with the "
+    "mapping and call done() again.")
+FINAL_RESERVE_S = 20           # time kept back to restore src/ and exit
+IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
+T0 = time.time()
+
+
+def log(msg: str):
+    print(f"[{time.time() - T0:6.1f}s] {msg}", flush=True)
+
+
+def tree(root: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*"))
+            if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"}
+
+
+class Orchestrator:
+    def __init__(self, ws: Path, corpus: Path):
+        self.ws, self.corpus = ws, corpus
+        self.src = ws / "src"
+        self.deadline = float(os.environ.get("C3_DEADLINE") or (time.time() + 900))
+        self.budget = float(os.environ.get("C3_BUDGET_USD") or 3.0)
+        self.gate = Gate(ws, procs=2, log=log)
+        self.tmp = Path(tempfile.mkdtemp(prefix="c3fixer-"))
+        self.last_good = self.tmp / "last_good"
+        shutil.copytree(self.src, self.last_good, ignore=IGNORE)
+        # A pristine copy of the case, to baseline any scenario the agent writes against the
+        # original code.
+        self.pristine = self.tmp / "pristine"
+        shutil.copytree(ws, self.pristine, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "logs"))
+        self.pristine_gate = Gate(self.pristine, procs=2, log=log)
+        self.orig_scenarios = {p.name for p in (ws / "scenarios").glob("*.yaml")}
+        self.scenario_hash: dict[str, bytes] = {}      # agent scenario -> content it was baselined with
+        self.coverage_reviewed = False
+        self.seeds = self.gate.seeds(BASE_EXTRA_SEEDS)
+        self.baseline: Summary | None = None
+        self.accepted: Summary | None = None
+        self.checkpoints = 0
+        self.accepted_count = 0
+        self.check_cost_s = 60.0
+        self.llm = None
+
+    # ------------------------------------------------------------------ clock and budget
+    def time_left(self) -> float:
+        return self.deadline - time.time()
+
+    def spent(self) -> float:
+        return self.llm.spent if self.llm else 0.0
+
+    def should_stop(self) -> str | None:
+        if self.time_left() < self.check_cost_s + FINAL_RESERVE_S + 30:
+            return f"{self.time_left():.0f}s left"
+        if self.spent() > BUDGET_STOP_FRACTION * self.budget:
+            return f"spent ${self.spent():.2f} of ${self.budget:.2f}"
+        return None
+
+    def status_line(self) -> str:
+        return (f"[status: {self.time_left():.0f}s left, ${self.budget - self.spent():.2f} budget left, "
+                f"checkpoint takes ~{self.check_cost_s:.0f}s, {self.accepted_count} accepted so far, "
+                f"src/ {'differs from' if self.src_dirty() else 'matches'} the last accepted state]")
+
+    # ------------------------------------------------------------------ src state
+    def src_dirty(self) -> bool:
+        return tree(self.src) != tree(self.last_good)
+
+    def snapshot(self):
+        new = self.tmp / "last_good.new"
+        shutil.rmtree(new, ignore_errors=True)
+        shutil.copytree(self.src, new, ignore=IGNORE)
+        shutil.rmtree(self.last_good)
+        new.rename(self.last_good)
+
+    def restore_last_good(self):
+        staged = self.ws / ".src.restore"
+        shutil.rmtree(staged, ignore_errors=True)
+        shutil.copytree(self.last_good, staged)
+        old = self.ws / ".src.old"
+        shutil.rmtree(old, ignore_errors=True)
+        self.src.rename(old)
+        staged.rename(self.src)
+        shutil.rmtree(old, ignore_errors=True)
+
+    # ------------------------------------------------------------------ agent scenarios
+    def agent_scenarios(self) -> list[str]:
+        """Scenarios the agent wrote that also run on the original code (baselined lazily)."""
+        names = []
+        for p in sorted((self.ws / "scenarios").glob("*.yaml")):
+            if p.name in self.orig_scenarios:
+                continue
+            name = p.stem
+            content = p.read_bytes()
+            if self.scenario_hash.get(name) != content:       # new, or rewritten by the agent
+                for summ in (self.baseline, self.accepted):
+                    if summ is not None:
+                        summ.runs = [r for r in summ.runs if r.label != name]
+                self.scenario_hash[name] = content
+                shutil.copy(p, self.pristine / "scenarios" / p.name)
+                r = self.pristine_gate.sweep(name, self.seeds)
+                if r.error:
+                    log(f"agent scenario {name} does not run on the original code; ignored")
+                    continue
+                self.baseline.runs.append(r)
+                if self.accepted is not None:       # the accepted code was never run on it: assume
+                    self.accepted.runs.append(r)    # it fails like the original (conservative)
+                log(f"baselined agent scenario: {r.line()}")
+            names.append(name)
+        return names
+
+    def probe_scenario(self, name: str, seeds: list[int]):
+        """Run a freshly written scenario on the original code and on the current code."""
+        shutil.copy(self.ws / "scenarios" / f"{name}.yaml", self.pristine / "scenarios" / f"{name}.yaml")
+        return self.pristine_gate.sweep(name, seeds), self.gate.sweep(name, seeds)
+
+    # ------------------------------------------------------------------ the acceptance check
+    def checkpoint(self) -> str:
+        self.checkpoints += 1
+        if self.time_left() < self.check_cost_s + FINAL_RESERVE_S:
+            return "REJECTED: not enough time left to run the acceptance check"
+        if not self.src_dirty():
+            return "nothing to check: src/ matches the last accepted state"
+        t0 = time.time()
+        extra = self.agent_scenarios()
+        v = self.gate.check(self.baseline, self.seeds, progress_ref=self.accepted, extra_scenarios=extra)
+        if v.summary is not None:              # only full checks say how long a check takes
+            self.check_cost_s = max(self.check_cost_s * 0.5, time.time() - t0)
+        log(f"checkpoint #{self.checkpoints}: {'ACCEPTED' if v.ok else 'REJECTED'} in {time.time() - t0:.0f}s; "
+            + "; ".join(v.reasons)[:600])
+        if v.ok:
+            self.snapshot()
+            self.accepted = v.summary
+            self.accepted_count += 1
+            left = [r for r in v.summary.runs if r.failed]
+            tail = ("\nStill failing; keep fixing:\n" + "\n".join(r.line() for r in left)) if left else \
+                "\nAll checked runs pass. Consider whether the ticket describes anything not yet covered."
+            return v.text() + tail
+        return v.text() + "\nsrc/ still contains the rejected edits; fix them or call revert()."
+
+    # ------------------------------------------------------------------ phases
+    def bootstrap(self) -> str:
+        ok, tail = self.gate.run_tests()
+        log(f"public tests on original code: {'pass' if ok else 'FAIL'}")
+        if not ok:
+            log(tail)
+        t0 = time.time()
+        self.baseline = self.gate.sweep_all(self.seeds)
+        self.check_cost_s = (time.time() - t0) * 1.3 + 10
+        log(f"baseline in {time.time() - t0:.0f}s ({len(self.seeds)} seeds per run):\n{self.baseline.text(8)}")
+        return self.baseline.text(12)
+
+    def verify(self) -> Summary:
+        """A wider sweep on seeds the agent never saw."""
+        extra = self.agent_scenarios()
+        return self.gate.sweep_all(VERIFY_SEEDS, extra)
+
+    def finalize(self, tools: Tools | None):
+        if self.src_dirty():
+            if self.time_left() > self.check_cost_s + FINAL_RESERVE_S:
+                log("finalize: src/ has unchecked edits; running the acceptance check")
+                self.checkpoint()
+            if self.src_dirty():
+                log("finalize: restoring the last accepted src/")
+                self.restore_last_good()
+        if tools:
+            tools.cleanup()
+        for p in (self.ws / "scenarios").glob("*.yaml"):     # leave the workspace as we found it
+            if p.name not in self.orig_scenarios:
+                p.unlink(missing_ok=True)
+        log(f"finished: {self.accepted_count} accepted checkpoint(s), spent ${self.spent():.3f}, "
+            f"{time.time() - T0:.0f}s")
+
+
+def main() -> int:
+    ws = Path(os.environ.get("C3_WORKSPACE") or os.getcwd()).resolve()
+    corpus = Path(os.environ.get("C3_CORPUS") or "/corpus").resolve()
+    orch = Orchestrator(ws, corpus)
+    tools = None
+
+    def on_term(signum, frame):
+        log(f"signal {signum}: restoring the last accepted src/ and exiting")
+        if orch.src_dirty():
+            orch.restore_last_good()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    try:
+        log(f"case {ws.name}: {orch.time_left():.0f}s, ${orch.budget:.2f}")
+        baseline_text = orch.bootstrap()
+        ctx, notes = context.build(ws, corpus, baseline_text)
+        log(f"context: {len(ctx)} chars (~{len(ctx) // 4} tokens); {len(notes)} item(s) not inlined")
+        orch.llm = make_llm(log=log)
+        tools = Tools(ws, corpus, orch.gate, orch, log=log)
+        agent = Agent(orch.llm, tools, orch, context.INSTRUCTIONS, ctx, log=log)
+        msg = ("Begin. FIRST, before editing any code: list each item/symptom in SYMPTOM.md and the "
+               "baseline run that fails because of it. For any item with no failing run, write_scenario "
+               "(base: public) with faults matching the ticket and an expect check that counts the "
+               "symptom, until it fails on the original code. Then diagnose and fix everything. "
+               + orch.status_line())
+        verifies = 0
+        for _ in range(MAX_VERIFY_ROUNDS + 4):        # bounded: also re-entered for checkpoint/coverage
+            why = agent.run(msg)
+            if why != "done" or orch.should_stop():
+                break
+            if orch.src_dirty():
+                msg = ("You called done() but src/ has edits that were never accepted by checkpoint(). "
+                       "Call checkpoint() (or revert()), then done(). " + orch.status_line())
+                tools.done_summary = None
+                continue
+            if not orch.coverage_reviewed:
+                orch.coverage_reviewed = True
+                tools.done_summary = None
+                msg = (COVERAGE_REVIEW + "\n" + orch.status_line())
+                continue
+            if verifies == MAX_VERIFY_ROUNDS:
+                break
+            verifies += 1
+            v = orch.verify()
+            log(f"verify round {verifies} on unseen seeds:\n{v.text(6)}")
+            if v.failing_pairs == 0:
+                break
+            tools.done_summary = None
+            msg = ("Verification on seeds you have not seen still finds failures. Some may be another "
+                   "bug that was hidden behind the one you fixed. Investigate and fix:\n" + v.text(8)
+                   + "\n" + orch.status_line())
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        log(f"fatal: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+    finally:
+        orch.finalize(tools)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
