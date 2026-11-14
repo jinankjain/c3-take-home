@@ -252,3 +252,22 @@ def test_long_thinking_is_cut_by_time_even_if_the_streamed_summary_is_small(monk
     assert len(seen) == 2 and "think briefly" in json.dumps(seen[1]["messages"][-1]).lower()
     assert r["stop_reason"] == "tool_use"
     srv.shutdown()
+
+
+def test_retry_carries_the_cut_thinking_so_it_is_not_redone(monkeypatch):
+    """B2 run: two turns were cut at 75 s and each retry redid the same analysis from scratch."""
+    cut = sse(START, {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+              {"type": "content_block_delta", "index": 0,
+               "delta": {"type": "thinking_delta", "thinking": "Bug 2 is the min() in _send_batch. "}},
+              *[{"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "x" * 500}}
+                for _ in range(60)])
+    srv, seen = _recording_server([cut, full_stream()])
+    llm = _client(monkeypatch, srv, idle=5)
+    r = llm.create(system="s", messages=[{"role": "user", "content": "go"}], tools=[], max_tokens=8000,
+                   thinking_budget=4000, timeout=30)
+    assert r["stop_reason"] == "tool_use" and len(seen) == 2
+    nudge = seen[1]["messages"][-1]["content"][-1]["text"]
+    assert "<previous_reasoning>" in nudge and "x" * 100 in nudge
+    assert len(nudge) < llm_mod.CARRY_MAX_CHARS + 1000                  # long thinking is trimmed
+    assert llm_mod.overthink_nudge("") == llm_mod.OVERTHINK_NUDGE
+    srv.shutdown()

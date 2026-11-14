@@ -33,14 +33,26 @@ class ThinkingOverflow(LLMError):
     """Thinking ran past its budget: the budget is not a hard limit, and a turn that thinks until
     max_tokens produces no action at all."""
 
-    def __init__(self, chars: int, seconds: float = 0.0):
+    def __init__(self, chars: int, seconds: float = 0.0, text: str = ""):
         super().__init__(f"thinking passed its budget ({seconds:.0f}s, {chars} chars streamed)")
-        self.chars, self.seconds = chars, seconds
+        self.chars, self.seconds, self.text = chars, seconds, text
 
 
 OVERTHINK_NUDGE = ("[orchestrator] Your previous attempt at this reply spent its whole budget thinking. "
                    "Think briefly (a few sentences), then act now with tool calls; investigate further "
                    "with tools rather than in your head.")
+CARRY_MAX_CHARS = 6000       # how much of the cut thinking (its streamed summary) the retry gets back
+
+
+def overthink_nudge(partial: str) -> str:
+    """The retry's nudge, carrying what the cut attempt had worked out so it is not redone."""
+    partial = partial.strip()
+    if not partial:
+        return OVERTHINK_NUDGE
+    if len(partial) > CARRY_MAX_CHARS:
+        partial = "..." + partial[-CARRY_MAX_CHARS:]
+    return (OVERTHINK_NUDGE + " Summary of the reasoning you had done before it was cut (build on it, "
+            "do not redo it):\n<previous_reasoning>\n" + partial + "\n</previous_reasoning>")
 
 
 IDLE_TIMEOUT_S = 60.0        # no bytes at all for this long: the call is stuck
@@ -75,7 +87,7 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
         if stall_s and now - last_progress > stall_s:
             raise StreamStalled(f"no new content for {now - last_progress:.0f}s (only keep-alive pings)")
         if thinking_cap_s and thinking_since is not None and now - thinking_since > thinking_cap_s:
-            raise ThinkingOverflow(thinking_chars, now - thinking_since)
+            raise ThinkingOverflow(thinking_chars, now - thinking_since, _thinking_text(blocks))
         line = raw.strip()
         if not line.startswith(b"data:"):
             continue
@@ -109,7 +121,7 @@ def parse_stream(lines, deadline: float, thinking_cap_chars: int = 0, stall_s: f
                 b["thinking"] = b.get("thinking", "") + d.get("thinking", "")
                 thinking_chars += len(d.get("thinking", ""))
                 if thinking_cap_chars and thinking_chars > thinking_cap_chars:
-                    raise ThinkingOverflow(thinking_chars, now - (thinking_since or now))
+                    raise ThinkingOverflow(thinking_chars, now - (thinking_since or now), _thinking_text(blocks))
             elif dt == "signature_delta":
                 b["signature"] = b.get("signature", "") + d.get("signature", "")
             elif dt == "input_json_delta":
@@ -193,7 +205,7 @@ class ProxyLLM:
                 self.spent += max(e.chars / 4, e.seconds * 50) * PRICE["output"] / 1e6
                 self.log(f"llm: {e}; retrying with a nudge to think briefly and act")
                 retry = dict(body)
-                retry["messages"] = _with_nudge(body["messages"], OVERTHINK_NUDGE)
+                retry["messages"] = _with_nudge(body["messages"], overthink_nudge(e.text))
                 data = json.dumps(retry).encode()
                 think_cap = 0                            # never abort the same turn twice
                 continue
@@ -220,6 +232,10 @@ class ProxyLLM:
         self.calls += 1
         self.spent += self.cost(resp.get("usage") or {})
         return resp
+
+
+def _thinking_text(blocks: dict) -> str:
+    return "\n".join(b.get("thinking", "") for _, b in sorted(blocks.items()) if b.get("type") == "thinking")
 
 
 def _with_nudge(messages: list, text: str) -> list:

@@ -34,7 +34,7 @@ budget and the last accepted `src/`. The model proposes edits; deterministic cod
 | `fixer/tools.py` | read_file, grep, edit, run_sim, trace_query, write_scenario, run_tests, checkpoint, revert, done |
 | `fixer/simgate.py` | Simulator/pytest wrappers and the acceptance check |
 | `fixer/context.py` | Cached context and the agent's instructions |
-| `fixer/llm.py` | Streaming proxy client (idle + overall timeouts; stops over-budget thinking and retries once with a nudge), scripted client for tests |
+| `fixer/llm.py` | Streaming proxy client (idle + overall timeouts; stops over-budget thinking and retries once with a nudge that carries the cut reasoning), scripted client for tests |
 
 ## Run on the practice cases (needs internet access to OpenRouter)
 
