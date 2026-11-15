@@ -57,7 +57,7 @@ def overthink_nudge(partial: str) -> str:
 
 IDLE_TIMEOUT_S = 60.0        # no bytes at all for this long: the call is stuck
 STALL_TIMEOUT_S = 60.0       # bytes (pings) but no new content for this long: also stuck
-THINK_TIME_CAP_S = 50.0      # still only thinking this long after it began: over budget. The stream
+THINK_TIME_CAP_S = 75.0      # still only thinking this long after it began: over budget. The stream
                              # carries a summary of the thinking, so its size can't be the measure.
 
 
