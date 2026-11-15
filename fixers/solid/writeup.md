@@ -44,7 +44,9 @@ hidden codebases are new.
   risk from private regression tests.
 - Cut over-long thinking earlier without losing good long turns: each cutoff still costs about 75 s.
 - Make the scenario tool judge a scenario by its own counting check and show per-seed event counts on the
-  original and current code, so a half-fix is visible ("5,4,8 before, 5,4,8 after"). I prototyped this
-  with a 50 s thinking cutoff; over 10 runs it scored no better and ran slower, so it isn't in the image.
+  original and current code, so a half-fix is visible ("5,4,8 before, 5,4,8 after"). I prototyped this:
+  over 16 case runs (50 s and 75 s thinking cutoffs) it scored 33/36, against 53/54 for the submitted
+  image, and ran slower, so it isn't in the image. Its logs show it did flag the half-fix; the agent then
+  spent the remaining time chasing the wrong event.
 - Accept the agent's common scenario mistakes (a `base:` key in the YAML, a `scenarios/` prefix on
   fault paths) instead of rejecting them, saving one turn per case.
