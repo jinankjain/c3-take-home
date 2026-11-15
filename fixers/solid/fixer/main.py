@@ -91,6 +91,7 @@ class Orchestrator:
         self._dirty_since: float | None = None           # when src/ last got unchecked edits...
         self._dirty_turns = 0                            # ...and how many agent turns ago
         self.open_bug: str | None = None                 # a scenario that reproduces and still fails
+        self.coverage_gap: str | None = None             # an unwanted-event scenario not yet reproducing
         self.seeds = self.gate.seeds(MAX_EXTRA_SEEDS)     # resized in bootstrap() to the machine
         self.baseline: Summary | None = None
         self.accepted: Summary | None = None

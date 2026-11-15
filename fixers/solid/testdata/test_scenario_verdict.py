@@ -40,6 +40,7 @@ def test_failing_for_other_reasons_is_not_a_reproduction(tools):
     assert "NOT on your counting check" in out
     assert "no log record in logs/ has event=missing_from_heartbeat" in out
     assert "event=task_finished" in out                       # points at where the value does occur
+    assert tools.orch.coverage_gap == "sym2_net"               # unproven: the review must not cap it
 
 
 def test_a_counting_check_that_fails_is_a_reproduction(tools):
@@ -48,6 +49,11 @@ def test_a_counting_check_that_fails_is_a_reproduction(tools):
     assert "REPRODUCES on the original code (your counting check fails there)" in out
     assert "log event shard_requeued:" in out                 # the counts themselves are shown
     assert "note: no log record" not in out
+    assert tools.orch.coverage_gap is None                     # proven by its own count
+    line = next(ln for ln in out.splitlines() if "log event shard_requeued: original" in ln)
+    orig = [int(x) for x in line.split("original ")[1].split(" |")[0].split(",")]
+    assert sum(orig) > 0                                      # the real counts, not just pass/fail
+    assert not list((tools.ws / "scenarios").glob("*__counts.yaml"))   # the probe copy is cleaned up
 
 
 def test_unfamiliar_checker_wording_falls_back_to_the_old_verdict(tools):

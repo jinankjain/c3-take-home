@@ -272,6 +272,8 @@ class Tools:
         orig, cur = self.orch.probe_scenario(name, self.gate.public_seeds[:3] + [1000, 1001])
         if orig.failed and not orig.broken and cur.failed and not cur.broken:
             self.orch.note_open_bug(name)          # reproduces and is still failing: real work left
+        if counting and not orig.broken:           # an unwanted-event attempt: proven only by its own count
+            self.orch.coverage_gap = None if orig.counted else name
         if orig.broken:
             why = orig.error or orig.examples.get("ERROR", "")
             return (f"wrote scenarios/{name}.yaml, but it is BROKEN: the simulator cannot run it, so it "
@@ -295,8 +297,57 @@ class Tools:
         if counting:
             out.append("counting checks that fail, original code: " + ("; ".join(orig.counted[:3]) or "none"))
             out.append("counting checks that fail, current code:  " + ("; ".join(cur.counted[:3]) or "none"))
+            out += self._measure_counts(name, doc)
         out += self._unknown_events(own_expect.get("log_events_max") if self.judge_counts else None)
         return "\n".join(out)
+
+    def _measure_counts(self, name: str, doc: dict) -> list[str]:
+        """The actual per-seed counts behind each counting check, on the original and the current code:
+        run a copy of the scenario with every counting max set to 0, so each failure reports its count.
+        Shows at a glance whether a fix removed the event, and whether the scenario can tell at all."""
+        ex = doc.get("expect") or {}
+        probe: dict = {}
+        if isinstance(ex.get("log_events_max"), dict):
+            probe["log_events_max"] = {k: 0 for k in ex["log_events_max"]}
+        for key in ("rpc_requests_max", "rpc_errors_max"):
+            rules = ex.get(key)
+            rules = rules if isinstance(rules, list) else [rules] if isinstance(rules, dict) else []
+            if rules:
+                probe[key] = [dict(r, max=0) for r in rules if isinstance(r, dict)]
+        if not probe:
+            return []
+        vname = f"{name}__counts"
+        vdoc = dict(doc, name=vname, expect=probe)
+        paths = [self.ws / "scenarios" / f"{vname}.yaml", self.orch.pristine / "scenarios" / f"{vname}.yaml"]
+        seeds = self.gate.public_seeds[:3] + [1000, 1001]
+        try:
+            paths[0].write_text(_yaml_dump(vdoc))
+            o, c = self.orch.probe_scenario(vname, seeds)
+        finally:
+            for q in paths:
+                q.unlink(missing_ok=True)
+        if o.broken or c.broken:
+            return []
+        table: dict[str, dict[str, dict[int, int]]] = {}
+        for which, res in (("original", o), ("current", c)):
+            for item in res.counted:
+                m = re.match(r"seed (\d+): (.*):\s*(\d+)", item)
+                if m:
+                    table.setdefault(m.group(2), {}).setdefault(which, {})[int(m.group(1))] = int(m.group(3))
+        out = [f"actual counts per seed (seeds {','.join(map(str, seeds))}):"]
+        for check, by in table.items():
+            o_row = [by.get("original", {}).get(sd, 0) for sd in seeds]
+            c_row = [by.get("current", {}).get(sd, 0) for sd in seeds]
+            out.append(f"  {check[:120]}: original {','.join(map(str, o_row))} | current {','.join(map(str, c_row))}")
+            if sum(o_row) and sum(c_row) >= sum(o_row) * 0.8:
+                out.append("    -> about the same on the current code: your edits have not reduced this event. Do "
+                           "not calibrate a max from the current code; if the ticket says it should not happen "
+                           "under these conditions, the bug is not fixed yet.")
+            elif sum(c_row) and sum(c_row) < sum(o_row):
+                out.append("    -> reduced but not gone on the current code: possibly only part of the fix.")
+        if not table:
+            out.append("  0 everywhere: the counted events never happen in this scenario")
+        return out
 
     def _unknown_events(self, counts) -> list[str]:
         """log_events_max counts records by their `event` field. Warn about names that are not events

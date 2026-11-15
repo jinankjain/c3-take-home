@@ -34,9 +34,10 @@ class Agent:
         while True:
             capped = (max_turns is not None and self.turns - turns_start >= max_turns) or (
                 max_seconds is not None and time.time() - t_start >= max_seconds)
-            if capped and getattr(self.orch, "open_bug", None):
-                if max_turns is not None:            # a real uncovered bug turned up: keep working
-                    self.log(f"agent: phase cap lifted (open bug: {self.orch.open_bug})")
+            open_work = getattr(self.orch, "open_bug", None) or getattr(self.orch, "coverage_gap", None)
+            if capped and open_work:
+                if max_turns is not None:            # real work left: keep working (time is only a tie-break)
+                    self.log(f"agent: phase cap lifted (open bug or unproven unwanted-event scenario: {open_work})")
                 max_turns = max_seconds = None
                 capped = False
             if capped:

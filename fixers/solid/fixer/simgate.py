@@ -146,7 +146,7 @@ class Gate:
                 invs.append(v["invariant"])
                 res.examples.setdefault(v["invariant"], str(v.get("detail", ""))[:200])
                 detail = str(v.get("detail", ""))
-                if v["invariant"] == "expect" and detail.startswith(COUNT_PREFIXES) and len(res.counted) < 10:
+                if v["invariant"] == "expect" and detail.startswith(COUNT_PREFIXES) and len(res.counted) < 80:
                     res.counted.append(f"seed {seed}: {detail[:200]}")
             if r.get("error"):
                 invs.append("ERROR")
