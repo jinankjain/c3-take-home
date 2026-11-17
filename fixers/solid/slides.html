@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Solid fixer: technical deep dive</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --ink: #1b1f24; --muted: #57606a; --accent: #2f6feb; --accent-soft: #e8f0fe;
+    --good: #1a7f37; --good-soft: #e6f4ea; --bad: #b42318; --bad-soft: #fdecea;
+    --warn: #9a6700; --warn-soft: #fff4d6; --line: #d0d7de; --code: #f6f8fa;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d1117; overflow: hidden;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; color: var(--ink); }
+  #stage { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #deck { width: 1280px; height: 720px; position: relative; transform-origin: center center; }
+  .slide { position: absolute; inset: 0; background: #fff; padding: 56px 72px 48px; display: none;
+    flex-direction: column; border-radius: 6px; overflow: hidden; }
+  .slide.active { display: flex; }
+  .slide h1 { font-size: 40px; margin: 0 0 6px; letter-spacing: -0.5px; }
+  .slide h2 { font-size: 32px; margin: 0 0 4px; letter-spacing: -0.3px; }
+  .slide .sub { color: var(--muted); font-size: 19px; margin: 0 0 24px; }
+  .slide p, .slide li { font-size: 19px; line-height: 1.45; }
+  .slide ul { margin: 6px 0; padding-left: 24px; }
+  .slide li { margin: 5px 0; }
+  .slide li li { font-size: 17px; color: #333; }
+  code, pre { font-family: var(--mono); }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 0.88em; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px;
+    font-size: 14px; line-height: 1.45; margin: 0; overflow: hidden; white-space: pre; }
+  pre .c { color: #6e7781; } pre .k { color: #cf222e; } pre .s { color: #0a3069; } pre .g { color: var(--good); font-weight: 600; }
+  pre .r { color: var(--bad); font-weight: 600; } pre .h { background: #fff4d6; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; flex: 1; min-height: 0; }
+  .cols.wide-left { grid-template-columns: 1.25fr 1fr; }
+  .cols.wide-right { grid-template-columns: 1fr 1.3fr; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p, .card li { font-size: 16.5px; margin: 3px 0; }
+  .tag { display: inline-block; font-size: 13px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+    background: var(--accent-soft); color: var(--accent); margin-right: 6px; vertical-align: 2px; }
+  .tag.good { background: var(--good-soft); color: var(--good); }
+  .tag.bad { background: var(--bad-soft); color: var(--bad); }
+  .tag.warn { background: var(--warn-soft); color: var(--warn); }
+  table { border-collapse: collapse; width: 100%; font-size: 16.5px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td code { font-size: 14px; }
+  .note { margin-top: auto; padding-top: 10px; color: var(--muted); font-size: 15px; }
+  .callout { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 10px 16px;
+    border-radius: 0 6px 6px 0; font-size: 18px; margin: 10px 0; }
+  .callout.bad { border-color: var(--bad); background: var(--bad-soft); }
+  .callout.good { border-color: var(--good); background: var(--good-soft); }
+  .footer { position: absolute; left: 72px; right: 72px; bottom: 16px; display: flex; justify-content: space-between;
+    color: #8c959f; font-size: 13px; }
+  /* title slide */
+  .slide.title { background: #0d1117; color: #e6edf3; justify-content: center; }
+  .slide.title h1 { font-size: 64px; color: #fff; margin-bottom: 12px; }
+  .slide.title .sub { color: #9da7b3; font-size: 24px; }
+  .stats { display: flex; gap: 22px; margin-top: 46px; }
+  .stat { border: 1px solid #30363d; border-radius: 10px; padding: 18px 22px; min-width: 230px; }
+  .stat b { display: block; font-size: 38px; color: #fff; font-variant-numeric: tabular-nums; }
+  .stat span { color: #9da7b3; font-size: 16px; }
+  .slide.title .footer { color: #6e7681; }
+  .slide.section { background: #f6f8fa; }
+  /* timeline */
+  .tl { display: flex; height: 64px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 18px 0 6px; }
+  .tl div { display: flex; align-items: center; justify-content: center; text-align: center; font-size: 14px;
+    font-weight: 600; padding: 0 6px; border-right: 1px solid #fff; line-height: 1.2; }
+  .tl-axis { display: flex; justify-content: space-between; font-size: 13px; color: var(--muted); font-family: var(--mono); }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .grid2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .big { font-size: 22px !important; }
+  .muted { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 170px 1fr; gap: 6px 14px; font-size: 16.5px; }
+  .kv div:nth-child(odd) { font-family: var(--mono); font-size: 14.5px; color: var(--accent); padding-top: 2px; }
+  #hud { position: fixed; right: 14px; bottom: 10px; color: #8c959f; font: 12px var(--mono); }
+  @media print {
+    @page { size: 1280px 720px; margin: 0; }
+    html, body { overflow: visible; background: #fff; height: auto; }
+    #stage { position: static; display: block; }
+    #deck { transform: none !important; width: 1280px; height: auto; }
+    .slide { display: flex !important; position: relative; width: 1280px; height: 720px; page-break-after: always; border-radius: 0; }
+    #hud { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="stage"><div id="deck">
+
+<!-- 1 -->
+<section class="slide title">
+  <div class="sub" style="margin-bottom:8px">C3 engineering take-home</div>
+  <h1>Solid fixer</h1>
+  <div class="sub">An autonomous fixer for distributed-systems bugs:<br>Claude Sonnet 4.6 inside a deterministic orchestrator</div>
+  <div class="stats">
+    <div class="stat"><b>12 / 12</b><span>practice bugs, one graded run</span></div>
+    <div class="stat"><b>35 / 36</b><span>over three more runs</span></div>
+    <div class="stat"><b>407 s · $0.69</b><span>average per case (limit 900 s, $3 per bug)</span></div>
+  </div>
+  <div class="footer"><span>Jinank Jain · November 2026</span><span>← → to navigate · P to print</span></div>
+</section>
+
+<!-- 2 -->
+<section class="slide">
+  <h2>The task</h2>
+  <div class="sub">A hands-off program that repairs bugs in a service it has never seen</div>
+  <div class="cols">
+    <div>
+      <div class="card" style="margin-bottom:14px">
+        <h3>What goes in: <code>/workspace</code></h3>
+        <ul>
+          <li><code>SYMPTOM.md</code>: a terse ticket that doesn't say how many bugs there are</li>
+          <li><code>logs/</code> from the failing run, <code>src/</code>, public <code>tests/</code></li>
+          <li>A <b>deterministic simulator</b>, <code>scenarios/</code> and fault files</li>
+          <li><code>/corpus</code>: about 26M tokens of platform contracts and service docs</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>What comes out</h3>
+        <ul>
+          <li>Edits under <code>src/</code>: the only thing graded</li>
+          <li>SIGTERM at the deadline, then whatever is in <code>src/</code> is graded</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <table>
+        <tr><th>Constraint</th><th>Value</th></tr>
+        <tr><td>Time</td><td>15 min per case</td></tr>
+        <tr><td>Model spend</td><td>$3 per bug in the case</td></tr>
+        <tr><td>Machine</td><td>2 CPUs, 4 GB RAM, no network except the proxy</td></tr>
+        <tr><td>Models at run time</td><td>Sonnet 4.6 and Jev only, via the proxy</td></tr>
+        <tr><td>Bug counts as fixed</td><td>Its hidden scenario passes on <b>all 20</b> hidden seeds</td></tr>
+        <tr><td>Breaks a public test</td><td><span class="tag bad">0 for the case</span></td></tr>
+        <tr><td>Score</td><td>Bugs fixed; total time breaks ties</td></tr>
+      </table>
+      <div class="callout" style="margin-top:16px">The 12 hidden cases use three <b>new codebases</b>. Anything tuned to the practice cases is a liability.</div>
+    </div>
+  </div>
+</section>
+
+<!-- 3 -->
+<section class="slide">
+  <h2>Design principle</h2>
+  <div class="sub">The model proposes changes; deterministic code decides what is kept</div>
+  <div class="cols wide-left">
+    <div>
+      <p class="big"><b>Why not just let the agent run?</b></p>
+      <ul>
+        <li><b>Grading is unforgiving.</b> One broken test zeroes the case, and the deadline grades whatever is on disk. <code>src/</code> must be valid at every moment.</li>
+        <li><b>The model's own report can't be trusted.</b> It says "all three bugs fixed" while one is half-fixed.</li>
+        <li><b>The simulator is a free oracle.</b> It's deterministic, takes about 0.4 s per seed, and checks invariants and <code>expect</code> blocks.</li>
+      </ul>
+      <p class="big" style="margin-top:20px"><b>So the orchestrator owns:</b></p>
+      <ul>
+        <li>the clock and the model budget</li>
+        <li>the last accepted copy of <code>src/</code> (restored on any failure or SIGTERM)</li>
+        <li>the acceptance check: plain Python, never model judgement</li>
+        <li>the phases: when to review, verify, save and stop</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card" style="background:var(--good-soft);border-color:#b7dfc3">
+        <h3>What this buys</h3>
+        <ul>
+          <li>A bad edit costs a turn, not the case</li>
+          <li>Partial progress is kept: one of three bugs still counts</li>
+          <li>Behaviour is testable offline with a scripted model</li>
+          <li>Nothing is specific to one codebase: it uses only the contract every case shares (tests, sim, scenarios)</li>
+        </ul>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3>Footprint</h3>
+        <p>About 1.6K lines of Python across 6 modules. Dependencies: PyYAML and pytest. Image: <code>python:3.12-slim</code>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 4 -->
+<section class="slide">
+  <h2>Architecture</h2>
+  <div class="sub">One tool-use agent with no framework. Each box is a module in <code>fixer/</code></div>
+  <svg viewBox="0 0 1136 500" width="1136" height="500" style="font-family:system-ui,sans-serif">
+    <defs>
+      <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" fill="#57606a"/></marker>
+    </defs>
+    <style>
+      .bx { fill:#fff; stroke:#d0d7de; stroke-width:1.5; rx:8; }
+      .bx.hl { fill:#e8f0fe; stroke:#2f6feb; }
+      .bx.ws { fill:#f6f8fa; }
+      .t1 { font-size:17px; font-weight:700; fill:#1b1f24; }
+      .t2 { font-size:13.5px; fill:#57606a; }
+      .mono { font-family: ui-monospace, Menlo, monospace; font-size:13px; fill:#2f6feb; }
+      .ln { stroke:#57606a; stroke-width:1.5; fill:none; marker-end:url(#ar); }
+      .lb { font-size:12.5px; fill:#57606a; }
+    </style>
+    <!-- orchestrator -->
+    <rect class="bx hl" x="418" y="4" width="300" height="104"/>
+    <text class="t1" x="434" y="30">Orchestrator</text><text class="mono" x="610" y="30">main.py</text>
+    <text class="t2" x="434" y="52">clock · budget · phases · snapshots</text>
+    <text class="t2" x="434" y="72">coverage review · verification</text>
+    <text class="t2" x="434" y="92">safety checkpoint · SIGTERM restore</text>
+    <!-- context -->
+    <rect class="bx" x="830" y="4" width="300" height="104"/>
+    <text class="t1" x="846" y="30">Context</text><text class="mono" x="1024" y="30">context.py</text>
+    <text class="t2" x="846" y="52">instructions + cached context</text>
+    <text class="t2" x="846" y="72">docs · all of src/ · corpus docs</text>
+    <text class="t2" x="846" y="92">expect checker · log event names</text>
+    <!-- agent -->
+    <rect class="bx hl" x="418" y="182" width="300" height="92"/>
+    <text class="t1" x="434" y="208">Agent loop</text><text class="mono" x="620" y="208">agent.py</text>
+    <text class="t2" x="434" y="230">tool-use turns · cache breakpoints</text>
+    <text class="t2" x="434" y="250">history trimming · error tolerance</text>
+    <!-- llm -->
+    <rect class="bx" x="830" y="182" width="300" height="92"/>
+    <text class="t1" x="846" y="208">LLM client</text><text class="mono" x="1056" y="208">llm.py</text>
+    <text class="t2" x="846" y="230">streaming · idle/stall timeouts</text>
+    <text class="t2" x="846" y="250">thinking cutoff + retry · cost</text>
+    <!-- proxy -->
+    <rect class="bx ws" x="830" y="352" width="300" height="70"/>
+    <text class="t1" x="846" y="380">C3 proxy</text>
+    <text class="t2" x="846" y="402">→ anthropic/claude-sonnet-4.6</text>
+    <!-- tools -->
+    <rect class="bx" x="418" y="352" width="300" height="140"/>
+    <text class="t1" x="434" y="378">Tools</text><text class="mono" x="628" y="378">tools.py</text>
+    <text class="t2" x="434" y="400">read_file · grep · edit</text>
+    <text class="t2" x="434" y="420">run_sim · trace_query</text>
+    <text class="t2" x="434" y="440">write_scenario · run_tests</text>
+    <text class="t2" x="434" y="460">checkpoint · revert · done</text>
+    <!-- gate -->
+    <rect class="bx hl" x="6" y="182" width="300" height="92"/>
+    <text class="t1" x="22" y="208">Acceptance check</text><text class="mono" x="208" y="208">simgate.py</text>
+    <text class="t2" x="22" y="230">parallel sweeps (2 procs) · pytest</text>
+    <text class="t2" x="22" y="250">full check · quick check</text>
+    <!-- workspace -->
+    <rect class="bx ws" x="6" y="352" width="300" height="140"/>
+    <text class="t1" x="22" y="378">Filesystem</text>
+    <text class="mono" x="22" y="402">/workspace/src</text><text class="t2" x="150" y="402">live, graded</text>
+    <text class="mono" x="22" y="426">last_good/</text><text class="t2" x="150" y="426">last accepted src</text>
+    <text class="mono" x="22" y="450">pristine/</text><text class="t2" x="150" y="450">original case copy</text>
+    <text class="t2" x="22" y="474">(probes agent scenarios)</text>
+    <!-- arrows -->
+    <path class="ln" d="M568,108 L568,180"/><text class="lb" x="576" y="140">phase prompts, caps,</text><text class="lb" x="576" y="156">safety-checkpoint notes</text>
+    <path class="ln" d="M980,108 L980,128 L700,128 L700,180"/><text class="lb" x="760" y="122">cached system prefix</text>
+    <path class="ln" d="M718,228 L828,228"/><text class="lb" x="740" y="220">messages</text>
+    <path class="ln" d="M980,274 L980,350"/>
+    <path class="ln" d="M568,274 L568,350"/><text class="lb" x="576" y="316">dispatch tool calls</text>
+    <path class="ln" d="M418,56 L156,56 L156,180"/><text class="lb" x="200" y="48">checkpoint(), verify(), quick check</text>
+    <path class="ln" d="M418,420 L308,420"/><text class="lb" x="322" y="412">edit</text>
+    <path class="ln" d="M418,252 L308,252"/><text class="lb" x="318" y="244">run_sim,</text><text class="lb" x="318" y="268">checkpoint</text>
+    <path class="ln" d="M156,274 L156,350"/><text class="lb" x="164" y="316">sim + tests on src/, pristine/</text>
+  </svg>
+</section>
+
+<!-- 5 -->
+<section class="slide">
+  <h2>Life of one case</h2>
+  <div class="sub">A 900 s budget, with phase changes made by the orchestrator, not the model</div>
+  <div class="tl">
+    <div style="flex:40;background:#d0d7de">Boot&shy;strap</div>
+    <div style="flex:260;background:#cfe0fb">Map symptoms → diagnose → fix</div>
+    <div style="flex:55;background:#b7dfc3">Check&shy;point</div>
+    <div style="flex:150;background:#cfe0fb">Fix the rest, more checkpoints</div>
+    <div style="flex:150;background:#fde7b0">Coverage review ≤150 s</div>
+    <div style="flex:55;background:#b7dfc3">Verify on unseen seeds</div>
+    <div style="flex:120;background:#eef1f4;color:#57606a">slack</div>
+    <div style="flex:70;background:#f3c5c0">Stop · finalize</div>
+  </div>
+  <div class="tl-axis"><span>0 s</span><span>~40 s</span><span>scale is illustrative</span><span>T−80 / T−45</span><span>900 s</span></div>
+  <div class="grid3" style="margin-top:26px">
+    <div class="card"><h3>1 · Bootstrap (no model)</h3>
+      <p>Public tests, a baseline sweep of every fault file over a sized set of seeds, then the cached context is built.</p></div>
+    <div class="card"><h3>2 · Agent loop</h3>
+      <p>Coverage first: every ticket item is mapped to a run that fails on the original code. Then the agent fixes and calls <code>checkpoint()</code> to get an edit accepted.</p></div>
+    <div class="card"><h3>3 · First <code>done()</code></h3>
+      <p>Bounced back if there are unchecked edits. Otherwise a capped, item-by-item <b>coverage review</b> runs.</p></div>
+    <div class="card"><h3>4 · Verification</h3>
+      <p>A sweep on seeds 2000+ that were never seen. Failures send the agent back (at most 2 rounds), e.g. for a bug that was hidden behind the first.</p></div>
+    <div class="card"><h3>5 · Near the deadline</h3>
+      <p>The orchestrator saves unchecked edits itself, stops new turns, and runs a full or quick check, or reverts.</p></div>
+    <div class="card"><h3>6 · Always</h3>
+      <p>Finalize keeps a 20 s reserve. SIGTERM/SIGINT restore <code>last_good/</code> before exiting.</p></div>
+  </div>
+</section>
+
+<!-- 6 -->
+<section class="slide">
+  <h2>Bootstrap: measure before the model speaks</h2>
+  <div class="sub">About 40 s of plain Python that every later decision depends on</div>
+  <div class="cols wide-right">
+    <div>
+      <ul>
+        <li><b>Adaptive sweep size.</b> A short probe measures seconds per seed, then picks 5–15 extra seeds beyond the public ones so that <b>one full sweep takes about 40 s</b> on the machine at hand.</li>
+        <li><b>Baseline.</b> The public scenario plus every fault file, recording which runs and seeds fail and which invariants they break. This is the reference for "no regression" and "progress".</li>
+        <li><b>Cached context</b> (about 43K tokens): case docs, all of <code>src/</code>, the service and <i>CURRENT</i> platform docs from the corpus, the simulator's <code>expect</code> checker source, and the log event names seen in the evidence logs.</li>
+      </ul>
+      <div class="callout">Seed count is sized from a measurement, not hard-coded: the grader's machine may be faster or slower than mine.</div>
+    </div>
+<pre><span class="c">// fixer.log, practice case B2</span>
+[  2.2s] public tests on original code: pass
+[  4.0s] sweep sizing: 0.37s per seed x 12 runs
+         -> 5 extra seeds
+[ 40.3s] baseline in 36s (10 seeds per run):
+public                  <span class="r">fail   9/10</span>  {'I2': 38, 'expect': 32}
+public+calm.yaml        fail   0/10
+public+clocks.yaml      fail   0/10
+public+crashes.yaml     fail   0/10
+public+gpu.yaml         fail   0/10
+public+lossy.yaml       <span class="r">fail  10/10</span>  {'I2': 84, 'expect': 16}
+public+network.yaml     <span class="r">fail  10/10</span>  {'I2': 72, 'expect': 28}
+public+partitions.yaml  <span class="r">fail   9/10</span>  {'I2': 11, 'expect': 11}
+public+reorder.yaml     <span class="h">fail   0/10</span>   <span class="c">&lt;- bug 2 hides here</span>
+public+soak.yaml        fail   1/10  {'I2': 2, 'expect': 2}
+public+stragglers.yaml  fail   0/10
+  e.g. [public] I2: action 18 (submit_job)
+       never resolved
+[ 40.3s] context: 170920 chars (~42730 tokens)</pre>
+  </div>
+</section>
+
+<!-- 7 -->
+<section class="slide">
+  <h2>Agent loop and prompt caching</h2>
+  <div class="sub">Every turn re-sends the whole conversation, so caching sets the cost</div>
+  <div class="cols">
+    <div>
+<pre><span class="k">self</span>.system = [
+  {<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: instructions},
+  {<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: context,
+   <span class="s">"cache_control"</span>: {<span class="s">"type"</span>: <span class="s">"ephemeral"</span>}}]
+
+<span class="k">def</span> _mark_cache(<span class="k">self</span>):
+    <span class="c"># rolling breakpoint: drop old markers,</span>
+    <span class="c"># put one on the newest user turn</span>
+    ...
+    last[<span class="s">"content"</span>][-1][<span class="s">"cache_control"</span>] = ephemeral</pre>
+<pre style="margin-top:12px"><span class="c">// real turns: only ~10 uncached input tokens each</span>
+turn 1:  31.9s in=10 cache_r=0     cache_w=55783 out=1557 $0.233
+turn 2:  35.1s in=10 cache_r=55783 cache_w=3830  out=1596 $0.288
+turn 8:   2.9s in=10 cache_r=69622 cache_w=498   out=134  $0.571</pre>
+    </div>
+    <div>
+      <table>
+        <tr><th>Setting</th><th>Value</th></tr>
+        <tr><td>Thinking budget</td><td>4K tokens per turn</td></tr>
+        <tr><td>Max output</td><td>8K tokens (long replies risk timeouts)</td></tr>
+        <tr><td>Per-call timeout</td><td>min(300 s, time left − 30 s)</td></tr>
+        <tr><td>History trim</td><td>over 450K chars: old tool results cut to 200 chars, newest 8 kept</td></tr>
+        <tr><td>No tool call</td><td>nudged twice, then the phase ends</td></tr>
+        <tr><td>Status line</td><td>after every tool batch: time left, spend, accepted checkpoints</td></tr>
+      </table>
+      <p style="margin-top:14px">Cache reads cost $0.30/M against $3/M uncached. The first turn pays about $0.21 to write the cache, and later turns cost about $0.03–0.08.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 8 -->
+<section class="slide">
+  <h2>Tools</h2>
+  <div class="sub">Few, sharp, and each one returns evidence rather than prose</div>
+  <table>
+    <tr><th style="width:190px">Tool</th><th>What it does</th><th style="width:330px">Guard rails</th></tr>
+    <tr><td><code>read_file</code>, <code>grep</code></td><td>Read the case, src and corpus</td><td>grep-style <code>\|</code> is treated as alternation (a bug found in real runs)</td></tr>
+    <tr><td><code>edit</code></td><td>Exact <code>old → new</code> replacement in a file</td><td><code>src/</code> only; <code>old</code> must match once; refused if the file wouldn't compile; atomic write</td></tr>
+    <tr><td><code>run_sim</code></td><td>Replay a scenario (+ fault file) over seeds, in parallel</td><td>Returns a pass/fail summary with example violations</td></tr>
+    <tr><td><code>trace_query</code></td><td>Grep the event trace of one replay</td><td>Output capped, keeping the most recent lines</td></tr>
+    <tr><td><code>write_scenario</code></td><td>Write a scenario (merged onto <code>base</code>) and <b>probe it on the original and current code</b></td><td>Says REPRODUCES / does NOT reproduce / BROKEN</td></tr>
+    <tr><td><code>run_tests</code></td><td>Public pytest suite</td><td>Shows the tail on failure</td></tr>
+    <tr><td><code>checkpoint</code></td><td>Run the acceptance check on the current <code>src/</code></td><td>Accepted → snapshot; rejected → reasons listed</td></tr>
+    <tr><td><code>revert</code></td><td>Restore the last accepted <code>src/</code></td><td></td></tr>
+    <tr><td><code>done</code></td><td>Claim the work is finished, with a summary</td><td>The orchestrator decides what happens next</td></tr>
+  </table>
+</section>
+
+<!-- 9 -->
+<section class="slide">
+  <h2>Coverage first: <code>write_scenario</code></h2>
+  <div class="sub">Some symptoms break no invariant, so no built-in run fails on them</div>
+  <div class="cols">
+    <div>
+      <p><b>The trap:</b> fix the bugs that make runs fail, see everything green, stop. A symptom such as "tasks get re-queued for no reason" stays unfixed.</p>
+      <p><b>The rule</b> (the first message to the agent): before editing, map every ticket item to a baseline run that fails because of it. If none exists, write a scenario whose <code>expect</code> block <b>counts the symptom</b>, until it fails on the original code.</p>
+      <ul>
+        <li>The tool runs the new scenario on a <b>pristine copy</b> of the case and on the current code (5 seeds) and reports which fail.</li>
+        <li>A scenario the simulator can't run is <b>BROKEN</b>: excluded from checkpoints, never a "reproduction".</li>
+        <li>Valid agent scenarios join every later checkpoint, so a fix must make them pass too.</li>
+        <li>Fails on both the original and the current code → the <code>open_bug</code> flag is set: real work remains.</li>
+      </ul>
+    </div>
+    <div>
+<pre><span class="c"># the agent's scenario (merged onto base: public)</span>
+faults: faults/reorder.yaml
+expect:
+  log_events_max:
+    shard_requeued: 0</pre>
+<pre style="margin-top:12px">wrote scenarios/symptom2_reorder.yaml;
+it <span class="g">REPRODUCES on the original code.</span>
+original code: fail 4/5 {'expect': 9}
+current code:  fail 4/5 {'expect': 9}
+  expect e.g.: log event shard_requeued: 3 (max 0)
+<span class="c">orchestrator: open bug found: scenario
+symptom2_reorder fails on the original and the current code</span></pre>
+      <div class="callout" style="margin-top:12px">The pristine copy is made at startup, so "fails on the original code" is measured, not something the model remembers.</div>
+      <p class="muted" style="font-size:14px;margin-top:4px">Output shown in the tool's format; the counts are illustrative.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 10 -->
+<section class="slide">
+  <h2>The acceptance check</h2>
+  <div class="sub"><code>Gate.check</code>: the only way an edit is kept. About 45–60 s per call, measured and used for scheduling</div>
+  <div class="cols wide-left">
+    <div>
+      <table>
+        <tr><th>Rejects when…</th><th>Why</th></tr>
+        <tr><td>Doesn't compile; a public test fails</td><td>A broken test scores 0 for the case</td></tr>
+        <tr><td>Simulator crash or unhandled exception</td><td>Not a fix</td></tr>
+        <tr><td>A run that was <b>clean at baseline</b> now fails</td><td>Regression</td></tr>
+        <tr><td>Messages &gt; 2× baseline on any seed</td><td>Graders fail runs over 3×: a "fix by retry storm"</td></tr>
+        <tr><td>Replays aren't deterministic</td><td>Hidden seeds would flake</td></tr>
+        <tr><td>No progress over the <b>last accepted</b> state</td><td>Every accepted edit is a ratchet</td></tr>
+      </table>
+      <p style="font-size:16.5px;margin-top:10px"><span class="tag warn">allowed</span> New failure kinds inside runs that were <i>already failing</i> are only noted. Fixing one bug often exposes the next (chained cases).</p>
+    </div>
+<pre><span class="c"># progress = fewer failing (run, seed) pairs,</span>
+<span class="c"># or as many but fewer violations; agent</span>
+<span class="c"># scenarios count too</span>
+ref = progress_ref <span class="k">or</span> baseline
+ref_pairs  = _pairs(ref, cand)
+cand_pairs = _pairs(cand, ref)
+progress = cand_pairs &lt; ref_pairs <span class="k">or</span> (
+    cand_pairs == ref_pairs <span class="k">and</span>
+    _viol(cand, ref) &lt; _viol(ref, cand))
+
+<span class="c">// fixer.log</span>
+checkpoint #1: <span class="g">ACCEPTED</span> in 47s;
+  failing (run, seed) pairs:
+  52 at baseline -&gt; 4 now</pre>
+  </div>
+</section>
+
+<!-- 11 -->
+<section class="slide">
+  <h2>Never lose progress</h2>
+  <div class="sub">The model forgets to checkpoint, runs long, or gets killed. The orchestrator plans for all three</div>
+  <div class="cols">
+    <div>
+      <table>
+        <tr><th>Trigger</th><th>Action</th></tr>
+        <tr><td>Edits unchecked for more than 3 turns or 150 s</td><td><b>Early save:</b> quick check; if it shows progress, a full checkpoint</td></tr>
+        <tr><td>Time left ≤ 2× check cost + 50 s</td><td><b>Safety checkpoint</b> of the current edits; the agent is told</td></tr>
+        <tr><td>T−45 s (all accepted) / T−80 s (unchecked edits)</td><td>No new model turns</td></tr>
+        <tr><td>End with unchecked edits</td><td>Full check if it fits → else <b>quick check</b> (≥45 s) → else revert</td></tr>
+        <tr><td>SIGTERM / SIGINT</td><td>Restore <code>last_good/</code>, exit 0</td></tr>
+        <tr><td>Spend reaches 85% of the budget</td><td>Stop taking turns</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="card"><h3>Quick check (when the full one won't fit)</h3>
+        <p>Compiles, public tests pass, deterministic, and on the public scenario plus every agent scenario (public seeds only): nothing newly fails, nothing crashes, messages bounded, fewer failing pairs than the last accepted state.</p></div>
+<pre style="margin-top:14px">[293.5s] early save: unchecked edits for 3 turns;
+         quick check shows progress:
+         failing (run, seed) pairs 5 -&gt; 0 on public
+[293.5s] safety checkpoint: 611s left and src/
+         has unchecked edits
+[340.7s] checkpoint #1: <span class="g">ACCEPTED</span> in 47s</pre>
+      <p class="muted" style="font-size:15px">Offline tests check that the quick check keeps a real partial fix and rolls back test-breaking or no-progress edits.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 12 -->
+<section class="slide">
+  <h2>Making model calls reliable</h2>
+  <div class="sub">The first full graded run scored 6/12, and <b>every</b> miss came from slow or stalled calls</div>
+  <div class="cols wide-left">
+    <div>
+      <ul>
+        <li><b>Streamed calls</b> with a hand-written SSE parser, so progress is visible byte by byte.</li>
+        <li><b>Idle timeout 60 s:</b> no bytes at all → the call is stuck.</li>
+        <li><b>Stall timeout 60 s:</b> keep-alive pings but no new content → also stuck (seen in real runs).</li>
+        <li><b>Thinking cutoff:</b> still only thinking 75 s after the call started → abort and retry once with a nudge to think briefly and act.
+          <ul><li>The retry gets back the <b>last 6,000 chars of the cut reasoning</b>, so it doesn't redo the analysis. Retry times fell from 77–93 s to a median under 40 s.</li></ul></li>
+        <li><b>Errors are local:</b> a failed call pauses up to 10 s and retries; only 3 failures in a row end a phase. The proxy's 402 → <code>BudgetExhausted</code>.</li>
+        <li>Cost is tracked from the <code>usage</code> block in every response, with cache-aware pricing.</li>
+      </ul>
+    </div>
+    <div>
+<pre><span class="k">class</span> ThinkingOverflow(LLMError):
+    <span class="c"># chars, seconds, and the streamed</span>
+    <span class="c"># thinking text so far</span>
+
+<span class="k">def</span> overthink_nudge(partial):
+    <span class="k">return</span> (OVERTHINK_NUDGE +
+      <span class="s">"&lt;previous_reasoning&gt;"</span>
+      + partial[-CARRY_MAX_CHARS:] +
+      <span class="s">"&lt;/previous_reasoning&gt;"</span>)
+
+<span class="c">// fixer.log</span>
+llm: thinking passed its budget (78s,
+  5301 chars streamed); retrying with a
+  nudge to think briefly and act</pre>
+      <div class="callout bad" style="margin-top:12px;font-size:16px">The cutoff is a trade-off. At 50 s it fired on ordinary turns (6 cuts, about 310 s lost in one run). Even at 75 s each cut costs about 75 s.</div>
+    </div>
+  </div>
+</section>
+
+<!-- 13 -->
+<section class="slide">
+  <h2>Coverage review, then verification</h2>
+  <div class="sub">Only partly trusting the first <code>done()</code></div>
+  <div class="cols">
+    <div>
+      <p>The first <code>done()</code> asks for one line per ticket item: <code>item → kind → evidence</code>.</p>
+      <div class="card" style="margin-bottom:12px"><h3><span class="tag good">liveness / correctness</span></h3>
+        <p>Stuck, never finishes, wrong result, invariant broken. Evidence: a run that failed on the original code and passes now. It's fine if other bugs also made that run fail.</p></div>
+      <div class="card"><h3><span class="tag warn">unwanted event</span></h3>
+        <p>Re-queued, cancelled, retried, registered again. A run failing for other reasons <b>does not count</b>. Evidence: a scenario under the ticket's conditions whose <code>expect</code> <b>counts that event</b> (usually max 0), failing on the original code and passing now.</p></div>
+    </div>
+    <div>
+      <ul>
+        <li><b>Capped at 6 turns or 150 s.</b> It's a sanity pass, not a second investigation; otherwise it ate the time a verification sweep needed.</li>
+        <li><b>The cap is lifted</b> when the agent's scenario fails on both the original and the current code (<code>open_bug</code>). There, the review found real work.</li>
+        <li>Hitting the cap → keep what's accepted, move on.</li>
+      </ul>
+      <p style="margin-top:16px"><b>Verification:</b> a sweep the size of a checkpoint on <b>unseen seeds (2000+)</b>. Any failure goes back to the agent with examples ("possibly a bug hidden behind the one you fixed"), for up to 2 rounds.</p>
+      <div class="callout">Hidden grading uses 20 seeds per bug. Verifying on seeds the agent never saw is the closest local proxy for that.</div>
+    </div>
+  </div>
+</section>
+
+<!-- 14 -->
+<section class="slide">
+  <h2>Testing the fixer without a model</h2>
+  <div class="sub">The control flow is deterministic, so it can be tested like ordinary code</div>
+  <div class="cols wide-right">
+    <div>
+      <ul>
+        <li><b><code>ScriptedLLM</code></b> replays a JSON script of tool calls through the real orchestrator. Each run is graded by the <b>real grader</b>.</li>
+        <li><code>test_llm_stream.py</code>: stream parser, idle vs merely slow, pings-only stalls, thinking cutoff and the carry-over.</li>
+        <li><code>test_end_of_run.py</code>: the quick check keeps a partial fix and rolls back bad edits.</li>
+        <li><code>claude_p_shim.py</code>: a local stand-in upstream for the proxy, for end-to-end tests.</li>
+      </ul>
+      <div class="callout good" style="font-size:16.5px">Every bug found in a real run (grep <code>\|</code>, broken scenarios counted as reproductions, a review that ran too long) became a script before it was fixed.</div>
+    </div>
+<pre><span class="c">// 12 scripted runs, run in parallel</span>
+A1-402-dirty        0/1  <span class="c">budget gone, dirty src restored</span>
+A1-broken-scenario  1/1
+A1-failures         1/1  <span class="c">invalid tool calls refused, then fixed</span>
+A1-fix              1/1
+A1-llm-errors       1/1  <span class="c">model errors mid-run</span>
+A1-no-checkpoint    1/1  <span class="c">safety checkpoint saves it</span>
+A1-noop-edit        0/1  <span class="c">no progress -&gt; not accepted</span>
+A1-review-cap       1/1  <span class="c">review capped, fix kept</span>
+A1-unchecked        1/1  <span class="c">done() with unchecked edits</span>
+B1-fix              1/1
+B2-review-open-bug  1/3  <span class="c">cap lifted for an open bug</span>
+B2-scenario         1/3  <span class="c">scenario workflow</span>
+<span class="c">// every grade is the expected one; scripts fix
+// only what they script</span></pre>
+  </div>
+</section>
+
+<!-- 15 -->
+<section class="slide">
+  <h2>Results on the practice cases</h2>
+  <div class="sub">The submitted image (<code>d43f381</code>) graded with <code>./grade.sh</code> in Docker: 2 CPUs and 4 GB per case, concurrency 2</div>
+  <div class="cols wide-left">
+    <div>
+      <table>
+        <tr><th>Run</th><th class="num">Bugs fixed</th><th class="num">Fixer time</th><th class="num">Spend</th></tr>
+        <tr><td>First full run (early build)</td><td class="num">6 / 12</td><td class="num"></td><td class="num"></td></tr>
+        <tr><td><b>Submitted image</b>, one run</td><td class="num"><b>12 / 12</b></td><td class="num">2,333 s</td><td class="num">$4.13</td></tr>
+        <tr><td>Submitted image, three more runs</td><td class="num"><b>35 / 36</b></td><td class="num">avg 407 s / case</td><td class="num">avg $0.69 / case</td></tr>
+        <tr><td>B2 (3 bugs), all runs</td><td class="num">3/3 in 5 of 6</td><td class="num"></td><td class="num"></td></tr>
+      </table>
+      <ul style="margin-top:16px">
+        <li>Every miss on the submitted image was B2, the hardest case.</li>
+        <li>Under half the time limit and about a quarter of the spend limit on average: room for harder hidden cases.</li>
+        <li>From 6/12 to 12/12 came mostly from <b>timeouts, retries and progress-saving</b>, not prompt changes.</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card"><h3>Typical time and spend per case (graded runs)</h3>
+        <div class="kv" style="margin-top:8px">
+          <div>A1, B1 (1 bug)</div><div>~210–230 s, ~$0.45–0.50</div>
+          <div>A2 (2 bugs)</div><div>~250 s, ~$0.46</div>
+          <div>A3, B3 (2–3)</div><div>~610–620 s, ~$0.8–1.1</div>
+          <div>B2 (3 bugs)</div><div>650–850 s, ~$1.1–1.2</div>
+        </div></div>
+      <div class="callout bad" style="margin-top:14px;font-size:16.5px">The practice score is a guide only: I tuned against these six cases, and the hidden codebases are new.</div>
+    </div>
+  </div>
+</section>
+
+<!-- 16 -->
+<section class="slide">
+  <h2>Case study: why B2 is hard</h2>
+  <div class="sub">Three bugs in a GPU map-reduce service, one of them almost invisible</div>
+  <div class="grid3">
+    <div class="card"><h3><span class="tag good">fixed reliably</span> Bug 1</h3>
+      <p>The worker drops finished tasks only <i>if its report succeeds</i>. After a network blip they stay listed in heartbeats forever, so the shard is never re-queued and the job is stuck in MAPPING.</p>
+      <p class="muted" style="font-size:14px">Fails 10/10 under <code>network.yaml</code>.</p></div>
+    <div class="card" style="border-color:#e8b4ad;background:#fffafa"><h3><span class="tag bad">the trap</span> Bug 2</h3>
+      <p>Spurious re-queues when heartbeats arrive reordered. It needs <b>two fixes</b>: the scheduler acks <code>min(seen, hb_seq)</code>, and the worker must report the last heartbeat it <i>sent</i>.</p>
+      <p class="muted" style="font-size:14px">Breaks no invariant: <code>reorder.yaml</code> fails 0/10 at baseline.</p></div>
+    <div class="card"><h3><span class="tag good">fixed reliably</span> Bug 3</h3>
+      <p>After <code>gpu_submit_unknown</code> and a NOT_FOUND reply, the client never resubmits, so the job is stuck in REDUCING under packet loss.</p>
+      <p class="muted" style="font-size:14px">Fails 10/10 under <code>lossy.yaml</code>.</p></div>
+  </div>
+  <div class="callout bad" style="margin-top:20px">After fixing bug 1, bug 3 and <b>only the scheduler half</b> of bug 2, every built-in scenario passes. The <code>shard_requeued</code> counts don't change. Only a scenario that counts that event shows the half-fix.</div>
+  <p>The coverage-first rule and the "unwanted event" review exist for this pattern, and they're written generically: any symptom phrased as "X happens when it shouldn't".</p>
+</section>
+
+<!-- 17 -->
+<section class="slide">
+  <h2>What a miss looks like</h2>
+  <div class="sub">From a graded B2 run (2/3) on the prototype build. The common mistake: setting the limit from the fixed code</div>
+<pre style="font-size:13.5px">[232.1s] open bug found: scenario symptom2_reorder fails on the original and the current code
+[232.1s]   tool write_scenario(... shard_requeued ...) -&gt; it <span class="g">REPRODUCES</span> on the original code.
+[273.2s]   says: Bug 2: scheduler.py - ack_seq = min(seen, reply_hb_seq) should be just reply_hb_seq   <span class="c">&lt;- one half only</span>
+[340.7s] checkpoint #1: <span class="g">ACCEPTED</span> in 47s; failing (run, seed) pairs: 52 at baseline -&gt; 4 now
+[413.5s]   says: The symptom2_reorder check threshold is too tight (fixed code also gets up to 8
+         requeues from legitimate assign-timeout re-queues ...). Let me adjust it:
+<span class="h">[416.5s]   tool write_scenario(... max 15 ...) -&gt; it does NOT reproduce anything on the original code.</span>
+[474.0s]   says: Both codes pass with threshold 15 - the metric doesn't distinguish old from new.
+         The real check is whether all three bugs are fixed (confirmed by public scenarios).
+[506.6s]   tool done(...)                                    <span class="c">&lt;- coverage review starts</span>
+[570.2s]   says: Fixed code still cancels ... Let me trace what's triggering them   <span class="c">&lt;- now counting gpu_cancel</span>
+[649.3s] llm: thinking passed its budget (78s); retrying ...   <span class="c">&lt;- 189 s turn</span>
+[761.0s] agent: phase cap lifted (open bug: symptom2_reorder)
+[833.2s] no time left for verification on unseen seeds; finishing</pre>
+  <div class="grid2" style="margin-top:14px">
+    <div class="card"><p><b>The tools did their job:</b> reproduction measured, the half-fix flagged as an open bug, the review cap lifted.</p></div>
+    <div class="card"><p><b>The reasoning didn't:</b> it explained the remaining re-queues away, then chased a different event until time ran out.</p></div>
+  </div>
+</section>
+
+<!-- 18 -->
+<section class="slide">
+  <h2>What didn't work, and lessons</h2>
+  <div class="sub">Measured, then kept or dropped</div>
+  <div class="cols">
+    <div>
+      <div class="card" style="margin-bottom:12px"><h3><span class="tag warn">prototype, not shipped</span> Per-seed counts in <code>write_scenario</code></h3>
+        <p>Judge a scenario by <i>its own</i> counting check and show event counts per seed on the original and current code ("5,4,8 before, 5,4,8 after"). Over 16 case runs it scored <b>33/36</b> against 53/54 for the submitted image, and ran slower. It caught the half-fix; the agent still ran out of time.</p></div>
+      <div class="card"><h3><span class="tag bad">invalid measurement</span> Grading at concurrency 6</h3>
+        <p>Each container gets 2 CPUs; six on a laptop made the simulator 2× slower (0.73 vs 0.37 s per seed), and the results were meaningless. Benchmarks must match the real resources.</p></div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:12px"><h3><span class="tag warn">trade-off</span> Thinking cutoff</h3>
+        <p>Too low cuts good turns; too high lets a runaway turn eat a minute or more. 75 s plus carrying the reasoning into the retry was the best measured setting.</p></div>
+      <div class="card" style="margin-bottom:12px"><h3><span class="tag">generality</span> Don't overfit the practice simulator</h3>
+        <p>The checker's failure wording is trusted only if the case's own <code>check.py</code> uses it, with a fallback otherwise. Rules are phrased by symptom kind, never by codebase.</p></div>
+      <div class="card"><h3><span class="tag good">kept</span> Real runs find real tool bugs</h3>
+        <p>grep <code>\|</code>, scenarios that only produce simulator errors, an uncapped review. Each one became an offline test first.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- 19 -->
+<section class="slide">
+  <h2>What I'd do next</h2>
+  <div class="sub">Roughly in order of expected value on hidden cases</div>
+  <div class="grid2">
+    <div class="card"><h3>Systematic stress scenarios</h3><p>Generate scenarios by varying fault parameters around the ticket, rather than relying on the agent's choices. Most B2 misses were about evidence, not code.</p></div>
+    <div class="card"><h3>One agent per ticket item</h3><p>Run them in parallel inside the 15 minutes, with merge handling for bugs that touch the same files.</p></div>
+    <div class="card"><h3>Jev for cheap yes/no checks</h3><p>"Does this patch disable functionality?" or "Is this limit set from the fixed code?" at almost no cost, to reduce the risk from private regression tests.</p></div>
+    <div class="card"><h3>On-demand corpus retrieval</h3><p>For services whose docs are too large to include in the cached context.</p></div>
+    <div class="card"><h3>Smarter thinking control</h3><p>Cut runaway thinking earlier without losing good long turns; each cut still costs about 75 s.</p></div>
+    <div class="card"><h3>Forgive common scenario mistakes</h3><p>Accept a <code>base:</code> key inside the YAML or a <code>scenarios/</code> prefix on fault paths instead of rejecting them: one turn saved per case.</p></div>
+  </div>
+</section>
+
+<!-- 20 -->
+<section class="slide title">
+  <h1 style="font-size:52px">Takeaways</h1>
+  <ul style="font-size:24px;line-height:1.6;color:#e6edf3;max-width:1050px">
+    <li>A <b>deterministic oracle plus a snapshot</b> make model mistakes cheap: a bad edit costs a turn, not the case.</li>
+    <li>Most early points were lost to <b>plumbing</b> (stalled streams, runaway thinking, unsaved progress), not reasoning. Fix those first.</li>
+    <li>The hardest remaining failure is <b>evidence quality</b> for symptoms that break no invariant. Tools can surface it; the model still has to act on it.</li>
+    <li>Every change was <b>measured under the real grading setup</b> and dropped if it didn't help.</li>
+  </ul>
+  <div class="sub" style="margin-top:40px">Questions?</div>
+  <div class="footer"><span>Solid fixer · C3 take-home</span><span></span></div>
+</section>
+
+</div></div>
+<div id="hud"></div>
+<script>
+  const slides = [...document.querySelectorAll('.slide')];
+  const deck = document.getElementById('deck'), hud = document.getElementById('hud');
+  let i = Math.max(0, Math.min(slides.length - 1, (parseInt(location.hash.slice(1)) || 1) - 1));
+  function show(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, k) => s.classList.toggle('active', k === i));
+    hud.textContent = (i + 1) + ' / ' + slides.length;
+    history.replaceState(null, '', '#' + (i + 1));
+  }
+  function fit() {
+    const s = Math.min(innerWidth / 1280, innerHeight / 720) * 0.97;
+    deck.style.transform = 'scale(' + s + ')';
+  }
+  addEventListener('resize', fit);
+  addEventListener('keydown', e => {
+    if (['ArrowRight', 'ArrowDown', 'PageDown', ' ', 'Enter'].includes(e.key)) { e.preventDefault(); show(i + 1); }
+    else if (['ArrowLeft', 'ArrowUp', 'PageUp', 'Backspace'].includes(e.key)) { e.preventDefault(); show(i - 1); }
+    else if (e.key === 'Home') show(0);
+    else if (e.key === 'End') show(slides.length - 1);
+    else if (e.key === 'p' || e.key === 'P') window.print();
+  });
+  addEventListener('click', e => { if (e.target.closest('a')) return; show(i + (e.clientX > innerWidth / 3 ? 1 : -1)); });
+  fit(); show(i);
+</script>
+</body>
+</html>
