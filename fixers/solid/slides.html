@@ -46,6 +46,7 @@
   table { border-collapse: collapse; width: 100%; font-size: 16.5px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { font-size: 13px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); font-weight: 600; }
+  table.tight td, table.tight th { padding: 4px 8px; line-height: 1.3; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   td code { font-size: 14px; }
   .note { margin-top: auto; padding-top: 10px; color: var(--muted); font-size: 15px; }
@@ -602,9 +603,9 @@ B2-scenario         1/3  <span class="c">scenario workflow</span>
 <!-- 15b: comparison with the first attempt -->
 <section class="slide">
   <h2>Two approaches: the first attempt vs this one</h2>
-  <div class="sub">An earlier, larger fixer (<code>fixers/autonomous</code>, on <code>main</code>) against the submitted one (<code>fixers/solid</code>)</div>
-  <table style="font-size:15px">
-    <tr><th style="width:190px"></th><th>First attempt: <code>autonomous</code></th><th>Submitted: <code>solid</code></th></tr>
+  <div class="sub" style="margin-bottom:12px">An earlier, larger fixer (<code>fixers/autonomous</code>, on <code>main</code>) against the submitted one (<code>fixers/solid</code>)</div>
+  <table class="tight" style="font-size:14.5px">
+    <tr><th style="width:170px"></th><th>First attempt: <code>autonomous</code></th><th>Submitted: <code>solid</code></th></tr>
     <tr><td><b>Size</b></td><td>17 modules, 8.4K runtime lines, 627 tests</td><td>6 modules, 1.6K runtime lines, scripted-model runs + unit tests</td></tr>
     <tr><td><b>Who decides what's kept</b></td><td>Measured checks <i>plus</i> a second Sonnet reviewer that must approve partial repairs</td><td>Measured checks only (tests, sweeps, determinism, progress)</td></tr>
     <tr><td><b>Context</b></td><td>Compacted to about 120K chars; docs fetched on demand</td><td>About 43K tokens included once and cached; old tool output trimmed only past 450K chars</td></tr>
